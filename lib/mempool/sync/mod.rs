@@ -7,15 +7,11 @@ use std::{
 use bip300301::{
     client::{
         GetBlockClient as _, GetRawTransactionClient as _,
-        GetRawTransactionVerbose, MainClient as _, U8Witness,
+        GetRawTransactionVerbose, U8Witness,
     },
-    jsonrpsee::{
-        core::{
-            client::ClientT as _,
-            params::{ArrayParams, BatchRequestBuilder, ObjectParams},
-            ClientError as JsonRpcError,
-        },
-        http_client::HttpClient,
+    jsonrpsee::core::{
+        params::{ArrayParams, BatchRequestBuilder, ObjectParams},
+        ClientError as JsonRpcError,
     },
 };
 use bitcoin::{BlockHash, Transaction, Txid};
@@ -29,7 +25,7 @@ use thiserror::Error;
 use crate::zmq::{SequenceMessage, SequenceStreamError};
 
 mod initial_sync;
-mod task;
+pub(in crate::mempool) mod task;
 
 pub use initial_sync::{
     init_sync_mempool, SyncMempoolError as InitialSyncMempoolError,
@@ -150,7 +146,7 @@ impl Stream for RequestQueue {
 /// Responses received while syncing
 #[derive(Clone, Debug)]
 enum ResponseItem {
-    Block(Box<bip300301::client::Block>),
+    Block(Box<bip300301::client::Block<true>>),
     RejectTx,
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
@@ -175,10 +171,13 @@ pub enum RequestError {
     JsonRpc(#[from] JsonRpcError),
 }
 
-async fn batched_request(
-    rpc_client: &HttpClient,
+async fn batched_request<RpcClient>(
+    rpc_client: &RpcClient,
     request: BatchedRequestItem,
-) -> Result<BatchedResponseItem, RequestError> {
+) -> Result<BatchedResponseItem, RequestError>
+where
+    RpcClient: bip300301::client::MainClient + Sync,
+{
     const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
     match request {
         BatchedRequestItem::BatchRejectTx(txs) => {
@@ -226,7 +225,7 @@ async fn batched_request(
         }
         BatchedRequestItem::Single(RequestItem::Block(block_hash)) => {
             let block =
-                rpc_client.get_block(block_hash, U8Witness::<1>).await?;
+                rpc_client.get_block(block_hash, U8Witness::<2>).await?;
             let resp = ResponseItem::Block(Box::new(block));
             Ok(BatchedResponseItem::Single(resp))
         }

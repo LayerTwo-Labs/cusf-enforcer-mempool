@@ -7,6 +7,10 @@ const DEFAULT_SERVE_RPC_ADDR: SocketAddr =
 
 #[derive(Parser)]
 pub struct Cli {
+    /// Address to use for mining rewards
+    #[arg(long)]
+    pub mining_reward_address:
+        bitcoin::Address<bitcoin::address::NetworkUnchecked>,
     /// Log level
     #[arg(default_value_t = tracing::Level::DEBUG, long)]
     pub log_level: tracing::Level,

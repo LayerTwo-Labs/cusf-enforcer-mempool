@@ -3,16 +3,19 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
+    convert::Infallible,
 };
 
 use bip300301::{
     bitcoin::hashes::Hash as _,
     client::{BoolWitness, GetRawMempoolClient as _, RawMempoolWithSequence},
-    jsonrpsee::{core::ClientError as JsonRpcError, http_client::HttpClient},
+    jsonrpsee::core::ClientError as JsonRpcError,
 };
 use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid};
+use educe::Educe;
 use futures::{stream, StreamExt as _};
 use hashlink::LinkedHashSet;
+use imbl::HashSet;
 use thiserror::Error;
 
 use super::{
@@ -20,19 +23,47 @@ use super::{
     batched_request, BatchedResponseItem, CombinedStreamItem, RequestError,
     RequestItem, RequestQueue, ResponseItem,
 };
-use crate::zmq::{
-    BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
-    SequenceStreamError, TxHashEvent, TxHashMessage,
+use crate::{
+    cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
+    zmq::{
+        BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
+        SequenceStreamError, TxHashEvent, TxHashMessage,
+    },
 };
 
+/// Actions to take immediately after initial sync is completed
+#[derive(Debug, Default)]
+struct PostSync {
+    /// Mempool txs excluded by enforcer
+    remove_mempool_txs: HashSet<Txid>,
+}
+
+impl PostSync {
+    fn apply(self, mempool: &mut Mempool) -> Result<(), MempoolRemoveError> {
+        let _removed_txs = mempool
+            .try_filter(true, |tx, _| {
+                Ok::<_, Infallible>(
+                    !self.remove_mempool_txs.contains(&tx.compute_txid()),
+                )
+            })
+            .map_err(|err| {
+                let either::Either::Left(err) = err;
+                err
+            })?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
-struct MempoolSyncing {
+struct MempoolSyncing<'a, Enforcer> {
     blocks_needed: LinkedHashSet<BlockHash>,
+    enforcer: &'a mut Enforcer,
     /// Drop messages with lower mempool sequences.
     /// Set to None after encountering this mempool sequence ID.
     /// Return an error if higher sequence is encountered.
     first_mempool_sequence: Option<u64>,
     mempool: Mempool,
+    post_sync: PostSync,
     request_queue: RequestQueue,
     seq_message_queue: VecDeque<SequenceMessage>,
     /// Txs not needed in mempool, but requested in order to determine fees
@@ -40,7 +71,7 @@ struct MempoolSyncing {
     txs_needed: LinkedHashSet<Txid>,
 }
 
-impl MempoolSyncing {
+impl<Enforcer> MempoolSyncing<'_, Enforcer> {
     fn is_synced(&self) -> bool {
         self.blocks_needed.is_empty()
             && self.txs_needed.is_empty()
@@ -48,14 +79,28 @@ impl MempoolSyncing {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum SyncMempoolError {
+#[derive(Educe)]
+#[educe(Debug(bound(cusf_enforcer::Error<Enforcer>: std::fmt::Debug)))]
+#[derive(Error)]
+pub enum SyncMempoolError<Enforcer>
+where
+    Enforcer: CusfEnforcer,
+{
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
+    #[error(transparent)]
+    CusfEnforcer(#[from] cusf_enforcer::Error<Enforcer>),
+    #[error("Failed to decode block: `{block_hash}`")]
+    DecodeBlock {
+        block_hash: BlockHash,
+        source: bitcoin::consensus::encode::Error,
+    },
     #[error("Fee overflow")]
     FeeOverflow,
     #[error("Missing first message with mempool sequence: {0}")]
     FirstMempoolSequence(u64),
+    #[error(transparent)]
+    InitialSyncEnforcer(#[from] cusf_enforcer::InitialSyncError<Enforcer>),
     #[error("RPC error")]
     JsonRpc(#[from] JsonRpcError),
     #[error(transparent)]
@@ -70,30 +115,92 @@ pub enum SyncMempoolError {
     SequenceStreamEnded,
 }
 
-fn handle_block_hash_msg(
-    sync_state: &mut MempoolSyncing,
+fn connect_block<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
+    block: &bip300301::client::Block<true>,
+) -> Result<(), SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    for tx_info in &block.tx {
+        let txid = tx_info.txid;
+        let _removed: Option<_> = sync_state.mempool.remove(&txid)?;
+        sync_state.txs_needed.remove(&txid);
+        sync_state
+            .request_queue
+            .remove(&RequestItem::Tx(txid, true));
+    }
+    let block_decoded =
+        block
+            .try_into()
+            .map_err(|err| SyncMempoolError::DecodeBlock {
+                block_hash: block.hash,
+                source: err,
+            })?;
+    match sync_state
+        .enforcer
+        .connect_block(&block_decoded)
+        .map_err(cusf_enforcer::Error::ConnectBlock)?
+    {
+        ConnectBlockAction::Accept { remove_mempool_txs } => {
+            sync_state
+                .post_sync
+                .remove_mempool_txs
+                .extend(remove_mempool_txs);
+        }
+        ConnectBlockAction::Reject => {
+            // FIXME: reject block
+        }
+    };
+    sync_state.mempool.chain.tip = block.hash;
+    Ok(())
+}
+
+fn disconnect_block<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
+    block: &bip300301::client::Block<true>,
+) -> Result<(), SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    for _tx_info in &block.tx {
+        // FIXME: insert without info
+        let () = todo!();
+    }
+    let () = sync_state
+        .enforcer
+        .disconnect_block(block.hash)
+        .map_err(cusf_enforcer::Error::DisconnectBlock)?;
+    sync_state.mempool.chain.tip =
+        block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
+    Ok(())
+}
+
+fn handle_block_hash_msg<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
     block_hash_msg: BlockHashMessage,
 ) {
     let BlockHashMessage {
-        block_hash, event, ..
+        block_hash,
+        event: _,
+        ..
     } = block_hash_msg;
-    tracing::trace!(%block_hash, "Adding block to req queue");
-    match event {
-        BlockHashEvent::Disconnected
-            if sync_state.mempool.chain.blocks.contains_key(&block_hash) => {}
-        BlockHashEvent::Connected | BlockHashEvent::Disconnected => {
-            sync_state.blocks_needed.replace(block_hash);
-            sync_state
-                .request_queue
-                .push_back(RequestItem::Block(block_hash));
-        }
+    if !sync_state.mempool.chain.blocks.contains_key(&block_hash) {
+        tracing::trace!(%block_hash, "Adding block to req queue");
+        sync_state.blocks_needed.replace(block_hash);
+        sync_state
+            .request_queue
+            .push_back(RequestItem::Block(block_hash));
     }
 }
 
-fn handle_tx_hash_msg(
-    sync_state: &mut MempoolSyncing,
+fn handle_tx_hash_msg<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
     tx_hash_msg: TxHashMessage,
-) -> Result<(), SyncMempoolError> {
+) -> Result<(), SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
     let TxHashMessage {
         txid,
         event,
@@ -135,10 +242,13 @@ fn handle_tx_hash_msg(
     Ok(())
 }
 
-fn handle_seq_message(
-    sync_state: &mut MempoolSyncing,
+fn handle_seq_message<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
     seq_msg: SequenceMessage,
-) -> Result<(), SyncMempoolError> {
+) -> Result<(), SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
     match seq_msg {
         SequenceMessage::BlockHash(block_hash_msg) => {
             let () = handle_block_hash_msg(sync_state, block_hash_msg);
@@ -151,59 +261,60 @@ fn handle_seq_message(
     Ok(())
 }
 
-fn handle_resp_block(
-    sync_state: &mut MempoolSyncing,
-    block: bip300301::client::Block,
-) -> Result<(), MempoolRemoveError> {
-    sync_state.blocks_needed.remove(&block.hash);
+fn handle_resp_block<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
+    resp_block: bip300301::client::Block<true>,
+) -> Result<(), SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    sync_state.blocks_needed.remove(&resp_block.hash);
     match sync_state.seq_message_queue.front() {
         Some(SequenceMessage::BlockHash(BlockHashMessage {
             block_hash,
             event: BlockHashEvent::Connected,
             ..
-        })) if *block_hash == block.hash => {
-            for txid in &block.tx {
-                let _removed: Option<_> = sync_state.mempool.remove(txid)?;
-                sync_state.txs_needed.remove(txid);
-                sync_state
-                    .request_queue
-                    .remove(&RequestItem::Tx(*txid, true));
-            }
-            sync_state.mempool.chain.tip = block.hash;
+        })) if *block_hash == resp_block.hash => {
+            let () = connect_block(sync_state, &resp_block)?;
             sync_state.seq_message_queue.pop_front();
         }
         Some(SequenceMessage::BlockHash(BlockHashMessage {
             block_hash,
             event: BlockHashEvent::Disconnected,
             ..
-        })) if *block_hash == block.hash
-            && sync_state.mempool.chain.tip == block.hash =>
+        })) if *block_hash == resp_block.hash
+            && sync_state.mempool.chain.tip == resp_block.hash =>
         {
-            for _txid in &block.tx {
-                // FIXME: insert without info
-                let () = todo!();
-            }
-            sync_state.mempool.chain.tip =
-                block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
+            let () = disconnect_block(sync_state, &resp_block)?;
             sync_state.seq_message_queue.pop_front();
         }
         Some(_) | None => (),
     }
-    sync_state.mempool.chain.blocks.insert(block.hash, block);
+    sync_state
+        .mempool
+        .chain
+        .blocks
+        .insert(resp_block.hash, resp_block);
     Ok(())
 }
 
-fn handle_resp_tx(sync_state: &mut MempoolSyncing, tx: Transaction) {
+fn handle_resp_tx<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
+    tx: Transaction,
+) {
     let txid = tx.compute_txid();
     sync_state.txs_needed.remove(&txid);
     sync_state.tx_cache.insert(txid, tx);
 }
 
 // returns `true` if the tx was added successfully
-fn try_add_tx_from_cache(
-    sync_state: &mut MempoolSyncing,
+fn try_add_tx_from_cache<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
     txid: &Txid,
-) -> Result<bool, SyncMempoolError> {
+) -> Result<bool, SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
     let Some(tx) = sync_state.tx_cache.get(txid) else {
         return Ok(false);
     };
@@ -251,9 +362,12 @@ fn try_add_tx_from_cache(
 }
 
 // returns `true` if an item was applied successfully
-fn try_apply_next_seq_message(
-    sync_state: &mut MempoolSyncing,
-) -> Result<bool, SyncMempoolError> {
+fn try_apply_next_seq_message<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
+) -> Result<bool, SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
     let res = 'res: {
         match sync_state.seq_message_queue.front() {
             Some(SequenceMessage::BlockHash(BlockHashMessage {
@@ -265,17 +379,11 @@ fn try_apply_next_seq_message(
                     break 'res false;
                 };
                 let Some(block) =
-                    sync_state.mempool.chain.blocks.get(block_hash)
+                    sync_state.mempool.chain.blocks.get(block_hash).cloned()
                 else {
                     break 'res false;
                 };
-                for _txid in &block.tx {
-                    // FIXME: insert without info
-                    let () = todo!();
-                }
-                sync_state.mempool.chain.tip = block
-                    .previousblockhash
-                    .unwrap_or_else(BlockHash::all_zeros);
+                let () = disconnect_block(sync_state, &block)?;
                 true
             }
             Some(SequenceMessage::TxHash(TxHashMessage {
@@ -305,10 +413,13 @@ fn try_apply_next_seq_message(
     Ok(res)
 }
 
-fn handle_resp(
-    sync_state: &mut MempoolSyncing,
+fn handle_resp<Enforcer>(
+    sync_state: &mut MempoolSyncing<Enforcer>,
     resp: BatchedResponseItem,
-) -> Result<(), SyncMempoolError> {
+) -> Result<(), SyncMempoolError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
     match resp {
         BatchedResponseItem::BatchTx(txs) => {
             let mut input_txs_needed = LinkedHashSet::new();
@@ -334,8 +445,7 @@ fn handle_resp(
             }
         }
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
-            // FIXME: remove
-            tracing::debug!("Handling block {}", block.hash);
+            tracing::debug!(%block.hash, "Handling block");
             let () = handle_resp_block(sync_state, *block)?;
         }
         BatchedResponseItem::Single(ResponseItem::Tx(tx, in_mempool)) => {
@@ -366,12 +476,22 @@ fn handle_resp(
     Ok(())
 }
 
-/// Returns the synced mempool, and the accumulated tx cache
-pub async fn init_sync_mempool(
-    rpc_client: &HttpClient,
-    sequence_stream: &mut SequenceStream<'_>,
-    prev_blockhash: BlockHash,
-) -> Result<(Mempool, HashMap<Txid, Transaction>), SyncMempoolError> {
+/// Returns the zmq sequence stream, synced mempool, and the accumulated tx cache
+pub async fn init_sync_mempool<'a, Enforcer, RpcClient>(
+    enforcer: &mut Enforcer,
+    rpc_client: &RpcClient,
+    zmq_addr_sequence: &str,
+) -> Result<
+    (SequenceStream<'a>, Mempool, HashMap<Txid, Transaction>),
+    SyncMempoolError<Enforcer>,
+>
+where
+    Enforcer: CusfEnforcer,
+    RpcClient: bip300301::client::MainClient + Sync,
+{
+    let (best_block_hash, sequence_stream) =
+        cusf_enforcer::initial_sync(enforcer, rpc_client, zmq_addr_sequence)
+            .await?;
     let RawMempoolWithSequence {
         txids,
         mempool_sequence,
@@ -380,7 +500,7 @@ pub async fn init_sync_mempool(
         .await?;
     let mut sync_state = {
         let request_queue = RequestQueue::default();
-        request_queue.push_back(RequestItem::Block(prev_blockhash));
+        request_queue.push_back(RequestItem::Block(best_block_hash));
         for txid in &txids {
             request_queue.push_back(RequestItem::Tx(*txid, true));
         }
@@ -393,9 +513,11 @@ pub async fn init_sync_mempool(
             })
         }));
         MempoolSyncing {
-            blocks_needed: LinkedHashSet::from_iter([prev_blockhash]),
+            blocks_needed: LinkedHashSet::from_iter([best_block_hash]),
+            enforcer,
             first_mempool_sequence: Some(mempool_sequence + 1),
-            mempool: Mempool::new(prev_blockhash),
+            mempool: Mempool::new(best_block_hash),
+            post_sync: PostSync::default(),
             request_queue,
             seq_message_queue,
             tx_cache: HashMap::new(),
@@ -433,5 +555,16 @@ pub async fn init_sync_mempool(
             }
         }
     }
-    Ok((sync_state.mempool, sync_state.tx_cache))
+    let MempoolSyncing {
+        mut mempool,
+        post_sync,
+        tx_cache,
+        ..
+    } = sync_state;
+    let () = post_sync.apply(&mut mempool)?;
+    let sequence_stream = {
+        let (sequence_stream, _resp_stream) = combined_stream.into_inner();
+        sequence_stream.into_inner()
+    };
+    Ok((sequence_stream, mempool, tx_cache))
 }
