@@ -1,14 +1,15 @@
 use std::{
     collections::{HashMap, VecDeque},
+    convert::Infallible,
+    future::Future,
     sync::Arc,
 };
 
-use bip300301::jsonrpsee::http_client::HttpClient;
 use bitcoin::{
     hashes::Hash as _, Amount, BlockHash, OutPoint, Transaction, Txid,
 };
 use educe::Educe;
-use futures::{stream, StreamExt as _, TryFutureExt as _};
+use futures::{stream, StreamExt as _};
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
@@ -19,7 +20,7 @@ use super::{
     RequestError, RequestQueue, ResponseItem,
 };
 use crate::{
-    cusf_enforcer::{self, CusfEnforcer},
+    cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
     mempool::{sync::RequestItem, MempoolInsertError, MempoolRemoveError},
     zmq::{
         BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
@@ -48,6 +49,11 @@ where
     CombinedStreamEnded,
     #[error(transparent)]
     CusfEnforcer(#[from] cusf_enforcer::Error<Enforcer>),
+    #[error("Failed to decode block: `{block_hash}`")]
+    DecodeBlock {
+        block_hash: BlockHash,
+        source: bitcoin::consensus::encode::Error,
+    },
     #[error("Fee overflow")]
     FeeOverflow,
     #[error(transparent)]
@@ -76,6 +82,7 @@ async fn handle_seq_message<Enforcer>(
             event: BlockHashEvent::Connected,
             ..
         }) => {
+            // FIXME: handle case in which block exists
             // FIXME: remove
             tracing::debug!("Adding block {block_hash} to req queue");
             sync_state
@@ -87,6 +94,7 @@ async fn handle_seq_message<Enforcer>(
             event: BlockHashEvent::Disconnected,
             ..
         }) => {
+            // FIXME: handle case in which block exists
             // FIXME: remove
             tracing::debug!("Adding block {block_hash} to req queue");
             if !inner
@@ -137,14 +145,19 @@ fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
 async fn handle_resp_block<Enforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
-    block: bip300301::client::Block,
+    resp_block: bip300301::client::Block<true>,
 ) -> Result<(), SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
 {
-    let block_parent =
-        block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
-    inner.mempool.chain.blocks.insert(block.hash, block.clone());
+    let resp_block_parent = resp_block
+        .previousblockhash
+        .unwrap_or_else(BlockHash::all_zeros);
+    inner
+        .mempool
+        .chain
+        .blocks
+        .insert(resp_block.hash, resp_block.clone());
     let Some(SequenceMessage::BlockHash(block_hash_msg)) =
         sync_state.seq_message_queue.front()
     else {
@@ -152,39 +165,64 @@ where
     };
     match block_hash_msg.event {
         BlockHashEvent::Connected => {
-            if block_hash_msg.block_hash != block.hash {
+            if block_hash_msg.block_hash != resp_block.hash {
                 return Ok(());
             }
-            for txid in &block.tx {
-                let _removed: Option<_> = inner.mempool.remove(txid)?;
+            for tx_info in &resp_block.tx {
+                let txid = tx_info.txid;
+                let _removed: Option<_> = inner.mempool.remove(&txid)?;
                 sync_state
                     .request_queue
-                    .remove(&RequestItem::Tx(*txid, true));
+                    .remove(&RequestItem::Tx(txid, true));
             }
-            inner.mempool.chain.tip = block.hash;
-            let () = inner
+            inner.mempool.chain.tip = resp_block.hash;
+            let resp_block_decoded =
+                (&resp_block).try_into().map_err(|err| {
+                    SyncTaskError::DecodeBlock {
+                        block_hash: resp_block.hash,
+                        source: err,
+                    }
+                })?;
+            match inner
                 .enforcer
-                .handle_block_hash_msg(*block_hash_msg)
-                .map_err(cusf_enforcer::Error::HandleBlockHashMessage)
-                .await?;
+                .connect_block(&resp_block_decoded)
+                .map_err(cusf_enforcer::Error::ConnectBlock)?
+            {
+                ConnectBlockAction::Accept { remove_mempool_txs } => {
+                    let _removed_txs = inner
+                        .mempool
+                        .try_filter(true, |tx, _| {
+                            Ok::<_, Infallible>(
+                                !remove_mempool_txs
+                                    .contains(&tx.compute_txid()),
+                            )
+                        })
+                        .map_err(|err| {
+                            let either::Either::Left(err) = err;
+                            SyncTaskError::MempoolRemove(err)
+                        })?;
+                }
+                ConnectBlockAction::Reject => {
+                    // FIXME: reject block
+                }
+            };
             sync_state.seq_message_queue.pop_front();
         }
         BlockHashEvent::Disconnected => {
-            if !(block_hash_msg.block_hash == block.hash
-                && inner.mempool.chain.tip == block.hash)
+            if !(block_hash_msg.block_hash == resp_block.hash
+                && inner.mempool.chain.tip == resp_block.hash)
             {
                 return Ok(());
             };
-            for _txid in &block.tx {
+            for _tx_info in &resp_block.tx {
                 // FIXME: insert without info
                 let () = todo!();
             }
-            inner.mempool.chain.tip = block_parent;
+            inner.mempool.chain.tip = resp_block_parent;
             let () = inner
                 .enforcer
-                .handle_block_hash_msg(*block_hash_msg)
-                .map_err(cusf_enforcer::Error::HandleBlockHashMessage)
-                .await?;
+                .disconnect_block(block_hash_msg.block_hash)
+                .map_err(cusf_enforcer::Error::DisconnectBlock)?;
             sync_state.seq_message_queue.pop_front();
         }
     }
@@ -274,13 +312,11 @@ where
 {
     let res = 'res: {
         match sync_state.seq_message_queue.front() {
-            Some(SequenceMessage::BlockHash(
-                block_hash_msg @ BlockHashMessage {
-                    block_hash,
-                    event: BlockHashEvent::Disconnected,
-                    ..
-                },
-            )) => {
+            Some(SequenceMessage::BlockHash(BlockHashMessage {
+                block_hash,
+                event: BlockHashEvent::Disconnected,
+                ..
+            })) => {
                 if inner.mempool.chain.tip != *block_hash {
                     break 'res false;
                 };
@@ -288,15 +324,14 @@ where
                 else {
                     break 'res false;
                 };
-                for _txid in &block.tx {
+                for _tx_info in &block.tx {
                     // FIXME: insert without info
                     let () = todo!();
                 }
                 let () = inner
                     .enforcer
-                    .handle_block_hash_msg(*block_hash_msg)
-                    .map_err(cusf_enforcer::Error::HandleBlockHashMessage)
-                    .await?;
+                    .disconnect_block(*block_hash)
+                    .map_err(cusf_enforcer::Error::DisconnectBlock)?;
                 inner.mempool.chain.tip = block
                     .previousblockhash
                     .unwrap_or_else(BlockHash::all_zeros);
@@ -365,7 +400,7 @@ where
         }
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
             // FIXME: remove
-            tracing::debug!("Handling block {}", block.hash);
+            tracing::debug!(%block.hash, "Handling block");
             let () =
                 handle_resp_block(&mut inner_write, sync_state, *block).await?;
         }
@@ -394,14 +429,15 @@ where
     Ok(())
 }
 
-async fn task<Enforcer>(
+async fn task<Enforcer, RpcClient>(
     inner: Arc<RwLock<MempoolSyncInner<Enforcer>>>,
     tx_cache: HashMap<Txid, Transaction>,
-    rpc_client: HttpClient,
+    rpc_client: RpcClient,
     sequence_stream: SequenceStream<'static>,
-) -> Result<(), SyncTaskError<Enforcer>>
+) -> Result<Infallible, SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
+    RpcClient: bip300301::client::MainClient + Sync,
 {
     // Filter mempool with enforcer
     let rejected_txs: LinkedHashSet<Txid> = {
@@ -411,7 +447,7 @@ where
             ref mut mempool,
         } = *inner_write;
         let rejected_txs = mempool
-            .try_filter(|tx, mempool_inputs| {
+            .try_filter(true, |tx, mempool_inputs| {
                 let mut tx_inputs = mempool_inputs.clone();
                 for tx_in in &tx.input {
                     let input_txid = tx_in.previous_output.txid;
@@ -478,7 +514,7 @@ where
 }
 
 pub struct MempoolSync<Enforcer> {
-    inner: Arc<RwLock<MempoolSyncInner<Enforcer>>>,
+    inner: std::sync::Weak<RwLock<MempoolSyncInner<Enforcer>>>,
     task: JoinHandle<()>,
 }
 
@@ -486,31 +522,44 @@ impl<Enforcer> MempoolSync<Enforcer>
 where
     Enforcer: CusfEnforcer + Send + Sync + 'static,
 {
-    pub fn new(
+    pub fn new<RpcClient, ErrHandler, ErrHandlerFut>(
         enforcer: Enforcer,
         mempool: Mempool,
         tx_cache: HashMap<Txid, Transaction>,
-        rpc_client: &HttpClient,
+        rpc_client: RpcClient,
         sequence_stream: SequenceStream<'static>,
-    ) -> Self {
+        err_handler: ErrHandler,
+    ) -> Self
+    where
+        RpcClient: bip300301::client::MainClient + Send + Sync + 'static,
+        ErrHandler:
+            FnOnce(SyncTaskError<Enforcer>) -> ErrHandlerFut + Send + 'static,
+        ErrHandlerFut: Future<Output = ()> + Send,
+    {
         let inner = MempoolSyncInner { enforcer, mempool };
         let inner = Arc::new(RwLock::new(inner));
-        let task = spawn(
-            task(inner.clone(), tx_cache, rpc_client.clone(), sequence_stream)
-                .unwrap_or_else(|err| {
-                    let err = anyhow::Error::from(err);
-                    tracing::error!("{err:#}");
-                }),
-        );
-        Self { inner, task }
+        let inner_weak = Arc::downgrade(&inner);
+        let task = spawn(async {
+            let Err(err) =
+                task(inner, tx_cache, rpc_client, sequence_stream).await;
+            err_handler(err).await
+        });
+        Self {
+            inner: inner_weak,
+            task,
+        }
     }
 
-    pub async fn with<F, Output>(&self, f: F) -> Output
+    /// Apply a function over the mempool and enforcer.
+    /// Returns `None` if the mempool is unavailable due to an error.
+    pub async fn with<F, Output>(&self, f: F) -> Option<Output>
     where
         F: FnOnce(&Mempool, &Enforcer) -> Output,
     {
-        let inner_read = self.inner.read().await;
-        f(&inner_read.mempool, &inner_read.enforcer)
+        let inner = self.inner.upgrade()?;
+        let inner_read = inner.read().await;
+        let res = f(&inner_read.mempool, &inner_read.enforcer);
+        Some(res)
     }
 }
 

@@ -1,10 +1,6 @@
 use std::net::SocketAddr;
 
-use bip300301::{
-    client::BlockTemplateRequest, jsonrpsee::http_client::HttpClientBuilder,
-    MainClient as _,
-};
-use bitcoin::Network;
+use bip300301::{jsonrpsee::http_client::HttpClientBuilder, MainClient as _};
 use clap::Parser;
 use jsonrpsee::server::ServerHandle;
 use tokio::time::Duration;
@@ -13,7 +9,7 @@ use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 use cusf_enforcer_mempool::{
     cusf_enforcer::DefaultEnforcer,
     mempool::{self, MempoolSync},
-    server, zmq,
+    server,
 };
 
 mod cli;
@@ -74,50 +70,49 @@ async fn main() -> anyhow::Result<()> {
         tracing::debug!("connected to RPC server");
         (client, network_info)
     };
-
-    let blockchain_info = rpc_client.get_blockchain_info().await?;
-
-    let request = if blockchain_info.chain == Network::Signet {
-        let default_request = BlockTemplateRequest::default();
-        let mut rules = default_request.rules;
-
-        // Important: signet rules must be present on signet.
-        rules.push("signet".to_string());
-
-        BlockTemplateRequest {
-            rules,
-            ..default_request
+    let network = rpc_client.get_blockchain_info().await?.chain;
+    let mining_reward_address =
+        cli.mining_reward_address.require_network(network)?;
+    let sample_block_template = {
+        let mut request = bip300301::client::BlockTemplateRequest::default();
+        if network == bitcoin::Network::Signet {
+            request.rules.push("signet".to_owned())
         }
-    } else {
-        BlockTemplateRequest::default()
+        rpc_client
+            .get_block_template(Default::default())
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to get sample block template: {err:#}")
+            })?
     };
-    let sample_block_template = rpc_client
-        .get_block_template(request)
-        .await
-        .map_err(|err| {
-            anyhow::anyhow!("failed to get sample block template: {err:#}")
-        })?;
-
-    let mut sequence_stream =
-        zmq::subscribe_sequence(&cli.node_zmq_addr_sequence).await?;
-    let (mempool, tx_cache) = {
+    let mut enforcer = DefaultEnforcer;
+    let (sequence_stream, mempool, tx_cache) = {
         mempool::init_sync_mempool(
+            &mut enforcer,
             &rpc_client,
-            &mut sequence_stream,
-            sample_block_template.prev_blockhash,
+            &cli.node_zmq_addr_sequence,
         )
         .await?
     };
     tracing::info!("Initial mempool sync complete");
     let mempool = MempoolSync::new(
-        DefaultEnforcer,
+        enforcer,
         mempool,
         tx_cache,
-        &rpc_client,
+        rpc_client,
         sequence_stream,
+        |err| async {
+            let err = anyhow::Error::from(err);
+            tracing::error!("{err:#}")
+        },
     );
-    let server =
-        server::Server::new(mempool, network_info, sample_block_template)?;
+    let server = server::Server::new(
+        mining_reward_address.script_pubkey(),
+        mempool,
+        network,
+        network_info,
+        sample_block_template,
+    )?;
     let rpc_server_handle =
         spawn_rpc_server(server, cli.serve_rpc_addr).await?;
     let () = rpc_server_handle.stopped().await;

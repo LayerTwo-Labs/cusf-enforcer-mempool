@@ -12,7 +12,10 @@ pub mod iter;
 pub mod iter_mut;
 mod sync;
 
-pub use sync::{init_sync_mempool, InitialSyncMempoolError, MempoolSync};
+pub use sync::{
+    init_sync_mempool, task::SyncTaskError, InitialSyncMempoolError,
+    MempoolSync,
+};
 
 #[derive(Clone, Copy, Debug, Eq)]
 pub struct FeeRate {
@@ -121,14 +124,15 @@ impl ByAncestorFeeRate {
         }
     }
 
-    // Iterate from low-to-high fee rate, in insertion order
+    /// Iterate from low-to-high fee rate, in insertion order
+    #[allow(dead_code)]
     fn iter(&self) -> impl DoubleEndedIterator<Item = (FeeRate, Txid)> + '_ {
         self.0.iter().flat_map(|(fee_rate, txids)| {
             txids.iter().map(|txid| (*fee_rate, *txid))
         })
     }
 
-    // Iterate from high-to-low fee rate, in insertion order
+    /// Iterate from high-to-low fee rate, in insertion order
     fn iter_rev(
         &self,
     ) -> impl DoubleEndedIterator<Item = (FeeRate, Txid)> + '_ {
@@ -141,14 +145,15 @@ impl ByAncestorFeeRate {
 #[derive(Clone, Debug)]
 struct Chain {
     tip: BlockHash,
-    blocks: imbl::HashMap<BlockHash, bip300301::client::Block>,
+    blocks: imbl::HashMap<BlockHash, bip300301::client::Block<true>>,
 }
 
 impl Chain {
     // Iterate over blocks from tip towards genesis.
     // Not all history is guaranteed to exist, so this iterator might return
     // `None` before the genesis block.
-    fn iter(&self) -> impl Iterator<Item = &bip300301::client::Block> {
+    #[allow(dead_code)]
+    fn iter(&self) -> impl Iterator<Item = &bip300301::client::Block<true>> {
         let mut next = Some(self.tip);
         std::iter::from_fn(move || {
             if let Some(block) = self.blocks.get(&next?) {
@@ -214,7 +219,7 @@ impl Mempool {
         }
     }
 
-    pub fn tip(&self) -> &bip300301::client::Block {
+    pub fn tip(&self) -> &bip300301::client::Block<true> {
         &self.chain.blocks[&self.chain.tip]
     }
 
@@ -224,7 +229,7 @@ impl Mempool {
     }
 
     /// Insert a tx into the mempool
-    fn insert(
+    pub fn insert(
         &mut self,
         tx: Transaction,
         fee: u64,
@@ -395,10 +400,12 @@ impl Mempool {
     /// Retain txs for which the provided closure returns `true`.
     /// The closure's second argument is the in-mempool input txs for the
     /// transaction.
-    /// This function also deletes descendants of any deleted tx.
+    /// If the bool argument is `true, also deletes descendants of any deleted
+    /// tx.
     /// Returns the removed txs.
-    fn try_filter<F, E>(
+    pub fn try_filter<F, E>(
         &mut self,
+        also_remove_descendants: bool,
         mut f: F,
     ) -> Result<
         LinkedHashMap<Txid, Transaction>,
@@ -447,10 +454,17 @@ impl Mempool {
                     }
                 }
                 if !f(tx, &tx_inputs).map_err(either::Either::Right)? {
-                    res.extend(
+                    let removed = if also_remove_descendants {
                         self.remove_with_descendants(&descendant_txid)
-                            .map_err(either::Either::Left)?,
-                    );
+                            .map_err(either::Either::Left)?
+                    } else {
+                        self.remove(&descendant_txid)
+                            .map_err(either::Either::Left)?
+                            .into_iter()
+                            .map(|(tx, _tx_info)| (descendant_txid, tx))
+                            .collect()
+                    };
+                    res.extend(removed);
                 }
             }
         }
@@ -516,7 +530,7 @@ impl Mempool {
                 txid,
                 hash: tx.compute_wtxid(),
                 depends,
-                fee: info.fees.base as i64,
+                fee: bitcoin::SignedAmount::from_sat(info.fees.base as i64),
                 // FIXME: compute this
                 sigops: None,
                 weight: tx.weight().to_wu(),
