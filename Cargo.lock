@@ -211,10 +211,11 @@ dependencies = [
 [[package]]
 name = "bip300301"
 version = "0.1.1"
-source = "git+https://github.com/Ash-L2L/bip300301.git?rev=2315ddde381af907fcf8e029046bd5c43448a71f#2315ddde381af907fcf8e029046bd5c43448a71f"
+source = "git+https://github.com/Ash-L2L/bip300301.git?rev=abcf874daa2d86ac122945a37cada0124036cfd3#abcf874daa2d86ac122945a37cada0124036cfd3"
 dependencies = [
  "base64 0.21.7",
  "bitcoin",
+ "educe",
  "hashlink",
  "hex",
  "hex-conservative 0.1.2",
@@ -524,6 +525,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "typewit",
  "zeromq",
 ]
 
@@ -2630,6 +2632,21 @@ name = "typenum"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
+
+[[package]]
+name = "typewit"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb77c29baba9e4d3a6182d51fa75e3215c7fd1dab8f4ea9d107c716878e55fc0"
+dependencies = [
+ "typewit_proc_macros",
+]
+
+[[package]]
+name = "typewit_proc_macros"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e36a83ea2b3c704935a01b4642946aadd445cea40b10935e3f8bd8052b8193d6"
 
 [[package]]
 name = "unicode-ident"
