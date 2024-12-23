@@ -7,8 +7,8 @@ use bip300301::client::{
 };
 use bitcoin::{
     amount::CheckedSum, hashes::Hash as _, merkle_tree, script::PushBytesBuf,
-    Amount, Block, Network, Script, ScriptBuf, Transaction, TxOut, Txid,
-    WitnessMerkleNode, Wtxid,
+    Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf,
+    Transaction, TxIn, TxOut, Txid, WitnessMerkleNode, Wtxid,
 };
 use chrono::Utc;
 use educe::Educe;
@@ -29,31 +29,19 @@ pub trait Rpc {
     ) -> RpcResult<BlockTemplate>;
 }
 
-/// Signer for signet blocks
-pub trait SignetSigner {
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Sign for a specific signet challenge, returning a scriptSig and
-    /// scriptWitness
-    fn sign(
-        &self,
-        signet_challenge: &Script,
-    ) -> Result<(ScriptBuf, bitcoin::Witness), Self::Error>;
-}
-
-/// [`SignetSigner`] to use when Signet signing is not implemented
-#[derive(Debug, Default, Error)]
-#[error("Signet signing is not implemented")]
+/// [`bitcoin::psbt::GetKey`] impl to use if Signet signing is not implemented
+#[derive(Debug, Default)]
 pub struct SignetSigningNotImplemented;
 
-impl SignetSigner for SignetSigningNotImplemented {
-    type Error = SignetSigningNotImplemented;
+impl bitcoin::psbt::GetKey for SignetSigningNotImplemented {
+    type Error = Infallible;
 
-    fn sign(
+    fn get_key<C: bitcoin::secp256k1::Signing>(
         &self,
-        _signet_challenge: &Script,
-    ) -> Result<(ScriptBuf, bitcoin::Witness), Self::Error> {
-        Err(SignetSigningNotImplemented)
+        _key_request: bitcoin::psbt::KeyRequest,
+        _secp: &bitcoin::key::Secp256k1<C>,
+    ) -> Result<Option<bitcoin::PrivateKey>, Self::Error> {
+        Ok(None)
     }
 }
 
@@ -154,17 +142,129 @@ fn get_block_reward(height: u32, fees: Amount, network: Network) -> Amount {
     }
 }
 
+/// Generate 'to_spend' tx for signing a signet block
+fn signet_spend_tx(
+    block_version: bitcoin::block::Version,
+    prev_blockhash: BlockHash,
+    signet_merkle_root: WitnessMerkleNode,
+    block_timestamp: u32,
+    challenge_script: ScriptBuf,
+) -> Transaction {
+    let mut block_data = PushBytesBuf::new();
+    block_data
+        .extend_from_slice(&block_version.to_consensus().to_le_bytes())
+        .unwrap();
+    block_data
+        .extend_from_slice(prev_blockhash.as_byte_array())
+        .unwrap();
+    block_data
+        .extend_from_slice(signet_merkle_root.as_byte_array())
+        .unwrap();
+    block_data
+        .extend_from_slice(&block_timestamp.to_le_bytes())
+        .unwrap();
+    let script_sig = Script::builder()
+        .push_opcode(bitcoin::opcodes::OP_0)
+        .push_slice(&block_data)
+        .into_script();
+    Transaction {
+        version: bitcoin::transaction::Version(0),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::all_zeros(),
+                vout: 0xFFFFFFFF,
+            },
+            script_sig,
+            sequence: bitcoin::Sequence(0),
+            witness: bitcoin::Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: challenge_script,
+        }],
+    }
+}
+
+/// Generate 'to_sign' tx for signing a signet block
+fn signet_sign_tx(
+    block_version: bitcoin::block::Version,
+    prev_blockhash: BlockHash,
+    signet_merkle_root: WitnessMerkleNode,
+    block_timestamp: u32,
+    challenge_script: ScriptBuf,
+) -> Transaction {
+    let to_spend = signet_spend_tx(
+        block_version,
+        prev_blockhash,
+        signet_merkle_root,
+        block_timestamp,
+        challenge_script,
+    );
+    Transaction {
+        version: bitcoin::transaction::Version(0),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(to_spend.compute_txid(), 0),
+            script_sig: ScriptBuf::new(), // Will be filled with solution
+            sequence: bitcoin::Sequence(0),
+            witness: bitcoin::Witness::default(), // Will be filled with solution
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: Script::builder()
+                .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+                .into_script(),
+        }],
+    }
+}
+
+/// Generate scriptSig and scriptWitness for a signet block
+fn signet_sign_block<K>(
+    block_version: bitcoin::block::Version,
+    prev_blockhash: BlockHash,
+    signet_merkle_root: WitnessMerkleNode,
+    block_timestamp: u32,
+    challenge_script: ScriptBuf,
+    k: &K,
+) -> Result<(ScriptBuf, bitcoin::Witness), bitcoin::psbt::SignError>
+where
+    K: bitcoin::psbt::GetKey,
+{
+    let tx = signet_sign_tx(
+        block_version,
+        prev_blockhash,
+        signet_merkle_root,
+        block_timestamp,
+        challenge_script,
+    );
+    let mut psbt = bitcoin::psbt::Psbt::from_unsigned_tx(tx).unwrap();
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let _signing_keys_map: bitcoin::psbt::SigningKeysMap = psbt
+        .sign(k, &secp)
+        .map_err(|(_, mut errs)| errs.pop_first().unwrap().1)?;
+    let mut tx = psbt.extract_tx_unchecked_fee_rate();
+    let txin = tx.input.pop().unwrap();
+    Ok((txin.script_sig, txin.witness))
+}
+
 const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
 
-/// Compute witness commitment spk, from block txs not including coinbase tx.
+/// Add witness commitment output to the coinbase tx, and return a copy of the
+/// witness commitment spk.
+/// The coinbase tx should not include the witness commitment txout.
 /// Signet challenge should be `Some` for signets, and `None` otherwise.
-fn witness_commitment_spk<Signer>(
+fn add_witness_commitment_output<SignetSigner>(
+    coinbase_tx: &mut Transaction,
+    block_version: bitcoin::block::Version,
+    prev_blockhash: BlockHash,
+    block_timestamp: u32,
     transactions: &[BlockTemplateTransaction],
     signet_challenge: Option<&Script>,
-    signet_signer: &Signer,
-) -> Result<ScriptBuf, Signer::Error>
+    signet_signer: &SignetSigner,
+) -> Result<ScriptBuf, bitcoin::psbt::SignError>
 where
-    Signer: SignetSigner,
+    SignetSigner: bitcoin::psbt::GetKey,
 {
     let witness_root = {
         let hashes = std::iter::once(Wtxid::all_zeros().to_raw_hash())
@@ -178,7 +278,7 @@ where
         &WITNESS_RESERVED_VALUE,
     );
     // https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#commitment-structure
-    let mut res = {
+    let mut witness_commitment_spk = {
         const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
         let mut push_bytes = PushBytesBuf::from(WITNESS_COMMITMENT_HEADER);
         let () = push_bytes
@@ -188,26 +288,46 @@ where
     };
     if let Some(signet_challenge) = signet_challenge {
         const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
+        let signet_merkle_root = {
+            let mut modified_coinbase_tx = coinbase_tx.clone();
+            modified_coinbase_tx.output.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new_op_return(PushBytesBuf::from(
+                    SIGNET_HEADER,
+                )),
+            });
+            let hashes = std::iter::once(
+                modified_coinbase_tx.compute_wtxid().to_raw_hash(),
+            )
+            .chain(transactions.iter().map(|tx| tx.hash.to_raw_hash()));
+            merkle_tree::calculate_root(hashes)
+                .map(WitnessMerkleNode::from_raw_hash)
+                .unwrap()
+        };
+        let (script_sig, script_witness) = signet_sign_block(
+            block_version,
+            prev_blockhash,
+            signet_merkle_root,
+            block_timestamp,
+            signet_challenge.to_owned(),
+            signet_signer,
+        )?;
         let mut push_bytes = PushBytesBuf::from(SIGNET_HEADER);
-        let (script_sig, script_witness) =
-            signet_signer.sign(signet_challenge)?;
         push_bytes.extend_from_slice(script_sig.as_bytes()).unwrap();
-        // FIXME: is this correct?
         let script_witness_bytes =
             bitcoin::consensus::serialize(&script_witness);
         push_bytes.extend_from_slice(&script_witness_bytes).unwrap();
-        res.push_slice(push_bytes);
+        witness_commitment_spk.push_slice(push_bytes);
     }
-    Ok(res)
+    coinbase_tx.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: witness_commitment_spk.clone(),
+    });
+    Ok(witness_commitment_spk)
 }
 
-#[derive(Educe)]
-#[educe(Debug(bound()))]
-#[derive(Error)]
-enum FinalizeCoinbaseTxError<Signer>
-where
-    Signer: SignetSigner,
-{
+#[derive(Debug, Error)]
+enum FinalizeCoinbaseTxError {
     #[error("Coinbase reward underflow")]
     CoinbaseRewardUnderflow,
     #[error("Fee overflow")]
@@ -222,24 +342,28 @@ where
         fee: bitcoin::SignedAmount,
     },
     #[error("Failed to sign signet block")]
-    Signet(#[source] <Signer as SignetSigner>::Error),
+    Signet(#[from] bitcoin::psbt::SignError),
 }
 
-// Finalize coinbase tx, returning the coinbase tx and witness commitment spk
-fn finalize_coinbase_tx<Signer>(
+/// Finalize coinbase tx, returning the coinbase tx and witness commitment spk
+#[allow(clippy::too_many_arguments)]
+fn finalize_coinbase_tx<SignetSigner>(
     coinbase_spk: ScriptBuf,
-    best_block_height: u32,
+    block_version: bitcoin::block::Version,
+    block_height: u32,
+    prev_blockhash: BlockHash,
+    block_timestamp: u32,
     network: Network,
     mut coinbase_txouts: Vec<TxOut>,
     transactions: &[BlockTemplateTransaction],
     signet_challenge: Option<&Script>,
-    signet_signer: &Signer,
-) -> Result<(Transaction, ScriptBuf), FinalizeCoinbaseTxError<Signer>>
+    signet_signer: &SignetSigner,
+) -> Result<(Transaction, ScriptBuf), FinalizeCoinbaseTxError>
 where
-    Signer: SignetSigner,
+    SignetSigner: bitcoin::psbt::GetKey,
 {
     let bip34_height_script = bitcoin::blockdata::script::Builder::new()
-        .push_int((best_block_height + 1) as i64)
+        .push_int(block_height as i64)
         .push_opcode(bitcoin::opcodes::OP_0)
         .into_script();
     let fees = transactions.iter().enumerate().try_fold(
@@ -257,7 +381,7 @@ where
                 .ok_or(FinalizeCoinbaseTxError::FeeOverflow)
         },
     )?;
-    let block_reward = get_block_reward(best_block_height + 1, fees, network);
+    let block_reward = get_block_reward(block_height, fees, network);
     // Remaining block reward value to add to coinbase txouts
     let coinbase_reward = coinbase_txouts.iter().try_fold(
         block_reward,
@@ -273,20 +397,7 @@ where
             script_pubkey: coinbase_spk,
         })
     }
-    let witness_commitment_spk =
-        witness_commitment_spk(transactions, signet_challenge, signet_signer)
-            .map_err(FinalizeCoinbaseTxError::Signet)?;
-    // Add witness commitment to coinbase txouts if not present
-    if !coinbase_txouts
-        .iter()
-        .any(|txout| txout.script_pubkey == witness_commitment_spk)
-    {
-        coinbase_txouts.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: witness_commitment_spk.clone(),
-        })
-    }
-    let res = Transaction {
+    let mut coinbase_tx = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![bitcoin::TxIn {
@@ -300,19 +411,27 @@ where
         }],
         output: coinbase_txouts,
     };
-    Ok((res, witness_commitment_spk))
+    let witness_commitment_spk = add_witness_commitment_output(
+        &mut coinbase_tx,
+        block_version,
+        prev_blockhash,
+        block_timestamp,
+        transactions,
+        signet_challenge,
+        signet_signer,
+    )?;
+    Ok((coinbase_tx, witness_commitment_spk))
 }
 
 #[derive(Educe)]
 #[educe(Debug(bound()))]
 #[derive(Error)]
-enum BuildBlockError<BP, Signer>
+enum BuildBlockError<BP>
 where
     BP: CusfBlockProducer,
-    Signer: SignetSigner,
 {
     #[error(transparent)]
-    FinalizeCoinbaseTx(#[from] FinalizeCoinbaseTxError<Signer>),
+    FinalizeCoinbaseTx(#[from] FinalizeCoinbaseTxError),
     #[error(transparent)]
     InitialBlockTemplate(BP::InitialBlockTemplateError),
     #[error(transparent)]
@@ -324,14 +443,13 @@ where
 }
 
 // select block txs, and coinbase txouts if coinbasetxn is set
-fn block_txs<const COINBASE_TXN: bool, BP, Signer>(block_producer: &BP, mempool: &crate::mempool::Mempool)
+fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate::mempool::Mempool)
     -> Result<
             (<typewit::const_marker::Bool<COINBASE_TXN> as cusf_block_producer::CoinbaseTxn>::CoinbaseTxouts,
              Vec<BlockTemplateTransaction>),
-            BuildBlockError<BP, Signer>
+            BuildBlockError<BP>
         >
     where BP: CusfBlockProducer,
-        Signer: SignetSigner,
     typewit::const_marker::Bool<COINBASE_TXN>: cusf_block_producer::CoinbaseTxn
      {
     let mut initial_block_template =
@@ -433,10 +551,10 @@ fn block_txs<const COINBASE_TXN: bool, BP, Signer>(block_producer: &BP, mempool:
 }
 
 #[async_trait]
-impl<BP, Signer> RpcServer for Server<BP, Signer>
+impl<BP, SignetSigner> RpcServer for Server<BP, SignetSigner>
 where
     BP: CusfBlockProducer + Send + Sync + 'static,
-    Signer: SignetSigner + Send + Sync + 'static,
+    SignetSigner: bitcoin::psbt::GetKey + Send + Sync + 'static,
 {
     async fn get_block_template(
         &self,
@@ -459,7 +577,8 @@ where
             ref signet_challenge,
             ..
         } = self.sample_block_template;
-
+        let current_time_adjusted =
+            (now.timestamp() + self.network_info.time_offset_s) as u64;
         let (
             target,
             prev_blockhash,
@@ -475,11 +594,14 @@ where
                 let (coinbase_txn, block_txs, default_witness_commitment) =
                     if request.capabilities.contains("coinbasetxn") {
                         let (coinbase_txouts, block_txs) =
-                            block_txs::<true, _, _>(enforcer, mempool)?;
+                            block_txs::<true, _>(enforcer, mempool)?;
                         let (coinbase_tx, witness_commitment_spk) =
                             finalize_coinbase_tx(
                                 self.coinbase_spk.clone(),
-                                tip_block.height,
+                                version,
+                                tip_block.height + 1,
+                                tip_block.hash,
+                                current_time_adjusted as u32,
                                 self.network,
                                 coinbase_txouts,
                                 &block_txs,
@@ -497,7 +619,7 @@ where
                         )
                     } else {
                         let ((), block_txs) =
-                            block_txs::<false, _, _>(enforcer, mempool)?;
+                            block_txs::<false, _>(enforcer, mempool)?;
                         (None, block_txs, None)
                     };
                 Ok((
@@ -516,7 +638,7 @@ where
                 let err = log_error(err);
                 internal_error(err)
             })?
-            .map_err(|err: BuildBlockError<_, _>| {
+            .map_err(|err: BuildBlockError<_>| {
                 let err = log_error(err);
                 internal_error(err)
             })?;
@@ -546,8 +668,6 @@ where
         } else {
             coinbase_txn_or_value.clone()
         };
-        let current_time_adjusted =
-            (now.timestamp() + self.network_info.time_offset_s) as u64;
         let mintime = std::cmp::max(
             tip_block_mediantime as u64 + 1,
             current_time_adjusted,
