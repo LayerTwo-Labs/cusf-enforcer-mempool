@@ -10,11 +10,11 @@ authors = [
     "Ash Manning <ash@layertwolabs.com>",
 ]
 edition = "2021"
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies.bip300301]
 git = "https://github.com/Ash-L2L/bip300301.git"
-rev = "269eea374a5f8ca829b7aa775d4711483759a391"
+rev = "d2c92e06d9640c793288d2995bdc8d81fee4221f"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

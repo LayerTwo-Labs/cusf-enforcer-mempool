@@ -184,7 +184,7 @@ checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
 [[package]]
 name = "bip300301"
 version = "0.1.1"
-source = "git+https://github.com/Ash-L2L/bip300301.git?rev=269eea374a5f8ca829b7aa775d4711483759a391#269eea374a5f8ca829b7aa775d4711483759a391"
+source = "git+https://github.com/Ash-L2L/bip300301.git?rev=d2c92e06d9640c793288d2995bdc8d81fee4221f#d2c92e06d9640c793288d2995bdc8d81fee4221f"
 dependencies = [
  "base64",
  "bitcoin",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "cusf-enforcer-mempool"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "cusf-enforcer-mempool-demo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bip300301",

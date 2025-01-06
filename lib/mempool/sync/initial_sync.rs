@@ -318,7 +318,7 @@ where
     let Some(tx) = sync_state.tx_cache.get(txid) else {
         return Ok(false);
     };
-    let (mut value_in, value_out) = (Some(Amount::ZERO), Amount::ZERO);
+    let mut value_in = Some(Amount::ZERO);
     let mut input_txs_needed = Vec::new();
     for input in &tx.input {
         let OutPoint {
@@ -339,7 +339,7 @@ where
                 continue;
             };
         let value = input_tx.output[vout as usize].value;
-        value_in = value_in.map(|value_in| value_in + value);
+        value_in = value_in.and_then(|value_in| value_in.checked_add(value));
     }
     for input_txid in input_txs_needed.into_iter().rev() {
         sync_state.txs_needed.replace(input_txid);
@@ -349,6 +349,14 @@ where
             .push_front(RequestItem::Tx(input_txid, false))
     }
     let Some(value_in) = value_in else {
+        return Ok(false);
+    };
+    let mut value_out = Some(Amount::ZERO);
+    for output in &tx.output {
+        value_out =
+            value_out.and_then(|value_out| value_out.checked_add(output.value));
+    }
+    let Some(value_out) = value_out else {
         return Ok(false);
     };
     let Some(fee_delta) = value_in.checked_sub(value_out) else {
