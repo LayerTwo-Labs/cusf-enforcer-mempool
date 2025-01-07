@@ -11,10 +11,12 @@ authors = [
 ]
 edition = "2021"
 version = "0.1.1"
+license-file = "LICENSE.txt"
+publish = false
 
 [workspace.dependencies.bip300301]
 git = "https://github.com/Ash-L2L/bip300301.git"
-rev = "d2c92e06d9640c793288d2995bdc8d81fee4221f"
+rev = "45f74e37b8295207d29ddbbce10d563ec9f67151"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
