@@ -271,7 +271,24 @@ fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate:
             initial_block_template,
         )
         .map_err(BuildBlockError::InitialBlockTemplate)?;
+    let prefix_txids: hashlink::LinkedHashSet<Txid> = initial_block_template
+        .prefix_txs
+        .iter()
+        .map(|(tx, _fee)| tx.compute_txid())
+        .collect();
+    {
+        let prefix_txids: String = format!(
+            "[{}]",
+            prefix_txids
+                .iter()
+                .map(|txid| txid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tracing::debug!(%prefix_txids);
+    }
     let mut mempool = mempool.clone();
+    tracing::debug!("Inserting prefix txs into cloned mempool");
     for (tx, fee) in initial_block_template.prefix_txs.iter().cloned() {
         let _txinfo: Option<_> = mempool.insert(tx, fee.to_sat())?;
     }
@@ -291,14 +308,9 @@ fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate:
             })
             .collect()
     };
+    // Remove prefix txs
     {
-        // Remove prefix txs
-        let prefix_txids: std::collections::HashSet<Txid> =
-            initial_block_template
-                .prefix_txs
-                .iter()
-                .map(|(tx, _fee)| tx.compute_txid())
-                .collect();
+        tracing::debug!("Removing prefix txs");
         let _removed_txs = mempool
             .try_filter(false, |tx, _| {
                 let txid = tx.compute_txid();
@@ -307,6 +319,18 @@ fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate:
             .map_err(|err| match err {
                 either::Either::Left(err) => err,
             })?;
+        {
+            let excluded_txids: String = format!(
+                "[{}]",
+                initial_block_template
+                    .exclude_mempool_txs
+                    .iter()
+                    .map(|txid| txid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            tracing::debug!(%excluded_txids, "Removing excluded txs");
+        }
         let _removed_txs = mempool
             .try_filter(true, |tx, _| {
                 let txid = tx.compute_txid();
@@ -318,7 +342,19 @@ fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate:
                 either::Either::Left(err) => err,
             })?;
     }
+    tracing::debug!("Proposing txs for inclusion in block");
     let mempool_txs = mempool.propose_txs()?;
+    {
+        let proposed_txids: String = format!(
+            "[{}]",
+            mempool_txs
+                .iter()
+                .map(|tx| tx.txid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
+    }
     initial_block_template
         .prefix_txs
         .extend(mempool_txs.iter().map(|tx| {
