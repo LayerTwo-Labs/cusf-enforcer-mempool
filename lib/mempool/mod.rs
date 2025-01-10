@@ -255,6 +255,14 @@ impl Mempool {
             })
             .filter(|input_txid| self.txs.0.contains_key(input_txid))
             .collect();
+        for dep in &depends {
+            let (_, dep_info) =
+                self.txs.0.get_mut(dep).ok_or(MissingAncestorError {
+                    tx: txid,
+                    missing: *dep,
+                })?;
+            dep_info.spent_by.insert(txid);
+        }
         let spent_by = if let Some(childs) = self.tx_childs.0.get(&txid) {
             OrdSet::from_iter(childs.iter().copied())
         } else {
@@ -494,9 +502,11 @@ impl Mempool {
             else {
                 break;
             };
+            tracing::trace!(%txid, "Proposing tx with ancestors");
             let mut to_add = vec![(txid, false)];
             while let Some((txid, parents_visited)) = to_add.pop() {
                 if parents_visited {
+                    tracing::trace!(%txid, "Removing tx from mempool");
                     let (_tx, _info) = self
                         .remove(&txid)?
                         .expect("missing tx in mempool when proposing txs");
