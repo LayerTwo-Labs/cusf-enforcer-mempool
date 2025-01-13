@@ -503,6 +503,7 @@ impl Mempool {
                 break;
             };
             tracing::trace!(%txid, "Proposing tx with ancestors");
+            // stack of txs to add
             let mut to_add = vec![(txid, false)];
             while let Some((txid, parents_visited)) = to_add.pop() {
                 if parents_visited {
@@ -513,8 +514,8 @@ impl Mempool {
                     res.insert(txid);
                 } else {
                     let (_tx, info) = &self.txs.0[&txid];
-                    to_add.extend(info.depends.iter().map(|dep| (*dep, false)));
-                    to_add.push((txid, true))
+                    to_add.push((txid, true));
+                    to_add.extend(info.depends.iter().map(|dep| (*dep, false)))
                 }
             }
             total_size += ancestor_fee_rate.size;
@@ -529,12 +530,16 @@ impl Mempool {
         let mut res = Vec::new();
         // build result in reverse order
         while let Some(txid) = txs.pop() {
+            tracing::trace!(%txid, "Computing deps for tx");
             let mut depends = Vec::new();
             let mut ancestors = self.txs.ancestors(txid);
             while let Some((anc_txid, _, _)) = ancestors.next().transpose()? {
-                let anc_idx = txs
-                    .get_index_of(&anc_txid)
-                    .expect("missing dependency in proposal txs");
+                let anc_idx = txs.get_index_of(&anc_txid).ok_or(
+                    MissingAncestorError {
+                        tx: txid,
+                        missing: anc_txid,
+                    },
+                )?;
                 depends.push(anc_idx as u32);
             }
             depends.sort();
