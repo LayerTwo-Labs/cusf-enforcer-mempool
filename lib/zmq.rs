@@ -1,7 +1,4 @@
-use std::ops::Add;
-
 use bitcoin::{hashes::Hash as _, BlockHash, Txid};
-use either::Either;
 use futures::{
     stream::{self, BoxStream},
     Stream, StreamExt, TryStreamExt as _,
@@ -149,6 +146,8 @@ impl TryFrom<ZmqMessage> for SequenceMessage {
 pub enum SequenceStreamError {
     #[error("Error deserializing message")]
     Deserialize(#[from] DeserializeSequenceMessageError),
+    #[error("Expected message with mempool sequence at least {min_next_seq}, but received {seq}")]
+    ExpectedMempoolSequenceAtLeast { min_next_seq: u64, seq: u64 },
     #[error("Missing message with mempool sequence {0}")]
     MissingMempoolSequence(u64),
     #[error("Missing message with zmq sequence {0}")]
@@ -176,72 +175,87 @@ impl Stream for SequenceStream<'_> {
     }
 }
 
-/// Returns `Left(true)` if the sequence number is equal to the next sequence
-/// number, and increments the next sequence number.
-/// Returns `Left(true)` if the next sequence number is `None`, and sets the
-/// next sequence number to the successor of the sequence number.
-/// Returns `Left(false)` if the next sequence number is `1` greater than the
-/// sequence number (ignore duplicate messages).
-/// Otherwise, returns `Right(next_seq)`.
-fn check_seq_number<Seq>(
-    next_seq: &mut Option<Seq>,
-    seq: Seq,
-) -> Either<bool, &mut Seq>
-where
-    Seq: Add<Seq, Output = Seq> + Copy + Eq + num_traits::ConstOne,
-{
-    match next_seq {
+/// Next mempool sequence
+#[derive(Clone, Copy, Debug)]
+enum NextMempoolSeq {
+    /// After a block (dis)connect event, next mempool seq is incremented by
+    /// the number of txs added/removed from mempool by block (dis)connect
+    AtLeast(u64),
+    Equal(u64),
+}
+
+fn check_mempool_seq(
+    next_mempool_seq: &mut Option<NextMempoolSeq>,
+    msg: SequenceMessage,
+) -> Result<Option<SequenceMessage>, SequenceStreamError> {
+    match (*next_mempool_seq, msg.mempool_seq()) {
+        (None, Some(mempool_seq)) => {
+            *next_mempool_seq = Some(NextMempoolSeq::Equal(mempool_seq + 1));
+            Ok(Some(msg))
+        }
+        (Some(NextMempoolSeq::AtLeast(min_next_seq)), Some(mempool_seq)) => {
+            // No duplicate message is possible, since we know that the last
+            // message must have been a block event
+            if mempool_seq >= min_next_seq {
+                *next_mempool_seq =
+                    Some(NextMempoolSeq::Equal(mempool_seq + 1));
+                Ok(Some(msg))
+            } else {
+                let err = SequenceStreamError::ExpectedMempoolSequenceAtLeast {
+                    min_next_seq,
+                    seq: mempool_seq,
+                };
+                Err(err)
+            }
+        }
+        (Some(NextMempoolSeq::Equal(next_seq)), Some(mempool_seq)) => {
+            if mempool_seq + 1 == next_seq {
+                // Ignore duplicates
+                Ok(None)
+            } else if mempool_seq == next_seq {
+                *next_mempool_seq =
+                    Some(NextMempoolSeq::Equal(mempool_seq + 1));
+                Ok(Some(msg))
+            } else {
+                let err = SequenceStreamError::MissingMempoolSequence(next_seq);
+                Err(err)
+            }
+        }
+        (None | Some(NextMempoolSeq::AtLeast(_)), None) => Ok(Some(msg)),
+        (Some(NextMempoolSeq::Equal(next_seq)), None) => {
+            *next_mempool_seq = Some(NextMempoolSeq::AtLeast(next_seq));
+            Ok(Some(msg))
+        }
+    }
+}
+
+fn check_zmq_seq(
+    next_zmq_seq: &mut Option<u32>,
+    msg: SequenceMessage,
+) -> Result<Option<SequenceMessage>, SequenceStreamError> {
+    let zmq_seq = msg.zmq_seq();
+    match next_zmq_seq {
         None => {
-            *next_seq = Some(seq + Seq::ONE);
-            Either::Left(true)
+            *next_zmq_seq = Some(zmq_seq + 1);
+            Ok(Some(msg))
         }
         Some(next_seq) => {
-            if seq + Seq::ONE == *next_seq {
+            if zmq_seq + 1 == *next_seq {
                 // Ignore duplicates
-                Either::Left(false)
-            } else if seq == *next_seq {
-                *next_seq = seq + Seq::ONE;
-                Either::Left(true)
+                Ok(None)
+            } else if zmq_seq == *next_seq {
+                *next_seq += 1;
+                Ok(Some(msg))
             } else {
-                Either::Right(next_seq)
+                let err = SequenceStreamError::MissingZmqSequence(*next_seq);
+                Err(err)
             }
         }
     }
 }
 
-/// See [`check_seq_number`]
-fn check_mempool_seq(
-    next_mempool_seq: &mut Option<u64>,
-    msg: SequenceMessage,
-) -> Result<Option<SequenceMessage>, SequenceStreamError> {
-    let Some(mempool_seq) = msg.mempool_seq() else {
-        return Ok(Some(msg));
-    };
-    match check_seq_number(next_mempool_seq, mempool_seq) {
-        Either::Left(true) => Ok(Some(msg)),
-        Either::Left(false) => Ok(None),
-        Either::Right(next_mempool_seq) => Err(
-            SequenceStreamError::MissingMempoolSequence(*next_mempool_seq),
-        ),
-    }
-}
-
-/// See [`check_seq_number`]
-fn check_zmq_seq(
-    next_zmq_seq: &mut Option<u32>,
-    msg: SequenceMessage,
-) -> Result<Option<SequenceMessage>, SequenceStreamError> {
-    match check_seq_number(next_zmq_seq, msg.zmq_seq()) {
-        Either::Left(true) => Ok(Some(msg)),
-        Either::Left(false) => Ok(None),
-        Either::Right(next_zmq_seq) => {
-            Err(SequenceStreamError::MissingZmqSequence(*next_zmq_seq))
-        }
-    }
-}
-
 fn check_seq_numbers(
-    next_mempool_seq: &mut Option<u64>,
+    next_mempool_seq: &mut Option<NextMempoolSeq>,
     next_zmq_seq: &mut Option<u32>,
     msg: SequenceMessage,
 ) -> Result<Option<SequenceMessage>, SequenceStreamError> {
@@ -251,6 +265,11 @@ fn check_seq_numbers(
     check_zmq_seq(next_zmq_seq, msg)
 }
 
+/// Subscribe to ZMQ sequence stream.
+/// Sequence numbers are checked, although mempool sequence numbers can only
+/// be partially checked, since block (dis)connect events may increment
+/// mempool sequence numbers in a manner that cannot be determined from
+/// block event messages alone.
 #[tracing::instrument]
 pub async fn subscribe_sequence<'a>(
     zmq_addr_sequence: &str,
@@ -267,7 +286,7 @@ pub async fn subscribe_sequence<'a>(
         Ok(Some((msg, socket)))
     })
     .try_filter_map({
-        let mut next_mempool_seq: Option<u64> = None;
+        let mut next_mempool_seq: Option<NextMempoolSeq> = None;
         let mut next_zmq_seq: Option<u32> = None;
         move |sequence_msg| {
             let res = check_seq_numbers(

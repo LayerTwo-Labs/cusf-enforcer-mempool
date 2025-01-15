@@ -142,6 +142,55 @@ fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
     sync_state.tx_cache.insert(txid, tx);
 }
 
+fn connect_block<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    sync_state: &mut SyncState,
+    block: &bip300301::client::Block<true>,
+) -> Result<(), SyncTaskError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    let mut removed_txids = Vec::new();
+    for tx_info in &block.tx {
+        let txid = tx_info.txid;
+        if let Some((tx, _)) = inner.mempool.remove(&txid)? {
+            removed_txids.push(tx.compute_txid());
+        };
+        sync_state
+            .request_queue
+            .remove(&RequestItem::Tx(txid, true));
+    }
+    inner.mempool.chain.tip = block.hash;
+    let block_decoded =
+        block.try_into().map_err(|err| SyncTaskError::DecodeBlock {
+            block_hash: block.hash,
+            source: err,
+        })?;
+    match inner
+        .enforcer
+        .connect_block(&block_decoded)
+        .map_err(cusf_enforcer::Error::ConnectBlock)?
+    {
+        ConnectBlockAction::Accept { remove_mempool_txs } => {
+            let _removed_txs = inner
+                .mempool
+                .try_filter(true, |tx, _| {
+                    Ok::<_, Infallible>(
+                        !remove_mempool_txs.contains(&tx.compute_txid()),
+                    )
+                })
+                .map_err(|err| {
+                    let either::Either::Left(err) = err;
+                    SyncTaskError::MempoolRemove(err)
+                })?;
+        }
+        ConnectBlockAction::Reject => {
+            // FIXME: reject block
+        }
+    };
+    Ok(())
+}
+
 async fn handle_resp_block<Enforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
@@ -168,44 +217,7 @@ where
             if block_hash_msg.block_hash != resp_block.hash {
                 return Ok(());
             }
-            for tx_info in &resp_block.tx {
-                let txid = tx_info.txid;
-                let _removed: Option<_> = inner.mempool.remove(&txid)?;
-                sync_state
-                    .request_queue
-                    .remove(&RequestItem::Tx(txid, true));
-            }
-            inner.mempool.chain.tip = resp_block.hash;
-            let resp_block_decoded =
-                (&resp_block).try_into().map_err(|err| {
-                    SyncTaskError::DecodeBlock {
-                        block_hash: resp_block.hash,
-                        source: err,
-                    }
-                })?;
-            match inner
-                .enforcer
-                .connect_block(&resp_block_decoded)
-                .map_err(cusf_enforcer::Error::ConnectBlock)?
-            {
-                ConnectBlockAction::Accept { remove_mempool_txs } => {
-                    let _removed_txs = inner
-                        .mempool
-                        .try_filter(true, |tx, _| {
-                            Ok::<_, Infallible>(
-                                !remove_mempool_txs
-                                    .contains(&tx.compute_txid()),
-                            )
-                        })
-                        .map_err(|err| {
-                            let either::Either::Left(err) = err;
-                            SyncTaskError::MempoolRemove(err)
-                        })?;
-                }
-                ConnectBlockAction::Reject => {
-                    // FIXME: reject block
-                }
-            };
+            let () = connect_block(inner, sync_state, &resp_block)?;
             sync_state.seq_message_queue.pop_front();
         }
         BlockHashEvent::Disconnected => {
@@ -364,10 +376,23 @@ where
                 inner.mempool.remove(txid)?.is_some()
             }
             Some(SequenceMessage::BlockHash(BlockHashMessage {
+                block_hash,
                 event: BlockHashEvent::Connected,
                 ..
-            }))
-            | None => false,
+            })) => {
+                let Some(block) =
+                    inner.mempool.chain.blocks.get(block_hash).cloned()
+                else {
+                    break 'res false;
+                };
+                let parent = block
+                    .previousblockhash
+                    .unwrap_or_else(BlockHash::all_zeros);
+                assert_eq!(inner.mempool.chain.tip, parent);
+                let () = connect_block(inner, sync_state, &block)?;
+                true
+            }
+            None => false,
         }
     };
     if res {
