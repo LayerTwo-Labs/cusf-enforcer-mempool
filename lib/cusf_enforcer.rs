@@ -96,7 +96,7 @@ where
     #[error("ZMQ sequence stream ended unexpectedly")]
     SequenceStreamEnded,
     #[error(transparent)]
-    Zmq(#[from] zeromq::ZmqError),
+    SubscribeSequence(#[from] crate::zmq::SubscribeSequenceError),
 }
 
 /// Subscribe to ZMQ sequence and sync enforcer, obtaining a ZMQ sequence

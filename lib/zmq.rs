@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bitcoin::{hashes::Hash as _, BlockHash, Txid};
 use futures::{
     stream::{self, BoxStream},
@@ -265,6 +267,14 @@ fn check_seq_numbers(
     check_zmq_seq(next_zmq_seq, msg)
 }
 
+#[derive(Debug, Error)]
+pub enum SubscribeSequenceError {
+    #[error("Connection timeout")]
+    Timeout(#[from] tokio::time::error::Elapsed),
+    #[error(transparent)]
+    Zmq(#[from] ZmqError),
+}
+
 /// Subscribe to ZMQ sequence stream.
 /// Sequence numbers are checked, although mempool sequence numbers can only
 /// be partially checked, since block (dis)connect events may increment
@@ -273,10 +283,12 @@ fn check_seq_numbers(
 #[tracing::instrument]
 pub async fn subscribe_sequence<'a>(
     zmq_addr_sequence: &str,
-) -> Result<SequenceStream<'a>, ZmqError> {
+) -> Result<SequenceStream<'a>, SubscribeSequenceError> {
     tracing::debug!("Attempting to connect to ZMQ server...");
+    const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
     let mut socket = zeromq::SubSocket::new();
-    socket.connect(zmq_addr_sequence).await?;
+    tokio::time::timeout(CONNECTION_TIMEOUT, socket.connect(zmq_addr_sequence))
+        .await??;
     tracing::info!("Connected to ZMQ server");
     tracing::debug!("Attempting to subscribe to `sequence` topic...");
     socket.subscribe("sequence").await?;
