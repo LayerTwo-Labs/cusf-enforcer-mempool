@@ -158,6 +158,16 @@ enum FinalizeCoinbaseTxError {
     },
 }
 
+/// Generate a BIP34 height script
+fn bip34_height_script(height: u32) -> ScriptBuf {
+    let mut builder =
+        bitcoin::blockdata::script::Builder::new().push_int(height as i64);
+    while builder.len() < 2 {
+        builder = builder.push_opcode(bitcoin::opcodes::OP_0);
+    }
+    builder.into_script()
+}
+
 /// Finalize coinbase tx.
 /// The witness commitment output in the coinbase is not added on signets.
 /// Returns the coinbase tx, and (on networks other than signets) the witness
@@ -169,10 +179,6 @@ fn finalize_coinbase_tx(
     mut coinbase_txouts: Vec<TxOut>,
     transactions: &[BlockTemplateTransaction],
 ) -> Result<(Transaction, Option<ScriptBuf>), FinalizeCoinbaseTxError> {
-    let bip34_height_script = bitcoin::blockdata::script::Builder::new()
-        .push_int(block_height as i64)
-        .push_opcode(bitcoin::opcodes::OP_0)
-        .into_script();
     let fees = transactions.iter().enumerate().try_fold(
         Amount::ZERO,
         |fees_acc, (tx_index, tx)| {
@@ -219,7 +225,7 @@ fn finalize_coinbase_tx(
             },
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::from_slice(&[WITNESS_RESERVED_VALUE]),
-            script_sig: bip34_height_script,
+            script_sig: bip34_height_script(block_height),
         }],
         output: coinbase_txouts,
     };
