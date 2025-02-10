@@ -40,14 +40,15 @@ pub trait CusfEnforcer {
     fn connect_block(
         &mut self,
         block: &bitcoin::Block,
-    ) -> Result<ConnectBlockAction, Self::ConnectBlockError>;
+    ) -> impl Future<Output = Result<ConnectBlockAction, Self::ConnectBlockError>>
+           + Send;
 
     type DisconnectBlockError: std::error::Error + Send + Sync + 'static;
 
     fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
-    ) -> Result<(), Self::DisconnectBlockError>;
+    ) -> impl Future<Output = Result<(), Self::DisconnectBlockError>> + Send;
 
     type AcceptTxError: std::error::Error + Send + Sync + 'static;
 
@@ -195,7 +196,7 @@ where
 }
 
 /// Run an enforcer in sync with a node
-pub async fn task<'a, Enforcer, MainClient>(
+pub async fn task<Enforcer, MainClient>(
     enforcer: &mut Enforcer,
     main_client: &MainClient,
     zmq_addr_sequence: &str,
@@ -227,7 +228,8 @@ where
                 })?;
                 match enforcer
                     .connect_block(&block)
-                    .map_err(TaskError::ConnectBlock)?
+                    .map_err(TaskError::ConnectBlock)
+                    .await?
                 {
                     ConnectBlockAction::Accept {
                         remove_mempool_txs: _,
@@ -240,7 +242,8 @@ where
             BlockHashEvent::Disconnected => {
                 let () = enforcer
                     .disconnect_block(block_hash)
-                    .map_err(TaskError::DisconnectBlock)?;
+                    .map_err(TaskError::DisconnectBlock)
+                    .await?;
             }
         }
     }
@@ -305,16 +308,24 @@ where
 
     type ConnectBlockError = ComposeConnectBlockError<C0, C1>;
 
-    fn connect_block(
+    async fn connect_block(
         &mut self,
         block: &bitcoin::Block,
     ) -> Result<ConnectBlockAction, Self::ConnectBlockError> {
-        let res_left = self.0.connect_block(block).map_err(|err| {
-            Self::ConnectBlockError::ConnectBlock(Either::Left(err))
-        })?;
-        let res_right = self.1.connect_block(block).map_err(|err| {
-            Self::ConnectBlockError::ConnectBlock(Either::Right(err))
-        })?;
+        let res_left = self
+            .0
+            .connect_block(block)
+            .map_err(|err| {
+                Self::ConnectBlockError::ConnectBlock(Either::Left(err))
+            })
+            .await?;
+        let res_right = self
+            .1
+            .connect_block(block)
+            .map_err(|err| {
+                Self::ConnectBlockError::ConnectBlock(Either::Right(err))
+            })
+            .await?;
         match (res_left, res_right) {
             (
                 ConnectBlockAction::Accept {
@@ -334,13 +345,15 @@ where
                 },
             ) => {
                 // Disconnect block on right enforcer
-                let () = self.1.disconnect_block(block.block_hash()).map_err(
-                    |err| {
+                let () = self
+                    .1
+                    .disconnect_block(block.block_hash())
+                    .map_err(|err| {
                         Self::ConnectBlockError::DisconnectBlock(Either::Right(
                             err,
                         ))
-                    },
-                )?;
+                    })
+                    .await?;
                 Ok(ConnectBlockAction::Reject)
             }
             (
@@ -350,13 +363,15 @@ where
                 ConnectBlockAction::Reject,
             ) => {
                 // Disconnect block on left enforcer
-                let () = self.0.disconnect_block(block.block_hash()).map_err(
-                    |err| {
+                let () = self
+                    .0
+                    .disconnect_block(block.block_hash())
+                    .map_err(|err| {
                         Self::ConnectBlockError::DisconnectBlock(Either::Left(
                             err,
                         ))
-                    },
-                )?;
+                    })
+                    .await?;
                 Ok(ConnectBlockAction::Reject)
             }
             (ConnectBlockAction::Reject, ConnectBlockAction::Reject) => {
@@ -368,12 +383,19 @@ where
     type DisconnectBlockError =
         Either<C0::DisconnectBlockError, C1::DisconnectBlockError>;
 
-    fn disconnect_block(
+    async fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
     ) -> Result<(), Self::DisconnectBlockError> {
-        let () = self.0.disconnect_block(block_hash).map_err(Either::Left)?;
-        self.1.disconnect_block(block_hash).map_err(Either::Right)
+        let () = self
+            .0
+            .disconnect_block(block_hash)
+            .map_err(Either::Left)
+            .await?;
+        self.1
+            .disconnect_block(block_hash)
+            .map_err(Either::Right)
+            .await
     }
 
     type AcceptTxError = Either<C0::AcceptTxError, C1::AcceptTxError>;
@@ -409,7 +431,7 @@ impl CusfEnforcer for DefaultEnforcer {
 
     type ConnectBlockError = Infallible;
 
-    fn connect_block(
+    async fn connect_block(
         &mut self,
         _block: &bitcoin::Block,
     ) -> Result<ConnectBlockAction, Self::ConnectBlockError> {
@@ -418,7 +440,7 @@ impl CusfEnforcer for DefaultEnforcer {
 
     type DisconnectBlockError = Infallible;
 
-    fn disconnect_block(
+    async fn disconnect_block(
         &mut self,
         _block_hash: BlockHash,
     ) -> Result<(), Self::DisconnectBlockError> {
@@ -463,14 +485,16 @@ where
     type ConnectBlockError =
         Either<C0::ConnectBlockError, C1::ConnectBlockError>;
 
-    fn connect_block(
+    async fn connect_block(
         &mut self,
         block: &bitcoin::Block,
     ) -> Result<ConnectBlockAction, Self::ConnectBlockError> {
         match self {
-            Self::Left(left) => left.connect_block(block).map_err(Either::Left),
+            Self::Left(left) => {
+                left.connect_block(block).map_err(Either::Left).await
+            }
             Self::Right(right) => {
-                right.connect_block(block).map_err(Either::Right)
+                right.connect_block(block).map_err(Either::Right).await
             }
         }
     }
@@ -478,16 +502,21 @@ where
     type DisconnectBlockError =
         Either<C0::DisconnectBlockError, C1::DisconnectBlockError>;
 
-    fn disconnect_block(
+    async fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
     ) -> Result<(), Self::DisconnectBlockError> {
         match self {
             Self::Left(left) => {
-                left.disconnect_block(block_hash).map_err(Either::Left)
+                left.disconnect_block(block_hash)
+                    .map_err(Either::Left)
+                    .await
             }
             Self::Right(right) => {
-                right.disconnect_block(block_hash).map_err(Either::Right)
+                right
+                    .disconnect_block(block_hash)
+                    .map_err(Either::Right)
+                    .await
             }
         }
     }

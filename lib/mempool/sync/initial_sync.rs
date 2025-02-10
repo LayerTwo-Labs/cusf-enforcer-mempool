@@ -115,8 +115,8 @@ where
     SequenceStreamEnded,
 }
 
-fn connect_block<Enforcer>(
-    sync_state: &mut MempoolSyncing<Enforcer>,
+async fn connect_block<Enforcer>(
+    sync_state: &mut MempoolSyncing<'_, Enforcer>,
     block: &bip300301::client::Block<true>,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
@@ -140,6 +140,7 @@ where
     match sync_state
         .enforcer
         .connect_block(&block_decoded)
+        .await
         .map_err(cusf_enforcer::Error::ConnectBlock)?
     {
         ConnectBlockAction::Accept { remove_mempool_txs } => {
@@ -156,8 +157,8 @@ where
     Ok(())
 }
 
-fn disconnect_block<Enforcer>(
-    sync_state: &mut MempoolSyncing<Enforcer>,
+async fn disconnect_block<Enforcer>(
+    sync_state: &mut MempoolSyncing<'_, Enforcer>,
     block: &bip300301::client::Block<true>,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
@@ -170,6 +171,7 @@ where
     let () = sync_state
         .enforcer
         .disconnect_block(block.hash)
+        .await
         .map_err(cusf_enforcer::Error::DisconnectBlock)?;
     sync_state.mempool.chain.tip =
         block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
@@ -261,8 +263,8 @@ where
     Ok(())
 }
 
-fn handle_resp_block<Enforcer>(
-    sync_state: &mut MempoolSyncing<Enforcer>,
+async fn handle_resp_block<Enforcer>(
+    sync_state: &mut MempoolSyncing<'_, Enforcer>,
     resp_block: bip300301::client::Block<true>,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
@@ -275,7 +277,7 @@ where
             event: BlockHashEvent::Connected,
             ..
         })) if *block_hash == resp_block.hash => {
-            let () = connect_block(sync_state, &resp_block)?;
+            let () = connect_block(sync_state, &resp_block).await?;
             sync_state.seq_message_queue.pop_front();
         }
         Some(SequenceMessage::BlockHash(BlockHashMessage {
@@ -285,7 +287,7 @@ where
         })) if *block_hash == resp_block.hash
             && sync_state.mempool.chain.tip == resp_block.hash =>
         {
-            let () = disconnect_block(sync_state, &resp_block)?;
+            let () = disconnect_block(sync_state, &resp_block).await?;
             sync_state.seq_message_queue.pop_front();
         }
         Some(_) | None => (),
@@ -370,8 +372,8 @@ where
 }
 
 // returns `true` if an item was applied successfully
-fn try_apply_next_seq_message<Enforcer>(
-    sync_state: &mut MempoolSyncing<Enforcer>,
+async fn try_apply_next_seq_message<Enforcer>(
+    sync_state: &mut MempoolSyncing<'_, Enforcer>,
 ) -> Result<bool, SyncMempoolError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
@@ -391,7 +393,7 @@ where
                 else {
                     break 'res false;
                 };
-                let () = disconnect_block(sync_state, &block)?;
+                let () = disconnect_block(sync_state, &block).await?;
                 true
             }
             Some(SequenceMessage::TxHash(TxHashMessage {
@@ -421,8 +423,8 @@ where
     Ok(res)
 }
 
-fn handle_resp<Enforcer>(
-    sync_state: &mut MempoolSyncing<Enforcer>,
+async fn handle_resp<Enforcer>(
+    sync_state: &mut MempoolSyncing<'_, Enforcer>,
     resp: BatchedResponseItem,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
@@ -454,7 +456,7 @@ where
         }
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
             tracing::debug!(%block.hash, "Handling block");
-            let () = handle_resp_block(sync_state, *block)?;
+            let () = handle_resp_block(sync_state, *block).await?;
         }
         BatchedResponseItem::Single(ResponseItem::Tx(tx, in_mempool)) => {
             let mut input_txs_needed = LinkedHashSet::new();
@@ -480,7 +482,7 @@ where
         BatchedResponseItem::BatchRejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectTx) => {}
     }
-    while try_apply_next_seq_message(sync_state)? {}
+    while try_apply_next_seq_message(sync_state).await? {}
     Ok(())
 }
 
@@ -559,7 +561,7 @@ where
                 let () = handle_seq_message(&mut sync_state, seq_msg?)?;
             }
             CombinedStreamItem::Response(resp) => {
-                let () = handle_resp(&mut sync_state, resp?)?;
+                let () = handle_resp(&mut sync_state, resp?).await?;
             }
         }
     }

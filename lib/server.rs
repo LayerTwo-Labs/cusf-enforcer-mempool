@@ -12,6 +12,7 @@ use bitcoin::{
 };
 use chrono::Utc;
 use educe::Educe;
+use futures::FutureExt;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorCode};
 use thiserror::Error;
 
@@ -259,7 +260,7 @@ where
 }
 
 // select block txs, and coinbase txouts if coinbasetxn is set
-fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate::mempool::Mempool)
+async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate::mempool::Mempool)
     -> Result<
             (<typewit::const_marker::Bool<COINBASE_TXN> as cusf_block_producer::CoinbaseTxn>::CoinbaseTxouts,
              Vec<BlockTemplateTransaction>),
@@ -276,6 +277,7 @@ fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate:
             typewit::MakeTypeWitness::MAKE,
             initial_block_template,
         )
+        .await
         .map_err(BuildBlockError::InitialBlockTemplate)?;
     let prefix_txids: hashlink::LinkedHashSet<Txid> = initial_block_template
         .prefix_txs
@@ -371,6 +373,7 @@ fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate:
     tracing::debug!("Adding suffix txs");
     let suffix_txs = block_producer
         .suffix_txs(typewit::MakeTypeWitness::MAKE, &initial_block_template)
+        .await
         .map_err(BuildBlockError::SuffixTxs)?;
     res_txs.extend(mempool_txs);
     res_txs.extend(suffix_txs.iter().map(|(tx, fee)| {
@@ -445,42 +448,54 @@ where
         ) = self
             .mempool
             .with(|mempool, enforcer| {
-                let tip_block = mempool.tip();
-                let (coinbase_txn, block_txs, default_witness_commitment) =
-                    if request.capabilities.contains("coinbasetxn") {
-                        tracing::debug!("Filling block txs");
-                        let (coinbase_txouts, block_txs) =
-                            block_txs::<true, _>(enforcer, mempool)?;
-                        tracing::debug!("Finalizing coinbase txn");
-                        let (coinbase_tx, witness_commitment_spk) =
-                            finalize_coinbase_tx(
-                                self.coinbase_spk.clone(),
-                                tip_block.height + 1,
-                                self.network,
-                                coinbase_txouts,
-                                &block_txs,
-                            )?;
-                        let default_witness_commitment =
-                            witness_commitment_spk.map(|spk| spk.to_bytes());
-                        (
-                            Some(coinbase_tx),
+                {
+                    let coinbase_spk = self.coinbase_spk.clone();
+                    let network = self.network;
+                    async move {
+                        let tip_block = mempool.tip();
+                        let (
+                            coinbase_txn,
                             block_txs,
                             default_witness_commitment,
-                        )
-                    } else {
-                        let ((), block_txs) =
-                            block_txs::<false, _>(enforcer, mempool)?;
-                        (None, block_txs, None)
-                    };
-                Ok((
-                    mempool.next_target(),
-                    tip_block.hash,
-                    tip_block.mediantime,
-                    tip_block.height,
-                    coinbase_txn,
-                    block_txs,
-                    default_witness_commitment,
-                ))
+                        ) = if request.capabilities.contains("coinbasetxn") {
+                            tracing::debug!("Filling block txs");
+                            let (coinbase_txouts, block_txs) =
+                                block_txs::<true, _>(enforcer, mempool).await?;
+                            tracing::debug!("Finalizing coinbase txn");
+                            let (coinbase_tx, witness_commitment_spk) =
+                                finalize_coinbase_tx(
+                                    coinbase_spk,
+                                    tip_block.height + 1,
+                                    network,
+                                    coinbase_txouts,
+                                    &block_txs,
+                                )?;
+                            let default_witness_commitment =
+                                witness_commitment_spk
+                                    .map(|spk| spk.to_bytes());
+                            (
+                                Some(coinbase_tx),
+                                block_txs,
+                                default_witness_commitment,
+                            )
+                        } else {
+                            let ((), block_txs) =
+                                block_txs::<false, _>(enforcer, mempool)
+                                    .await?;
+                            (None, block_txs, None)
+                        };
+                        Ok((
+                            mempool.next_target(),
+                            tip_block.hash,
+                            tip_block.mediantime,
+                            tip_block.height,
+                            coinbase_txn,
+                            block_txs,
+                            default_witness_commitment,
+                        ))
+                    }
+                }
+                .boxed()
             })
             .await
             .ok_or_else(|| {

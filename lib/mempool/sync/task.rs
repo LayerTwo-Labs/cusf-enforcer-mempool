@@ -9,7 +9,7 @@ use bitcoin::{
     hashes::Hash as _, Amount, BlockHash, OutPoint, Transaction, Txid,
 };
 use educe::Educe;
-use futures::{stream, StreamExt as _};
+use futures::{future::BoxFuture, stream, StreamExt as _};
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
@@ -142,7 +142,7 @@ fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
     sync_state.tx_cache.insert(txid, tx);
 }
 
-fn connect_block<Enforcer>(
+async fn connect_block<Enforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
     block: &bip300301::client::Block<true>,
@@ -169,6 +169,7 @@ where
     match inner
         .enforcer
         .connect_block(&block_decoded)
+        .await
         .map_err(cusf_enforcer::Error::ConnectBlock)?
     {
         ConnectBlockAction::Accept { remove_mempool_txs } => {
@@ -217,7 +218,7 @@ where
             if block_hash_msg.block_hash != resp_block.hash {
                 return Ok(());
             }
-            let () = connect_block(inner, sync_state, &resp_block)?;
+            let () = connect_block(inner, sync_state, &resp_block).await?;
             sync_state.seq_message_queue.pop_front();
         }
         BlockHashEvent::Disconnected => {
@@ -234,6 +235,7 @@ where
             let () = inner
                 .enforcer
                 .disconnect_block(block_hash_msg.block_hash)
+                .await
                 .map_err(cusf_enforcer::Error::DisconnectBlock)?;
             sync_state.seq_message_queue.pop_front();
         }
@@ -351,6 +353,7 @@ where
                 let () = inner
                     .enforcer
                     .disconnect_block(*block_hash)
+                    .await
                     .map_err(cusf_enforcer::Error::DisconnectBlock)?;
                 inner.mempool.chain.tip = block
                     .previousblockhash
@@ -389,7 +392,7 @@ where
                     .previousblockhash
                     .unwrap_or_else(BlockHash::all_zeros);
                 assert_eq!(inner.mempool.chain.tip, parent);
-                let () = connect_block(inner, sync_state, &block)?;
+                let () = connect_block(inner, sync_state, &block).await?;
                 true
             }
             None => false,
@@ -587,11 +590,11 @@ where
     /// Returns `None` if the mempool is unavailable due to an error.
     pub async fn with<F, Output>(&self, f: F) -> Option<Output>
     where
-        F: FnOnce(&Mempool, &Enforcer) -> Output,
+        F: for<'a> FnOnce(&'a Mempool, &'a Enforcer) -> BoxFuture<'a, Output>,
     {
         let inner = self.inner.upgrade()?;
         let inner_read = inner.read().await;
-        let res = f(&inner_read.mempool, &inner_read.enforcer);
+        let res = f(&inner_read.mempool, &inner_read.enforcer).await;
         Some(res)
     }
 }

@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "cusf-enforcer-mempool"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -503,7 +503,7 @@ dependencies = [
 
 [[package]]
 name = "cusf-enforcer-mempool-demo"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bip300301",
