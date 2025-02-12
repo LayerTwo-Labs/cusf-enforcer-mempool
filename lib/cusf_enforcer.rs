@@ -6,6 +6,7 @@ use std::{
     future::Future,
 };
 
+use async_trait::async_trait;
 use bitcoin::{BlockHash, Transaction, Txid};
 use educe::Educe;
 use either::Either;
@@ -26,29 +27,29 @@ impl Default for ConnectBlockAction {
     }
 }
 
+#[async_trait]
 pub trait CusfEnforcer {
     type SyncError: std::error::Error + Send + Sync + 'static;
 
     /// Attempt to sync to the specified tip
-    fn sync_to_tip(
+    async fn sync_to_tip(
         &mut self,
         tip: BlockHash,
-    ) -> impl Future<Output = Result<(), Self::SyncError>> + Send;
+    ) -> Result<(), Self::SyncError>;
 
     type ConnectBlockError: std::error::Error + Send + Sync + 'static;
 
-    fn connect_block(
+    async fn connect_block(
         &mut self,
         block: &bitcoin::Block,
-    ) -> impl Future<Output = Result<ConnectBlockAction, Self::ConnectBlockError>>
-           + Send;
+    ) -> Result<ConnectBlockAction, Self::ConnectBlockError>;
 
     type DisconnectBlockError: std::error::Error + Send + Sync + 'static;
 
-    fn disconnect_block(
+    async fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
-    ) -> impl Future<Output = Result<(), Self::DisconnectBlockError>> + Send;
+    ) -> Result<(), Self::DisconnectBlockError>;
 
     type AcceptTxError: std::error::Error + Send + Sync + 'static;
 
@@ -228,8 +229,8 @@ where
                 })?;
                 match enforcer
                     .connect_block(&block)
-                    .map_err(TaskError::ConnectBlock)
-                    .await?
+                    .await
+                    .map_err(TaskError::ConnectBlock)?
                 {
                     ConnectBlockAction::Accept {
                         remove_mempool_txs: _,
@@ -263,7 +264,7 @@ where
     ErrHandler: FnOnce(TaskError<Enforcer>) -> ErrHandlerFut + Send + 'static,
     ErrHandlerFut: Future<Output = ()> + Send,
 {
-    tokio::task::spawn(async move {
+    tokio::task::spawn_local(async move {
         let Err(err) =
             task(&mut enforcer, &main_client, &zmq_addr_sequence).await;
         err_handler(err).await
@@ -291,6 +292,7 @@ where
 #[derive(Debug, Default)]
 pub struct Compose<C0, C1>(pub(crate) C0, pub(crate) C1);
 
+#[async_trait]
 impl<C0, C1> CusfEnforcer for Compose<C0, C1>
 where
     C0: CusfEnforcer + Send + 'static,
@@ -419,6 +421,7 @@ where
 #[derive(Clone, Copy, Debug)]
 pub struct DefaultEnforcer;
 
+#[async_trait]
 impl CusfEnforcer for DefaultEnforcer {
     type SyncError = Infallible;
 
@@ -461,6 +464,7 @@ impl CusfEnforcer for DefaultEnforcer {
     }
 }
 
+#[async_trait]
 impl<C0, C1> CusfEnforcer for Either<C0, C1>
 where
     C0: CusfEnforcer + Send,
