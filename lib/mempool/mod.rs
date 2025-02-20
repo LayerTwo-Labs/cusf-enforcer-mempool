@@ -513,7 +513,11 @@ impl Mempool {
                         .expect("missing tx in mempool when proposing txs");
                     res.insert(txid);
                 } else {
-                    let (_tx, info) = &self.txs.0[&txid];
+                    let Some((_, info)) = self.txs.0.get(&txid) else {
+                        tracing::warn!(%txid, "Missing tx in mempool when proposing txs, omitting from block template proposal");
+                        continue;
+                    };
+
                     to_add.push((txid, true));
                     to_add.extend(info.depends.iter().map(|dep| (*dep, false)))
                 }
@@ -543,7 +547,14 @@ impl Mempool {
                 depends.push(anc_idx as u32);
             }
             depends.sort();
-            let (tx, info) = &self.txs.0[&txid];
+
+            // TODO: Not sure if this is correct behavior. But avoid panics if we're
+            // handling a transaction that we cannot find.
+            let Some((tx, info)) = self.txs.0.get(&txid) else {
+                tracing::warn!(%txid, "Missing tx in mempool when proposing txs, omitting from block template");
+                continue;
+            };
+
             let block_template_tx = BlockTemplateTransaction {
                 data: bitcoin::consensus::serialize(tx),
                 txid,
