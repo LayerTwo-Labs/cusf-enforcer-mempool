@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use bitcoin::{Transaction, Txid};
-use lending_iterator::prelude::*;
+use lender::{Lend, Lender, Lending};
 
 use super::{MempoolTxs, MissingAncestorError, TxInfo};
 
@@ -54,16 +54,12 @@ impl Ancestors<'_> {
     }
 }
 
-#[gat]
-impl<'mempool_txs> LendingIterator for Ancestors<'mempool_txs> {
-    type Item<'next>
-    where
-        Self: 'next,
-    = Result<AncestorsItem<'next>, MissingAncestorError>;
+impl<'lend> Lending<'lend> for Ancestors<'_> {
+    type Lend = Result<AncestorsItem<'lend>, MissingAncestorError>;
+}
 
-    fn next<'next>(
-        self: &'next mut Ancestors<'mempool_txs>,
-    ) -> Option<Result<AncestorsItem<'next>, MissingAncestorError>> {
+impl Lender for Ancestors<'_> {
+    fn next(&mut self) -> Option<Lend<'_, Self>> {
         Self::next(self).transpose()
     }
 }

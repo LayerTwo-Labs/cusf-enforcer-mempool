@@ -5,7 +5,7 @@ use bitcoin::{BlockHash, Target, Transaction, Txid, Weight};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{ordmap, OrdMap, OrdSet};
 use indexmap::IndexSet;
-use lending_iterator::LendingIterator as _;
+use lender::Lender as _;
 use thiserror::Error;
 
 pub mod iter;

@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use bitcoin::{Transaction, Txid};
-use lending_iterator::prelude::*;
+use lender::{Lend, Lender, Lending};
 
 use super::{MempoolTxs, MissingAncestorError, MissingDescendantError, TxInfo};
 
@@ -61,16 +61,12 @@ impl AncestorsMut<'_> {
     }
 }
 
-#[gat]
-impl<'mempool_txs> LendingIterator for AncestorsMut<'mempool_txs> {
-    type Item<'next>
-    where
-        Self: 'next,
-    = Result<AncestorsItem<'next>, MissingAncestorError>;
+impl<'lend> Lending<'lend> for AncestorsMut<'_> {
+    type Lend = Result<AncestorsItem<'lend>, MissingAncestorError>;
+}
 
-    fn next<'next>(
-        self: &'next mut AncestorsMut<'mempool_txs>,
-    ) -> Option<Result<AncestorsItem<'next>, MissingAncestorError>> {
+impl Lender for AncestorsMut<'_> {
+    fn next(&mut self) -> Option<Lend<'_, Self>> {
         Self::next(self).transpose()
     }
 }
@@ -108,16 +104,12 @@ impl DescendantsMut<'_> {
     }
 }
 
-#[gat]
-impl<'mempool_txs> LendingIterator for DescendantsMut<'mempool_txs> {
-    type Item<'next>
-    where
-        Self: 'next,
-    = Result<DescendantsItem<'next>, MissingDescendantError>;
+impl<'lend> Lending<'lend> for DescendantsMut<'_> {
+    type Lend = Result<DescendantsItem<'lend>, MissingDescendantError>;
+}
 
-    fn next<'next>(
-        self: &'next mut DescendantsMut<'mempool_txs>,
-    ) -> Option<Result<DescendantsItem<'next>, MissingDescendantError>> {
+impl Lender for DescendantsMut<'_> {
+    fn next(&mut self) -> Option<Lend<'_, Self>> {
         Self::next(self).transpose()
     }
 }
