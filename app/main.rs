@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let (sequence_stream, mempool, tx_cache) = {
         mempool::init_sync_mempool(
             &mut enforcer,
-            &rpc_client,
+            rpc_client.clone(),
             &cli.node_zmq_addr_sequence,
         )
         .await?

@@ -292,11 +292,21 @@ where
         }
         Some(_) | None => (),
     }
+
+    let block_hash = resp_block.hash;
+    let block_height = resp_block.height;
+
     sync_state
         .mempool
         .chain
         .blocks
-        .insert(resp_block.hash, resp_block);
+        .insert(block_hash, resp_block);
+
+    sync_state
+        .mempool
+        .chain
+        .block_heights
+        .insert(block_height.into(), block_hash);
     Ok(())
 }
 
@@ -487,9 +497,9 @@ where
 }
 
 /// Returns the zmq sequence stream, synced mempool, and the accumulated tx cache
-pub async fn init_sync_mempool<'a, Enforcer, RpcClient>(
+pub async fn init_sync_mempool<'a, Enforcer>(
     enforcer: &mut Enforcer,
-    rpc_client: &RpcClient,
+    rpc_client: bip300301::jsonrpsee::http_client::HttpClient,
     zmq_addr_sequence: &str,
 ) -> Result<
     (SequenceStream<'a>, Mempool, HashMap<Txid, Transaction>),
@@ -497,11 +507,16 @@ pub async fn init_sync_mempool<'a, Enforcer, RpcClient>(
 >
 where
     Enforcer: CusfEnforcer,
-    RpcClient: bip300301::client::MainClient + Sync,
 {
-    let (best_block_hash, sequence_stream) =
-        cusf_enforcer::initial_sync(enforcer, rpc_client, zmq_addr_sequence)
-            .await?;
+    // Clone the client for different uses
+    let rpc_client_for_mempool = rpc_client.clone();
+
+    let (best_block_hash, sequence_stream) = cusf_enforcer::initial_sync(
+        enforcer,
+        rpc_client.clone(),
+        zmq_addr_sequence,
+    )
+    .await?;
     let RawMempoolWithSequence {
         txids,
         mempool_sequence,
@@ -526,7 +541,7 @@ where
             blocks_needed: LinkedHashSet::from_iter([best_block_hash]),
             enforcer,
             first_mempool_sequence: Some(mempool_sequence + 1),
-            mempool: Mempool::new(best_block_hash),
+            mempool: Mempool::new(best_block_hash, rpc_client_for_mempool),
             post_sync: PostSync::default(),
             request_queue,
             seq_message_queue,
@@ -538,7 +553,7 @@ where
     let response_stream = sync_state
         .request_queue
         .clone()
-        .then(|request| batched_request(rpc_client, request))
+        .then(|request| batched_request(&rpc_client, request))
         .boxed();
 
     let mut combined_stream = stream::select(

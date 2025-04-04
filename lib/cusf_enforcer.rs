@@ -108,9 +108,9 @@ where
 // 3. Get best block hash
 // 4. If best block hash has changed, drop messages up to and including
 //    (dis)connecting to best block hash, and go to step 2.
-pub async fn initial_sync<'a, Enforcer, MainClient>(
+pub async fn initial_sync<'a, Enforcer>(
     enforcer: &mut Enforcer,
-    main_client: &MainClient,
+    main_client: bip300301::jsonrpsee::http_client::HttpClient,
     zmq_addr_sequence: &str,
 ) -> Result<
     (BlockHash, crate::zmq::SequenceStream<'a>),
@@ -118,8 +118,9 @@ pub async fn initial_sync<'a, Enforcer, MainClient>(
 >
 where
     Enforcer: CusfEnforcer,
-    MainClient: bip300301::client::MainClient + Sync,
 {
+    use bip300301::client::MainClient as _;
+
     let mut sequence_stream =
         crate::zmq::subscribe_sequence(zmq_addr_sequence).await?;
     let mut block_hash = main_client.getbestblockhash().await?;
@@ -196,19 +197,18 @@ where
 }
 
 /// Run an enforcer in sync with a node
-pub async fn task<Enforcer, MainClient>(
+pub async fn task<Enforcer>(
     enforcer: &mut Enforcer,
-    main_client: &MainClient,
+    main_client: bip300301::jsonrpsee::http_client::HttpClient,
     zmq_addr_sequence: &str,
 ) -> Result<Infallible, TaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
-    MainClient: bip300301::client::MainClient + Sync,
 {
     use crate::zmq::{BlockHashEvent, BlockHashMessage, SequenceMessage};
     use bip300301::client::{GetBlockClient as _, U8Witness};
     let (_best_block_hash, mut sequence_stream) =
-        initial_sync(enforcer, main_client, zmq_addr_sequence).await?;
+        initial_sync(enforcer, main_client.clone(), zmq_addr_sequence).await?;
     while let Some(sequence_msg) = sequence_stream.try_next().await? {
         let BlockHashMessage {
             block_hash, event, ..
@@ -235,6 +235,7 @@ where
                         remove_mempool_txs: _,
                     } => (),
                     ConnectBlockAction::Reject => {
+                        use bip300301::client::MainClient as _;
                         main_client.invalidate_block(block_hash).await?;
                     }
                 }
@@ -251,21 +252,20 @@ where
 }
 
 /// Run an enforcer in sync with a node
-pub fn spawn_task<Enforcer, MainClient, ErrHandler, ErrHandlerFut>(
+pub fn spawn_task<Enforcer, ErrHandler, ErrHandlerFut>(
     mut enforcer: Enforcer,
-    main_client: MainClient,
+    main_client: bip300301::jsonrpsee::http_client::HttpClient,
     zmq_addr_sequence: String,
     err_handler: ErrHandler,
 ) -> tokio::task::JoinHandle<()>
 where
     Enforcer: CusfEnforcer + Send + 'static,
-    MainClient: bip300301::client::MainClient + Send + Sync + 'static,
     ErrHandler: FnOnce(TaskError<Enforcer>) -> ErrHandlerFut + Send + 'static,
     ErrHandlerFut: Future<Output = ()> + Send,
 {
     tokio::task::spawn(async move {
         let Err(err) =
-            task(&mut enforcer, &main_client, &zmq_addr_sequence).await;
+            task(&mut enforcer, main_client.clone(), &zmq_addr_sequence).await;
         err_handler(err).await
     })
 }
