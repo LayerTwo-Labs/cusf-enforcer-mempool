@@ -15,8 +15,8 @@ license-file = "LICENSE.txt"
 publish = false
 
 [workspace.dependencies.bip300301]
-git = "https://github.com/Ash-L2L/bip300301.git"
-rev = "45f74e37b8295207d29ddbbce10d563ec9f67151"
+git = "https://github.com/torkelrogstad/bip300301.git"
+rev = "b93320084a307c3f89d7999e2975ae7a769d0ba0"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
