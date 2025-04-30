@@ -184,7 +184,7 @@ checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
 [[package]]
 name = "bip300301"
 version = "0.1.1"
-source = "git+https://github.com/torkelrogstad/bip300301.git?rev=b93320084a307c3f89d7999e2975ae7a769d0ba0#b93320084a307c3f89d7999e2975ae7a769d0ba0"
+source = "git+https://github.com/Ash-L2L/bip300301.git?rev=543681a65f8f9b44b298482a7f39dd688829a2de#543681a65f8f9b44b298482a7f39dd688829a2de"
 dependencies = [
  "base64",
  "bitcoin",
