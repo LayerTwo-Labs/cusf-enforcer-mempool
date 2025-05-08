@@ -166,6 +166,10 @@ where
             block_hash: block.hash,
             source: err,
         })?;
+
+    tracing::trace!(block_hash = %block.hash, 
+        block_height = block.height, 
+        "processed mempool, forwarding to enforcer block connection logic");
     match inner
         .enforcer
         .connect_block(&block_decoded)
@@ -436,7 +440,7 @@ where
         }
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
             // FIXME: remove
-            tracing::debug!(%block.hash, "Handling block");
+            tracing::debug!(block_hash = %block.hash, "Handling block #{}", block.height);
             let () =
                 handle_resp_block(&mut inner_write, sync_state, *block).await?;
         }
