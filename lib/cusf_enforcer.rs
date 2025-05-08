@@ -11,6 +11,7 @@ use educe::Educe;
 use either::Either;
 use futures::{TryFutureExt, TryStreamExt};
 use thiserror::Error;
+use tracing::instrument;
 
 #[derive(Clone, Debug)]
 pub enum ConnectBlockAction {
@@ -108,6 +109,7 @@ where
 // 3. Get best block hash
 // 4. If best block hash has changed, drop messages up to and including
 //    (dis)connecting to best block hash, and go to step 2.
+#[instrument(skip_all)]
 pub async fn initial_sync<'a, Enforcer, MainClient>(
     enforcer: &mut Enforcer,
     main_client: &MainClient,
@@ -123,28 +125,54 @@ where
     let mut sequence_stream =
         crate::zmq::subscribe_sequence(zmq_addr_sequence).await?;
     let mut block_hash = main_client.getbestblockhash().await?;
-    let mut block_parent =
-        main_client.getblockheader(block_hash).await?.prev_blockhash;
+    tracing::debug!(
+        block_hash = %block_hash,
+        "fetched best block hash"
+    );
+
+    let block_header = main_client.getblockheader(block_hash).await?;
+
+    let mut block_parent = block_header.prev_blockhash;
     'sync: loop {
+        tracing::debug!(
+            block_hash = %block_hash,
+            block_height = block_header.height,
+            "syncing enforcer to tip"
+        );
         let () = enforcer
             .sync_to_tip(block_hash)
             .map_err(InitialSyncError::CusfEnforcer)
             .await?;
         let best_block_hash = main_client.getbestblockhash().await?;
         if block_hash == best_block_hash {
+            tracing::debug!(
+                block_hash = %block_hash,
+                block_height = block_header.height,
+                "enforcer synced to tip!"
+            );
             return Ok((block_hash, sequence_stream));
-        } else {
+        }
+
+        // We're NOT synced to the tip. This means that between we started the sync
+        // and finished, the tip has changed. That means we can expect to read something
+        // from the sequence stream!
             'drop_seq_msgs: loop {
+            tracing::trace!(
+                "reading next ZMQ sequence message, looking for block hash"
+            );
                 let Some(msg) = sequence_stream.try_next().await? else {
                     return Err(InitialSyncError::SequenceStreamEnded);
                 };
                 match msg {
                     crate::zmq::SequenceMessage::BlockHash(block_hash_msg) => {
                         match block_hash_msg.event {
+                        // A new block hash has been seen.
                             crate::zmq::BlockHashEvent::Connected => {
                                 block_parent = block_hash;
                                 block_hash = block_hash_msg.block_hash;
                             }
+                        // While we were syncing the tip moved backwards. We need to backtrack
+                        // until we reach the correct block.
                             crate::zmq::BlockHashEvent::Disconnected => {
                                 block_hash = block_parent;
                                 block_parent = main_client
@@ -159,13 +187,19 @@ where
                             continue 'drop_seq_msgs;
                         }
                     }
+                // We want the next block hash, so loop back
                     crate::zmq::SequenceMessage::TxHash(_) => {
                         continue 'drop_seq_msgs;
                     }
                 }
             }
+
+        // We've obtained the most recent tip,
+        tracing::debug!(
+            block_hash = %block_hash,
+            "looping back to sync with new tip"
+        );
             continue 'sync;
-        }
     }
 }
 
