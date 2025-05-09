@@ -64,6 +64,8 @@ where
     Request(#[from] RequestError),
     #[error("Sequence stream error")]
     SequenceStream(#[from] SequenceStreamError),
+    #[error("Sync was stopped")]
+    Shutdown,
 }
 
 struct MempoolSyncInner<Enforcer> {
@@ -474,7 +476,7 @@ async fn task<Enforcer, RpcClient>(
     tx_cache: HashMap<Txid, Transaction>,
     rpc_client: RpcClient,
     sequence_stream: SequenceStream<'static>,
-) -> Result<Infallible, SyncTaskError<Enforcer>>
+) -> Result<(), SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
     RpcClient: bip300301::client::MainClient + Sync,
@@ -549,6 +551,11 @@ where
             CombinedStreamItem::Response(resp) => {
                 let () = handle_resp(&inner, &mut sync_state, resp?).await?;
             }
+            CombinedStreamItem::Shutdown => {
+                tracing::info!("shutdown signal received, aborting");
+                // This isn't really an error though...
+                return Err(SyncTaskError::Shutdown);
+            }
         }
     }
 }
@@ -580,9 +587,10 @@ where
         let inner = Arc::new(RwLock::new(inner));
         let inner_weak = Arc::downgrade(&inner);
         let task = spawn(async {
-            let Err(err) =
-                task(inner, tx_cache, rpc_client, sequence_stream).await;
-            err_handler(err).await
+            match task(inner, tx_cache, rpc_client, sequence_stream).await {
+                Ok(_) => {}
+                Err(err) => err_handler(err).await,
+            }
         });
         Self {
             inner: inner_weak,
