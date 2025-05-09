@@ -9,7 +9,7 @@ use std::{
 use bitcoin::{BlockHash, Transaction, Txid};
 use educe::Educe;
 use either::Either;
-use futures::{TryFutureExt, TryStreamExt};
+use futures::{FutureExt as _, TryFutureExt as _, TryStreamExt as _};
 use thiserror::Error;
 use tracing::instrument;
 
@@ -31,8 +31,9 @@ pub trait CusfEnforcer {
     type SyncError: std::error::Error + Send + Sync + 'static;
 
     /// Attempt to sync to the specified tip
-    fn sync_to_tip(
+    fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
+        shutdown_signal: Signal,
         tip: BlockHash,
     ) -> impl Future<Output = Result<(), Self::SyncError>> + Send;
 
@@ -110,10 +111,11 @@ where
 // 4. If best block hash has changed, drop messages up to and including
 //    (dis)connecting to best block hash, and go to step 2.
 #[instrument(skip_all)]
-pub async fn initial_sync<'a, Enforcer, MainClient>(
+pub async fn initial_sync<'a, Enforcer, MainClient, Signal>(
     enforcer: &mut Enforcer,
     main_client: &MainClient,
     zmq_addr_sequence: &str,
+    shutdown_signal: Signal,
 ) -> Result<
     (BlockHash, crate::zmq::SequenceStream<'a>),
     InitialSyncError<Enforcer>,
@@ -121,6 +123,7 @@ pub async fn initial_sync<'a, Enforcer, MainClient>(
 where
     Enforcer: CusfEnforcer,
     MainClient: bip300301::client::MainClient + Sync,
+    Signal: Future<Output = ()> + Send,
 {
     let mut sequence_stream =
         crate::zmq::subscribe_sequence(zmq_addr_sequence).await?;
@@ -132,6 +135,8 @@ where
 
     let block_header = main_client.getblockheader(block_hash).await?;
 
+    let shutdown_signal = shutdown_signal.shared();
+
     let mut block_parent = block_header.prev_blockhash;
     'sync: loop {
         tracing::debug!(
@@ -140,7 +145,7 @@ where
             "syncing enforcer to tip"
         );
         let () = enforcer
-            .sync_to_tip(block_hash)
+            .sync_to_tip(shutdown_signal.clone(), block_hash)
             .map_err(InitialSyncError::CusfEnforcer)
             .await?;
         let best_block_hash = main_client.getbestblockhash().await?;
@@ -230,20 +235,45 @@ where
 }
 
 /// Run an enforcer in sync with a node
-pub async fn task<Enforcer, MainClient>(
+pub async fn task<Enforcer, MainClient, Signal>(
     enforcer: &mut Enforcer,
     main_client: &MainClient,
     zmq_addr_sequence: &str,
-) -> Result<Infallible, TaskError<Enforcer>>
+    shutdown_signal: Signal,
+) -> Result<(), TaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
     MainClient: bip300301::client::MainClient + Sync,
+    Signal: Future<Output = ()> + Send,
 {
     use crate::zmq::{BlockHashEvent, BlockHashMessage, SequenceMessage};
     use bip300301::client::{GetBlockClient as _, U8Witness};
-    let (_best_block_hash, mut sequence_stream) =
-        initial_sync(enforcer, main_client, zmq_addr_sequence).await?;
-    while let Some(sequence_msg) = sequence_stream.try_next().await? {
+
+    let shutdown_signal = shutdown_signal.shared();
+    let (_best_block_hash, mut sequence_stream) = initial_sync(
+        enforcer,
+        main_client,
+        zmq_addr_sequence,
+        shutdown_signal.clone(),
+    )
+    .await?;
+
+    // Pin the shutdown signal
+    futures::pin_mut!(shutdown_signal);
+
+    loop {
+        let Some(sequence_msg) = tokio::select! {
+            // borrow the shutdown signal, don't move
+            _ = &mut shutdown_signal => {
+                        tracing::info!("shutdown signal received, stopping");
+                        return Ok(());
+            }
+            sequence_res = sequence_stream.try_next() => sequence_res
+        }?
+        else {
+            return Err(TaskError::ZmqSequenceEnded);
+        };
+
         let BlockHashMessage {
             block_hash, event, ..
         } = match sequence_msg {
@@ -311,12 +341,23 @@ where
 {
     type SyncError = Either<C0::SyncError, C1::SyncError>;
 
-    async fn sync_to_tip(
+    async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
+        shutdown_signal: Signal,
         block_hash: BlockHash,
     ) -> Result<(), Self::SyncError> {
-        let () = self.0.sync_to_tip(block_hash).map_err(Either::Left).await?;
-        self.1.sync_to_tip(block_hash).map_err(Either::Right).await
+        let shutdown_signal = shutdown_signal.shared();
+
+        let () = self
+            .0
+            .sync_to_tip(shutdown_signal.clone(), block_hash)
+            .map_err(Either::Left)
+            .await?;
+
+        self.1
+            .sync_to_tip(shutdown_signal, block_hash)
+            .map_err(Either::Right)
+            .await
     }
 
     type ConnectBlockError = ComposeConnectBlockError<C0, C1>;
@@ -435,8 +476,9 @@ pub struct DefaultEnforcer;
 impl CusfEnforcer for DefaultEnforcer {
     type SyncError = Infallible;
 
-    async fn sync_to_tip(
+    async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
+        _shutdown_signal: Signal,
         _block_hash: BlockHash,
     ) -> Result<(), Self::SyncError> {
         Ok(())
@@ -481,16 +523,23 @@ where
 {
     type SyncError = Either<C0::SyncError, C1::SyncError>;
 
-    async fn sync_to_tip(
+    async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
+        shutdown_signal: Signal,
         tip: BlockHash,
     ) -> Result<(), Self::SyncError> {
+        let shutdown_signal = shutdown_signal.shared();
         match self {
             Self::Left(left) => {
-                left.sync_to_tip(tip).map_err(Either::Left).await
+                left.sync_to_tip(shutdown_signal, tip)
+                    .map_err(Either::Left)
+                    .await
             }
             Self::Right(right) => {
-                right.sync_to_tip(tip).map_err(Either::Right).await
+                right
+                    .sync_to_tip(shutdown_signal, tip)
+                    .map_err(Either::Right)
+                    .await
             }
         }
     }

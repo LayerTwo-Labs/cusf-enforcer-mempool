@@ -85,12 +85,19 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::anyhow!("failed to get sample block template: {err:#}")
             })?
     };
+    // We're not actually going to send anything on the shutdown signal.
+    let (_, shutdown_rx) = futures::channel::oneshot::channel::<()>();
+
     let mut enforcer = DefaultEnforcer;
     let (sequence_stream, mempool, tx_cache) = {
+        let shutdown_signal = async move {
+            let _ = shutdown_rx.await;
+        };
         mempool::init_sync_mempool(
             &mut enforcer,
             &rpc_client,
             &cli.node_zmq_addr_sequence,
+            shutdown_signal,
         )
         .await?
     };
