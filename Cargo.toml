@@ -18,6 +18,9 @@ publish = false
 git = "https://github.com/Ash-L2L/bip300301.git"
 rev = "8603b40520e432ccff27164a484647aa4a0be250"
 
+[workspace.dependencies.futures]
+version = "0.3.30"
+
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
 assertions_on_result_states = "allow"

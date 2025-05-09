@@ -1,5 +1,7 @@
 //! Initial mempool sync
 
+use core::future::Future;
+use futures::FutureExt as _;
 use std::{
     cmp::Ordering,
     collections::{HashMap, VecDeque},
@@ -88,6 +90,9 @@ where
 {
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
+    // TODO - this is not really an error...
+    #[error("Sync was stopped")]
+    Shutdown,
     #[error(transparent)]
     CusfEnforcer(#[from] cusf_enforcer::Error<Enforcer>),
     #[error("Failed to decode block: `{block_hash}`")]
@@ -487,10 +492,16 @@ where
 }
 
 /// Returns the zmq sequence stream, synced mempool, and the accumulated tx cache
-pub async fn init_sync_mempool<'a, Enforcer, RpcClient>(
+pub async fn init_sync_mempool<
+    'a,
+    Signal: Future<Output = ()> + Send,
+    Enforcer,
+    RpcClient,
+>(
     enforcer: &mut Enforcer,
     rpc_client: &RpcClient,
     zmq_addr_sequence: &str,
+    shutdown_signal: Signal, // Would it be better to return a Some/None, indicating sync stoppage?
 ) -> Result<
     (SequenceStream<'a>, Mempool, HashMap<Txid, Transaction>),
     SyncMempoolError<Enforcer>,
@@ -499,9 +510,14 @@ where
     Enforcer: CusfEnforcer,
     RpcClient: bip300301::client::MainClient + Sync,
 {
-    let (best_block_hash, sequence_stream) =
-        cusf_enforcer::initial_sync(enforcer, rpc_client, zmq_addr_sequence)
-            .await?;
+    let shutdown_signal = shutdown_signal.shared();
+    let (best_block_hash, sequence_stream) = cusf_enforcer::initial_sync(
+        enforcer,
+        rpc_client,
+        zmq_addr_sequence,
+        shutdown_signal.clone(),
+    )
+    .await?;
     let RawMempoolWithSequence {
         txids,
         mempool_sequence,
@@ -541,17 +557,21 @@ where
         .then(|request| batched_request(rpc_client, request))
         .boxed();
 
+    // Pin the shutdown signal
+    futures::pin_mut!(shutdown_signal);
+    let shutdown_stream = shutdown_signal.into_stream();
+
+    // This is kinda wonky - but the select() function is only able to operate on
+    // two streams. There's the stream_select! macro, but that consumes the streams.
+    // We need to retrieve them below, therefore the nested stream::select()
     let mut combined_stream = stream::select(
         sequence_stream.map(CombinedStreamItem::ZmqSeq),
-        response_stream.map(CombinedStreamItem::Response),
+        stream::select(
+            response_stream.map(CombinedStreamItem::Response),
+            shutdown_stream.map(|_| CombinedStreamItem::Shutdown),
+        ),
     );
     while !sync_state.is_synced() {
-        // FIXME: remove
-        tracing::debug!(
-            "sync state needed: {} blocks, {} txs",
-            sync_state.blocks_needed.len(),
-            sync_state.txs_needed.len()
-        );
         match combined_stream
             .next()
             .await
@@ -563,6 +583,9 @@ where
             CombinedStreamItem::Response(resp) => {
                 let () = handle_resp(&mut sync_state, resp?).await?;
             }
+            CombinedStreamItem::Shutdown => {
+                return Err(SyncMempoolError::Shutdown);
+            }
         }
     }
     let MempoolSyncing {
@@ -573,7 +596,7 @@ where
     } = sync_state;
     let () = post_sync.apply(&mut mempool)?;
     let sequence_stream = {
-        let (sequence_stream, _resp_stream) = combined_stream.into_inner();
+        let (sequence_stream, _) = combined_stream.into_inner();
         sequence_stream.into_inner()
     };
     Ok((sequence_stream, mempool, tx_cache))

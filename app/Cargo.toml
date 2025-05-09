@@ -8,10 +8,11 @@ version.workspace = true
 
 [dependencies]
 anyhow = "1.0.86"
-bip300301 ={ workspace = true, features = ["tracing"] }
+bip300301 = { workspace = true, features = ["tracing"] }
 bitcoin = { version = "0.32.2", features = ["serde"] }
 clap = { version = "4.5.15", features = ["derive"] }
 cusf-enforcer-mempool = { path = "../lib" }
+futures = { workspace = true }
 jsonrpsee = { version = "0.24.3", features = ["macros", "server"] }
 tokio = { version = "1.38.0", features = ["rt-multi-thread"] }
 tracing = "0.1.40"
