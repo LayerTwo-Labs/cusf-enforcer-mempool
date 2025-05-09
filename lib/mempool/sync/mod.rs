@@ -259,4 +259,6 @@ where
 enum CombinedStreamItem {
     ZmqSeq(Result<SequenceMessage, SequenceStreamError>),
     Response(Result<BatchedResponseItem, RequestError>),
+    /// The sync was stopped
+    Shutdown,
 }
