@@ -156,50 +156,50 @@ where
         // We're NOT synced to the tip. This means that between we started the sync
         // and finished, the tip has changed. That means we can expect to read something
         // from the sequence stream!
-            'drop_seq_msgs: loop {
+        'drop_seq_msgs: loop {
             tracing::trace!(
                 "reading next ZMQ sequence message, looking for block hash"
             );
-                let Some(msg) = sequence_stream.try_next().await? else {
-                    return Err(InitialSyncError::SequenceStreamEnded);
-                };
-                match msg {
-                    crate::zmq::SequenceMessage::BlockHash(block_hash_msg) => {
-                        match block_hash_msg.event {
+            let Some(msg) = sequence_stream.try_next().await? else {
+                return Err(InitialSyncError::SequenceStreamEnded);
+            };
+            match msg {
+                crate::zmq::SequenceMessage::BlockHash(block_hash_msg) => {
+                    match block_hash_msg.event {
                         // A new block hash has been seen.
-                            crate::zmq::BlockHashEvent::Connected => {
-                                block_parent = block_hash;
-                                block_hash = block_hash_msg.block_hash;
-                            }
+                        crate::zmq::BlockHashEvent::Connected => {
+                            block_parent = block_hash;
+                            block_hash = block_hash_msg.block_hash;
+                        }
                         // While we were syncing the tip moved backwards. We need to backtrack
                         // until we reach the correct block.
-                            crate::zmq::BlockHashEvent::Disconnected => {
-                                block_hash = block_parent;
-                                block_parent = main_client
-                                    .getblockheader(block_hash)
-                                    .await?
-                                    .prev_blockhash;
-                            }
-                        }
-                        if block_hash == best_block_hash {
-                            break 'drop_seq_msgs;
-                        } else {
-                            continue 'drop_seq_msgs;
+                        crate::zmq::BlockHashEvent::Disconnected => {
+                            block_hash = block_parent;
+                            block_parent = main_client
+                                .getblockheader(block_hash)
+                                .await?
+                                .prev_blockhash;
                         }
                     }
-                // We want the next block hash, so loop back
-                    crate::zmq::SequenceMessage::TxHash(_) => {
+                    if block_hash == best_block_hash {
+                        break 'drop_seq_msgs;
+                    } else {
                         continue 'drop_seq_msgs;
                     }
                 }
+                // We want the next block hash, so loop back
+                crate::zmq::SequenceMessage::TxHash(_) => {
+                    continue 'drop_seq_msgs;
+                }
             }
+        }
 
         // We've obtained the most recent tip,
         tracing::debug!(
             block_hash = %block_hash,
             "looping back to sync with new tip"
         );
-            continue 'sync;
+        continue 'sync;
     }
 }
 
@@ -281,27 +281,6 @@ where
             }
         }
     }
-    Err(TaskError::ZmqSequenceEnded)
-}
-
-/// Run an enforcer in sync with a node
-pub fn spawn_task<Enforcer, MainClient, ErrHandler, ErrHandlerFut>(
-    mut enforcer: Enforcer,
-    main_client: MainClient,
-    zmq_addr_sequence: String,
-    err_handler: ErrHandler,
-) -> tokio::task::JoinHandle<()>
-where
-    Enforcer: CusfEnforcer + Send + 'static,
-    MainClient: bip300301::client::MainClient + Send + Sync + 'static,
-    ErrHandler: FnOnce(TaskError<Enforcer>) -> ErrHandlerFut + Send + 'static,
-    ErrHandlerFut: Future<Output = ()> + Send,
-{
-    tokio::task::spawn(async move {
-        let Err(err) =
-            task(&mut enforcer, &main_client, &zmq_addr_sequence).await;
-        err_handler(err).await
-    })
 }
 
 /// Connect block error for [`Compose`]
