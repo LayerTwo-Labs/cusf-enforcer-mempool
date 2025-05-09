@@ -14,6 +14,7 @@ use chrono::Utc;
 use educe::Educe;
 use futures::FutureExt;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorCode};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -65,6 +66,16 @@ impl<Enforcer> Server<Enforcer> {
             network_info,
             sample_block_template,
         })
+    }
+
+    pub fn params(&self) -> Option<&bitcoin::consensus::Params> {
+        match self.network {
+            Network::Regtest => Some(&bitcoin::consensus::Params::REGTEST),
+            Network::Testnet => Some(&bitcoin::consensus::Params::TESTNET3),
+            Network::Bitcoin => Some(&bitcoin::consensus::Params::BITCOIN),
+            Network::Signet => Some(&bitcoin::consensus::Params::SIGNET),
+            _ => None,
+        }
     }
 }
 
@@ -421,6 +432,9 @@ where
         const NONCE_RANGE: [u8; 8] = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
 
         let now = Utc::now();
+        let params = self
+            .params()
+            .expect("unable to find consensus params for network {:?}");
         let BlockTemplate {
             version,
             ref rules,
@@ -448,6 +462,7 @@ where
         ) = self
             .mempool
             .with(|mempool, enforcer| {
+                let params = params.clone();
                 {
                     let coinbase_spk = self.coinbase_spk.clone();
                     let network = self.network;
@@ -485,7 +500,7 @@ where
                             (None, block_txs, None)
                         };
                         Ok((
-                            mempool.next_target(),
+                            mempool.next_target(&params).await,
                             tip_block.hash,
                             tip_block.mediantime,
                             tip_block.height,
@@ -561,6 +576,16 @@ where
             default_witness_commitment,
             signet_challenge: signet_challenge.clone(),
         };
+
+        tracing::debug!("returning block template: {}", {
+            let mut buf = Vec::new();
+            let mut serializer = serde_json::Serializer::new(&mut buf);
+            match res.serialize(&mut serializer) {
+                Ok(_) => String::from_utf8(buf)
+                    .unwrap_or("<serialization error>".to_string()),
+                Err(_) => "<serialization error>".to_string(),
+            }
+        });
         Ok(res)
     }
 }

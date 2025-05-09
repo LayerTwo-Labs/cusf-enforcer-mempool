@@ -1,6 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::Debug,
+};
 
-use bip300301::client::{BlockTemplateTransaction, RawMempoolTxFees};
+use bip300301::client::{
+    BlockTemplateTransaction, GetBlockClient, RawMempoolTxFees,
+};
 use bitcoin::{BlockHash, Target, Transaction, Txid, Weight};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{ordmap, OrdMap, OrdSet};
@@ -146,6 +151,10 @@ impl ByAncestorFeeRate {
 struct Chain {
     tip: BlockHash,
     blocks: imbl::HashMap<BlockHash, bip300301::client::Block<true>>,
+    block_heights: imbl::HashMap<u64, BlockHash>,
+
+    // Used for fetching blocks that aren't in our local cache
+    main_client: jsonrpsee::http_client::HttpClient,
 }
 
 impl Chain {
@@ -164,6 +173,33 @@ impl Chain {
                 None
             }
         })
+    }
+
+    /// Find a block by its height
+    /// Returns None if no block with the given height exists in the chain
+    pub async fn get_block_by_height(
+        &self,
+        height: u64,
+    ) -> Result<bip300301::client::Block<true>, jsonrpsee::core::client::Error>
+    {
+        if let Some(hash) = self.block_heights.get(&height) {
+            tracing::debug!(
+                "Found block at height {} in cache: {}",
+                height,
+                hash
+            );
+            return Ok(self.blocks[hash].clone());
+        }
+
+        tracing::debug!("Fetching block at height {} from main client", height);
+
+        let block_hash = self.main_client.get_block_hash(height).await?;
+        let block = self
+            .main_client
+            .get_block(block_hash, bip300301::client::U8Witness::<2>)
+            .await?;
+
+        Ok(block)
     }
 }
 
@@ -206,10 +242,15 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    fn new(prev_blockhash: BlockHash) -> Self {
+    fn new(
+        prev_blockhash: BlockHash,
+        main_client: jsonrpsee::http_client::HttpClient,
+    ) -> Self {
         let chain = Chain {
             tip: prev_blockhash,
             blocks: imbl::HashMap::new(),
+            block_heights: imbl::HashMap::new(),
+            main_client,
         };
         Self {
             by_ancestor_fee_rate: ByAncestorFeeRate::default(),
@@ -223,9 +264,86 @@ impl Mempool {
         &self.chain.blocks[&self.chain.tip]
     }
 
-    pub fn next_target(&self) -> Target {
-        // FIXME: calculate this properly
-        self.chain.blocks[&self.chain.tip].compact_target.into()
+    pub async fn next_target(
+        &self,
+        params: &bitcoin::consensus::Params,
+    ) -> Target {
+        let last_block = &self.chain.blocks[&self.chain.tip];
+
+        // If there's no retargeting on the network, that's great
+        if params.no_pow_retargeting {
+            return last_block.compact_target.into();
+        }
+
+        // We need to determine if we're on the boundary of a difficulty period
+        // If not, just return the current target
+        if ((last_block.height as u64) + 1)
+            % params.difficulty_adjustment_interval()
+            != 0
+        {
+            return last_block.compact_target.into();
+        }
+
+        // Difficulty adjustment!
+        let last_block_header = bitcoin::block::Header {
+            version: last_block.version,
+            prev_blockhash: last_block.previousblockhash.unwrap(),
+            merkle_root: last_block.merkleroot,
+            time: last_block.time,
+            bits: last_block.compact_target,
+            nonce: last_block.nonce,
+        };
+
+        // Get the block from the beginning of this difficulty adjustment period
+        let boundary_height = last_block.height as u64
+            - params.difficulty_adjustment_interval()
+            // +1 because we want the block at the beginning of the period, not the 
+            // first block of the /previous/ period
+            + 1;
+
+        // First try to get the block from cache
+        let boundary = match self
+            .chain
+            .get_block_by_height(boundary_height)
+            .await
+        {
+            Ok(block) => block,
+            Err(err) => {
+                // If we couldn't fetch the boundary block, we have to fall back to the current target
+                tracing::warn!(
+                    error = ?err,
+                    "Unable to find block at height {} for difficulty adjustment, using current target",
+                    boundary_height
+                );
+                return last_block.compact_target.into();
+            }
+        };
+
+        let boundary_header = bitcoin::block::Header {
+            version: boundary.version,
+            prev_blockhash: boundary.previousblockhash.unwrap(),
+            merkle_root: boundary.merkleroot,
+            time: boundary.time,
+            bits: boundary.compact_target,
+            nonce: boundary.nonce,
+        };
+
+        let compact_target =
+            bitcoin::CompactTarget::from_header_difficulty_adjustment(
+                boundary_header,
+                last_block_header,
+                params,
+            );
+
+        tracing::debug!(
+            last_block_height = last_block.height,
+            last_block_difficulty_adjustment_height = boundary_height,
+            "determined next PoW target: {:x} -> {:x}",
+            last_block_header.bits.to_consensus(),
+            compact_target.to_consensus()
+        );
+
+        compact_target.into()
     }
 
     /// Insert a tx into the mempool
@@ -570,4 +688,13 @@ impl Mempool {
         res.reverse();
         Ok(res)
     }
+}
+
+#[jsonrpsee::proc_macros::rpc(client)]
+trait HashFetcher {
+    #[method(name = "getblockhash")]
+    async fn get_block_hash(
+        &self,
+        height: u64,
+    ) -> Result<bitcoin::BlockHash, jsonrpsee::core::Error>;
 }

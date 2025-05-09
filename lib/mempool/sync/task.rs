@@ -203,11 +203,22 @@ where
     let resp_block_parent = resp_block
         .previousblockhash
         .unwrap_or_else(BlockHash::all_zeros);
+
+    let block_hash = resp_block.hash;
+    let block_height = resp_block.height;
+
     inner
         .mempool
         .chain
         .blocks
-        .insert(resp_block.hash, resp_block.clone());
+        .insert(block_hash, resp_block.clone());
+
+    inner
+        .mempool
+        .chain
+        .block_heights
+        .insert(block_height.into(), block_hash);
+
     let Some(SequenceMessage::BlockHash(block_hash_msg)) =
         sync_state.seq_message_queue.front()
     else {
