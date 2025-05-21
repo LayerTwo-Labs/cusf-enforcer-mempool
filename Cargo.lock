@@ -217,7 +217,7 @@ checksum = "0b47c4ab7a93edb0c7198c5535ed9b52b63095f4e9b45279c6736cec4b856baf"
 [[package]]
 name = "bitcoin-jsonrpsee"
 version = "0.1.1"
-source = "git+https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git?rev=e30cfe70e9330ed0676f3d9c92dd761ce01a6b3c#e30cfe70e9330ed0676f3d9c92dd761ce01a6b3c"
+source = "git+https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git?rev=360b4e4e3ab333a34e0d82d023494cbd8f13b06e#360b4e4e3ab333a34e0d82d023494cbd8f13b06e"
 dependencies = [
  "base64",
  "bitcoin",
