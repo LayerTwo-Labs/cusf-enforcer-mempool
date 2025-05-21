@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-use bip300301::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use bitcoin::{BlockHash, Target, Transaction, Txid, Weight};
+use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{ordmap, OrdMap, OrdSet};
 use indexmap::IndexSet;
@@ -145,7 +145,7 @@ impl ByAncestorFeeRate {
 #[derive(Clone, Debug)]
 struct Chain {
     tip: BlockHash,
-    blocks: imbl::HashMap<BlockHash, bip300301::client::Block<true>>,
+    blocks: imbl::HashMap<BlockHash, bitcoin_jsonrpsee::client::Block<true>>,
 }
 
 impl Chain {
@@ -153,7 +153,9 @@ impl Chain {
     // Not all history is guaranteed to exist, so this iterator might return
     // `None` before the genesis block.
     #[allow(dead_code)]
-    fn iter(&self) -> impl Iterator<Item = &bip300301::client::Block<true>> {
+    fn iter(
+        &self,
+    ) -> impl Iterator<Item = &bitcoin_jsonrpsee::client::Block<true>> {
         let mut next = Some(self.tip);
         std::iter::from_fn(move || {
             if let Some(block) = self.blocks.get(&next?) {
@@ -219,7 +221,7 @@ impl Mempool {
         }
     }
 
-    pub fn tip(&self) -> &bip300301::client::Block<true> {
+    pub fn tip(&self) -> &bitcoin_jsonrpsee::client::Block<true> {
         &self.chain.blocks[&self.chain.tip]
     }
 

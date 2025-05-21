@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 
-use bip300301::{jsonrpsee::http_client::HttpClientBuilder, MainClient as _};
+use bitcoin_jsonrpsee::{
+    jsonrpsee::http_client::HttpClientBuilder, MainClient as _,
+};
 use clap::Parser;
 use jsonrpsee::server::ServerHandle;
 use tokio::time::Duration;
@@ -59,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
             .max_request_size(MAX_REQUEST_SIZE)
             .max_response_size(MAX_RESPONSE_SIZE)
             .request_timeout(REQUEST_TIMEOUT);
-        let client = bip300301::client(
+        let client = bitcoin_jsonrpsee::client(
             cli.node_rpc_addr,
             Some(client_builder),
             &cli.node_rpc_pass,
@@ -74,7 +76,8 @@ async fn main() -> anyhow::Result<()> {
     let mining_reward_address =
         cli.mining_reward_address.require_network(network)?;
     let sample_block_template = {
-        let mut request = bip300301::client::BlockTemplateRequest::default();
+        let mut request =
+            bitcoin_jsonrpsee::client::BlockTemplateRequest::default();
         if network == bitcoin::Network::Signet {
             request.rules.push("signet".to_owned())
         }

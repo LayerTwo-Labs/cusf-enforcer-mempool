@@ -9,7 +9,7 @@ version.workspace = true
 [dependencies]
 anyhow = "1.0.86"
 async-trait = "0.1.81"
-bip300301 = { workspace = true, features = ["tracing"] }
+bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
 bitcoin = { version = "0.32.2", features = ["serde"] }
 blake3 = "1.5.3"
 borsh = "1.5.1"

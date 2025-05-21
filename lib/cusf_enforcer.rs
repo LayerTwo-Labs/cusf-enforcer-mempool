@@ -93,7 +93,7 @@ where
     #[error(transparent)]
     CusfEnforcer(<Enforcer as CusfEnforcer>::SyncError),
     #[error(transparent)]
-    JsonRpc(#[from] bip300301::jsonrpsee::core::ClientError),
+    JsonRpc(#[from] bitcoin_jsonrpsee::jsonrpsee::core::ClientError),
     #[error(transparent)]
     SequenceStream(#[from] crate::zmq::SequenceStreamError),
     #[error("ZMQ sequence stream ended unexpectedly")]
@@ -122,7 +122,7 @@ pub async fn initial_sync<'a, Enforcer, MainClient, Signal>(
 >
 where
     Enforcer: CusfEnforcer,
-    MainClient: bip300301::client::MainClient + Sync,
+    MainClient: bitcoin_jsonrpsee::client::MainClient + Sync,
     Signal: Future<Output = ()> + Send,
 {
     let mut sequence_stream =
@@ -227,7 +227,7 @@ where
     #[error(transparent)]
     InitialSync(#[from] InitialSyncError<Enforcer>),
     #[error(transparent)]
-    JsonRpc(#[from] bip300301::jsonrpsee::core::ClientError),
+    JsonRpc(#[from] bitcoin_jsonrpsee::jsonrpsee::core::ClientError),
     #[error(transparent)]
     ZmqSequence(#[from] crate::zmq::SequenceStreamError),
     #[error("ZMQ sequence stream ended unexpectedly")]
@@ -243,11 +243,11 @@ pub async fn task<Enforcer, MainClient, Signal>(
 ) -> Result<(), TaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
-    MainClient: bip300301::client::MainClient + Sync,
+    MainClient: bitcoin_jsonrpsee::client::MainClient + Sync,
     Signal: Future<Output = ()> + Send,
 {
     use crate::zmq::{BlockHashEvent, BlockHashMessage, SequenceMessage};
-    use bip300301::client::{GetBlockClient as _, U8Witness};
+    use bitcoin_jsonrpsee::client::{GetBlockClient as _, U8Witness};
 
     let shutdown_signal = shutdown_signal.shared();
     let (_best_block_hash, mut sequence_stream) = initial_sync(

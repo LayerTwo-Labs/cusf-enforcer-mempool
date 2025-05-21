@@ -8,12 +8,12 @@ use std::{
     convert::Infallible,
 };
 
-use bip300301::{
+use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid};
+use bitcoin_jsonrpsee::{
     bitcoin::hashes::Hash as _,
     client::{BoolWitness, GetRawMempoolClient as _, RawMempoolWithSequence},
     jsonrpsee::core::ClientError as JsonRpcError,
 };
-use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid};
 use educe::Educe;
 use futures::{stream, StreamExt as _};
 use hashlink::LinkedHashSet;
@@ -122,7 +122,7 @@ where
 
 async fn connect_block<Enforcer>(
     sync_state: &mut MempoolSyncing<'_, Enforcer>,
-    block: &bip300301::client::Block<true>,
+    block: &bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
@@ -164,7 +164,7 @@ where
 
 async fn disconnect_block<Enforcer>(
     sync_state: &mut MempoolSyncing<'_, Enforcer>,
-    block: &bip300301::client::Block<true>,
+    block: &bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
@@ -270,7 +270,7 @@ where
 
 async fn handle_resp_block<Enforcer>(
     sync_state: &mut MempoolSyncing<'_, Enforcer>,
-    resp_block: bip300301::client::Block<true>,
+    resp_block: bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<(), SyncMempoolError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
@@ -508,7 +508,7 @@ pub async fn init_sync_mempool<
 >
 where
     Enforcer: CusfEnforcer,
-    RpcClient: bip300301::client::MainClient + Sync,
+    RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
 {
     let shutdown_signal = shutdown_signal.shared();
     let (best_block_hash, sequence_stream) = cusf_enforcer::initial_sync(

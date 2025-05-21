@@ -4,7 +4,8 @@ use std::{
     task::{Poll, Waker},
 };
 
-use bip300301::{
+use bitcoin::{BlockHash, Transaction, Txid};
+use bitcoin_jsonrpsee::{
     client::{
         GetBlockClient as _, GetRawTransactionClient as _,
         GetRawTransactionVerbose, U8Witness,
@@ -14,7 +15,6 @@ use bip300301::{
         ClientError as JsonRpcError,
     },
 };
-use bitcoin::{BlockHash, Transaction, Txid};
 
 use futures::Stream;
 use hashlink::LinkedHashSet;
@@ -146,7 +146,7 @@ impl Stream for RequestQueue {
 /// Responses received while syncing
 #[derive(Clone, Debug)]
 enum ResponseItem {
-    Block(Box<bip300301::client::Block<true>>),
+    Block(Box<bitcoin_jsonrpsee::client::Block<true>>),
     RejectTx,
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
@@ -176,7 +176,7 @@ async fn batched_request<RpcClient>(
     request: BatchedRequestItem,
 ) -> Result<BatchedResponseItem, RequestError>
 where
-    RpcClient: bip300301::client::MainClient + Sync,
+    RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
 {
     const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
     match request {

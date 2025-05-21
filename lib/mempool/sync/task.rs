@@ -147,7 +147,7 @@ fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
 async fn connect_block<Enforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
-    block: &bip300301::client::Block<true>,
+    block: &bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<(), SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
@@ -201,7 +201,7 @@ where
 async fn handle_resp_block<Enforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
-    resp_block: bip300301::client::Block<true>,
+    resp_block: bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<(), SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
@@ -479,7 +479,7 @@ async fn task<Enforcer, RpcClient>(
 ) -> Result<(), SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
-    RpcClient: bip300301::client::MainClient + Sync,
+    RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
 {
     // Filter mempool with enforcer
     let rejected_txs: LinkedHashSet<Txid> = {
@@ -578,7 +578,8 @@ where
         err_handler: ErrHandler,
     ) -> Self
     where
-        RpcClient: bip300301::client::MainClient + Send + Sync + 'static,
+        RpcClient:
+            bitcoin_jsonrpsee::client::MainClient + Send + Sync + 'static,
         ErrHandler:
             FnOnce(SyncTaskError<Enforcer>) -> ErrHandlerFut + Send + 'static,
         ErrHandlerFut: Future<Output = ()> + Send,
