@@ -1,22 +1,17 @@
 [workspace]
 resolver = "2"
-members = [
-    "app",
-    "lib",
-]
+members = ["app", "lib"]
 
 [workspace.package]
-authors = [
-    "Ash Manning <ash@layertwolabs.com>",
-]
+authors = ["Ash Manning <ash@layertwolabs.com>"]
 edition = "2021"
 version = "0.2.0"
 license-file = "LICENSE.txt"
 publish = false
 
-[workspace.dependencies.bip300301]
-git = "https://github.com/Ash-L2L/bip300301.git"
-rev = "8603b40520e432ccff27164a484647aa4a0be250"
+[workspace.dependencies.bitcoin-jsonrpsee]
+git = "https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git"
+rev = "e30cfe70e9330ed0676f3d9c92dd761ce01a6b3c"
 
 [workspace.dependencies.futures]
 version = "0.3.30"

@@ -133,7 +133,7 @@ expression = "MIT AND ISC AND OpenSSL"
 # depending on the rest of your configuration
 license-files = [
     # Each entry is a crate relative path, and the (opaque) hash of its contents
-    { path = "LICENSE", hash = 0xbd0eed23 }
+    { path = "LICENSE", hash = 0xbd0eed23 },
 ]
 
 [licenses.private]
@@ -239,7 +239,7 @@ unknown-git = "deny"
 # if not specified. If it is specified but empty, no registries are allowed.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # List of URLs for allowed Git repositories
-allow-git = ["https://github.com/Ash-L2L/bip300301.git"]
+allow-git = ["https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git"]
 
 [sources.allow-org]
 # github.com organizations to allow git sources for

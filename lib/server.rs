@@ -1,14 +1,14 @@
 use std::convert::Infallible;
 
 use async_trait::async_trait;
-use bip300301::client::{
-    BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
-    CoinbaseTxnOrValue, NetworkInfo,
-};
 use bitcoin::{
     amount::CheckedSum, hashes::Hash as _, merkle_tree, script::PushBytesBuf,
     Amount, Block, Network, ScriptBuf, Transaction, TxOut, Txid,
     WitnessMerkleNode, Wtxid,
+};
+use bitcoin_jsonrpsee::client::{
+    BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
+    CoinbaseTxnOrValue, NetworkInfo,
 };
 use chrono::Utc;
 use educe::Educe;
