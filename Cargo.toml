@@ -11,7 +11,7 @@ publish = false
 
 [workspace.dependencies.bitcoin-jsonrpsee]
 git = "https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git"
-rev = "360b4e4e3ab333a34e0d82d023494cbd8f13b06e"
+rev = "4135b234cbc49b4cc49206c3261e04098d972343"
 
 [workspace.dependencies.futures]
 version = "0.3.30"

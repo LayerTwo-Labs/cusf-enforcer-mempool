@@ -16,7 +16,7 @@ use bitcoin_jsonrpsee::{
     },
 };
 
-use futures::Stream;
+use futures::{FutureExt as _, Stream};
 use hashlink::LinkedHashSet;
 use nonempty::NonEmpty;
 use parking_lot::Mutex;
@@ -192,6 +192,8 @@ where
             }
             let _resp: Vec<bool> = rpc_client
                 .batch_request(request)
+                // Must box due to https://github.com/rust-lang/rust/issues/100013
+                .boxed()
                 .await?
                 .into_ok()
                 .map_err(|mut errs| JsonRpcError::from(errs.next().unwrap()))?
@@ -209,6 +211,8 @@ where
             }
             let txs: Vec<(Transaction, bool)> = rpc_client
                 .batch_request(request)
+                // Must box due to https://github.com/rust-lang/rust/issues/100013
+                .boxed()
                 .await?
                 .into_ok()
                 .map_err(|mut errs| JsonRpcError::from(errs.next().unwrap()))?

@@ -13,7 +13,7 @@ bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
 clap = { version = "4.5.15", features = ["derive"] }
 cusf-enforcer-mempool = { path = "../lib" }
 futures = { workspace = true }
-jsonrpsee = { version = "0.24.3", features = ["macros", "server"] }
+jsonrpsee = { version = "0.25.1", features = ["macros", "server"] }
 tokio = { version = "1.38.0", features = ["rt-multi-thread"] }
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
