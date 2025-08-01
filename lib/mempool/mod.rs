@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use bitcoin::{BlockHash, Target, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
@@ -53,6 +53,8 @@ pub struct TxInfo {
     pub descendant_size: u64,
     pub fees: RawMempoolTxFees,
     pub spent_by: OrdSet<Txid>,
+    /// Conflicts due to reasons other than shared inputs
+    pub conflicts_with: OrdSet<Txid>,
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +84,8 @@ pub enum MempoolInsertError {
     MissingDescendant(#[from] MissingDescendantError),
     #[error(transparent)]
     MissingDescendantsKey(#[from] MissingDescendantsKeyError),
+    #[error("Tx already exists in mempool (`{txid}`)")]
+    TxAlreadyExists { txid: Txid },
 }
 
 #[derive(Debug, Error)]
@@ -99,6 +103,62 @@ pub enum MempoolRemoveError {
     MissingDescendant(#[from] MissingDescendantError),
     #[error(transparent)]
     MissingDescendantsKey(#[from] MissingDescendantsKeyError),
+}
+
+#[derive(Debug, Error)]
+pub enum MempoolUpdateError {
+    #[error(transparent)]
+    MissingDescendant(#[from] MissingDescendantError),
+}
+
+/// Description of conflicts between txs
+#[derive(Debug, Default)]
+pub(crate) struct Conflicts(
+    /// Conflicts between txids a and b, where a < b, are stored by inserting
+    /// b into the set of conflicts with a.
+    BTreeMap<Txid, std::collections::HashSet<Txid>>,
+);
+
+impl Conflicts {
+    fn insert(&mut self, txid_a: Txid, txid_b: Txid) {
+        let (txid_lo, txid_hi) = match txid_a.cmp(&txid_b) {
+            std::cmp::Ordering::Less => (txid_a, txid_b),
+            std::cmp::Ordering::Equal => return,
+            std::cmp::Ordering::Greater => (txid_b, txid_a),
+        };
+        self.0.entry(txid_lo).or_default().insert(txid_hi);
+    }
+
+    /// Iterate over conflicts, where the first element is the lower txid.
+    /// Each conflict will be visited only once - if txids `a` and `b` conflict,
+    /// where `a < b`, the conflict will be expressed as `(a, conflicts_a)`,
+    /// where `b` is an element of `conflicts_a`.
+    /// If `b` is visited, as `(b, conflicts_b)`, then `a` will not be an
+    /// element of `conflicts_b`.
+    fn iter(
+        &self,
+    ) -> impl Iterator<Item = (&Txid, &std::collections::HashSet<Txid>)> {
+        self.0.iter()
+    }
+
+    /// Iterate over conflicts, where the first element is the greater txid.
+    /// Each conflict will be visited only once - if txids `a` and `b` conflict,
+    /// where `a > b`, the conflict will be expressed as `(a, conflicts_a)`,
+    /// where `b` is an element of `conflicts_a`.
+    /// If `b` is visited, as `(b, conflicts_b)`, then `a` will not be an
+    /// element of `conflicts_b`.
+    fn iter_inverted(
+        self,
+    ) -> impl Iterator<Item = (Txid, std::collections::HashSet<Txid>)> {
+        let mut inverted =
+            BTreeMap::<Txid, std::collections::HashSet<Txid>>::new();
+        for (txid_lo, conflicts) in self.0 {
+            for txid_hi in conflicts {
+                inverted.entry(txid_hi).or_default().insert(txid_lo);
+            }
+        }
+        inverted.into_iter()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -230,13 +290,19 @@ impl Mempool {
         self.chain.blocks[&self.chain.tip].compact_target.into()
     }
 
-    /// Insert a tx into the mempool
+    /// Insert a tx into the mempool,
+    /// stating conflicts with other txs due to reasons other than shared
+    /// inputs.
     pub fn insert(
         &mut self,
         tx: Transaction,
         fee: u64,
+        conflicts_with: imbl::OrdSet<Txid>,
     ) -> Result<Option<TxInfo>, MempoolInsertError> {
         let txid = tx.compute_txid();
+        if self.txs.0.contains_key(&txid) {
+            return Err(MempoolInsertError::TxAlreadyExists { txid });
+        }
         // initially incorrect, must be computed after insertion
         let mut ancestor_fees = fee;
         // initially incorrect, must be computed after insertion
@@ -247,6 +313,8 @@ impl Mempool {
         let mut ancestor_size = vsize;
         // initially incorrect, must be computed after insertion
         let mut descendant_size = vsize;
+        // conflicts including ancestor conflicts
+        let mut ancestry_conflicts = conflicts_with.clone();
         let depends = tx
             .input
             .iter()
@@ -264,6 +332,8 @@ impl Mempool {
                     missing: *dep,
                 })?;
             dep_info.spent_by.insert(txid);
+            ancestry_conflicts =
+                ancestry_conflicts.union(dep_info.conflicts_with.clone());
         }
         let spent_by = if let Some(childs) = self.tx_childs.0.get(&txid) {
             OrdSet::from_iter(childs.iter().copied())
@@ -282,6 +352,7 @@ impl Mempool {
                 modified: modified_fee,
             },
             spent_by,
+            conflicts_with: ancestry_conflicts,
         };
         let (ndeps, nspenders) = (info.depends.len(), info.spent_by.len());
         let res = self.txs.0.insert(txid, (tx, info)).map(|(_, info)| info);
@@ -306,9 +377,22 @@ impl Mempool {
                 descendant_fees += descendant_info.fees.modified;
                 descendant_info.ancestor_size += vsize;
                 descendant_info.fees.ancestor += modified_fee;
+                descendant_info.conflicts_with = descendant_info
+                    .conflicts_with
+                    .clone()
+                    .union(conflicts_with.clone());
                 Result::<_, MempoolInsertError>::Ok(())
             },
         )?;
+        for conflict_txid in conflicts_with {
+            self.txs.descendants_mut(conflict_txid).try_for_each(
+                |descendant_info| {
+                    let (_descendant_tx, descendant_info) = descendant_info?;
+                    descendant_info.conflicts_with.insert(txid);
+                    Result::<_, MempoolInsertError>::Ok(())
+                },
+            )?;
+        }
         let (_, info) = self.txs.0.get_mut(&txid).unwrap();
         info.fees.ancestor = ancestor_fees;
         info.fees.descendant = descendant_fees;
@@ -485,6 +569,40 @@ impl Mempool {
         Ok(res)
     }
 
+    /// Add a set of conflicts between txs
+    fn add_conflicts(
+        &mut self,
+        conflicts: Conflicts,
+    ) -> Result<(), MempoolUpdateError> {
+        for (txid_lo, conflict_txids) in conflicts.iter() {
+            let conflict_txids = OrdSet::from(conflict_txids);
+            self.txs.descendants_mut(*txid_lo).try_for_each(
+                |descendant_info| {
+                    let (_desc_tx, desc_info) = descendant_info?;
+                    desc_info.conflicts_with = desc_info
+                        .conflicts_with
+                        .clone()
+                        .union(conflict_txids.clone());
+                    Result::<_, MissingDescendantError>::Ok(())
+                },
+            )?;
+        }
+        for (txid_hi, conflict_txids) in conflicts.iter_inverted() {
+            let conflict_txids = OrdSet::from(conflict_txids);
+            self.txs.descendants_mut(txid_hi).try_for_each(
+                |descendant_info| {
+                    let (_desc_tx, desc_info) = descendant_info?;
+                    desc_info.conflicts_with = desc_info
+                        .conflicts_with
+                        .clone()
+                        .union(conflict_txids.clone());
+                    Result::<_, MissingDescendantError>::Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// choose txs for a block proposal, mutating the underlying mempool
     fn propose_txs_mut(
         &mut self,
@@ -510,10 +628,20 @@ impl Mempool {
             while let Some((txid, parents_visited)) = to_add.pop() {
                 if parents_visited {
                     tracing::trace!(%txid, "Removing tx from mempool");
-                    let (_tx, _info) = self
+                    let (_tx, info) = self
                         .remove(&txid)?
                         .expect("missing tx in mempool when proposing txs");
                     res.insert(txid);
+                    // Remove conflicts for the final tx
+                    if to_add.is_empty() {
+                        for conflict_txid in info.conflicts_with {
+                            for (removed_txid, _removed_tx) in
+                                self.remove_with_descendants(&conflict_txid)?
+                            {
+                                tracing::trace!(%txid, %removed_txid, "Removed tx from mempool due to conflict");
+                            }
+                        }
+                    }
                 } else {
                     let Some((_, info)) = self.txs.0.get(&txid) else {
                         tracing::warn!(%txid, "Missing tx in mempool when proposing txs, omitting from block template proposal");

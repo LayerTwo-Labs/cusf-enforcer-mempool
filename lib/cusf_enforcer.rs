@@ -27,6 +27,16 @@ impl Default for ConnectBlockAction {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum TxAcceptAction {
+    Accept {
+        /// Transactions that conflict with this one.
+        /// It is not necessary to specify conflicts due to common inputs.
+        conflicts_with: HashSet<Txid>,
+    },
+    Reject,
+}
+
 pub trait CusfEnforcer {
     type SyncError: std::error::Error + Send + Sync + 'static;
 
@@ -54,13 +64,14 @@ pub trait CusfEnforcer {
 
     type AcceptTxError: std::error::Error + Send + Sync + 'static;
 
-    /// Return `true` to accept the tx, or `false` to reject it.
+    /// Accept or reject a transaction, declaring conflicts for reasons other
+    /// than shared inputs.
     /// Inputs to a tx are always available.
     fn accept_tx<TxRef>(
         &mut self,
         tx: &Transaction,
         tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<bool, Self::AcceptTxError>
+    ) -> Result<TxAcceptAction, Self::AcceptTxError>
     where
         TxRef: Borrow<Transaction>;
 }
@@ -458,14 +469,26 @@ where
         &mut self,
         tx: &Transaction,
         tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<bool, Self::AcceptTxError>
+    ) -> Result<TxAcceptAction, Self::AcceptTxError>
     where
         TxRef: Borrow<Transaction>,
     {
-        if self.0.accept_tx(tx, tx_inputs).map_err(Either::Left)? {
-            self.1.accept_tx(tx, tx_inputs).map_err(Either::Right)
-        } else {
-            Ok(false)
+        match self.0.accept_tx(tx, tx_inputs).map_err(Either::Left)? {
+            TxAcceptAction::Accept {
+                conflicts_with: left_conflicts,
+            } => {
+                match self.1.accept_tx(tx, tx_inputs).map_err(Either::Right)? {
+                    TxAcceptAction::Accept {
+                        conflicts_with: right_conflicts,
+                    } => {
+                        let mut conflicts_with = left_conflicts;
+                        conflicts_with.extend(right_conflicts);
+                        Ok(TxAcceptAction::Accept { conflicts_with })
+                    }
+                    TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
+                }
+            }
+            TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
         }
     }
 }
@@ -508,11 +531,13 @@ impl CusfEnforcer for DefaultEnforcer {
         &mut self,
         _tx: &Transaction,
         _tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<bool, Self::AcceptTxError>
+    ) -> Result<TxAcceptAction, Self::AcceptTxError>
     where
         TxRef: Borrow<Transaction>,
     {
-        Ok(true)
+        Ok(TxAcceptAction::Accept {
+            conflicts_with: HashSet::new(),
+        })
     }
 }
 
@@ -589,7 +614,7 @@ where
         &mut self,
         tx: &Transaction,
         tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<bool, Self::AcceptTxError>
+    ) -> Result<TxAcceptAction, Self::AcceptTxError>
     where
         TxRef: Borrow<Transaction>,
     {

@@ -51,6 +51,16 @@ where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
     pub exclude_mempool_txs: HashSet<Txid>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BlockTemplateSuffix<const COINBASE_TXN: bool>
+where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
+{
+    /// Suffix coinbase txouts
+    pub coinbase_txouts: <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
+    /// Suffix txs, with absolute fee
+    pub txs: Vec<(Transaction, bitcoin::Amount)>,
+}
+
 pub trait CusfBlockProducer: CusfEnforcer {
     type InitialBlockTemplateError: std::error::Error + Send + Sync + 'static;
 
@@ -69,14 +79,14 @@ pub trait CusfBlockProducer: CusfEnforcer {
 
     type SuffixTxsError: std::error::Error + Send + Sync + 'static;
 
-    /// Suffix txs, with absolute fee
-    fn suffix_txs<const COINBASE_TXN: bool>(
+    /// Add outputs / txs to a block template, after filling with proposed txs
+    fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: &InitialBlockTemplate<COINBASE_TXN>,
     ) -> impl Future<
         Output = Result<
-            Vec<(Transaction, bitcoin::Amount)>,
+            BlockTemplateSuffix<COINBASE_TXN>,
             Self::SuffixTxsError,
         >,
     > + Send
@@ -116,28 +126,52 @@ where
 
     type SuffixTxsError = Either<C0::SuffixTxsError, C1::SuffixTxsError>;
 
-    async fn suffix_txs<const COINBASE_TXN: bool>(
+    async fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<Vec<(Transaction, bitcoin::Amount)>, Self::SuffixTxsError>
+    ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
         let suffix_left = self
             .0
-            .suffix_txs(coinbase_txn_wit, template)
+            .block_template_suffix(coinbase_txn_wit, template)
             .await
             .map_err(Either::Left)?;
         let mut template = template.clone();
-        template.prefix_txs.extend(suffix_left.iter().cloned());
+        match coinbase_txn_wit {
+            typewit::const_marker::BoolWit::True(wit) => {
+                let wit = wit.map(CoinbaseTxouts);
+                let coinbase_txouts: &mut Vec<_> =
+                    wit.in_mut().to_right(&mut template.coinbase_txouts);
+                coinbase_txouts.extend(
+                    wit.in_ref()
+                        .to_right(&suffix_left.coinbase_txouts)
+                        .iter()
+                        .cloned(),
+                );
+            }
+            typewit::const_marker::BoolWit::False(_) => (),
+        }
+        template.prefix_txs.extend(suffix_left.txs.iter().cloned());
         let suffix_right = self
             .1
-            .suffix_txs(coinbase_txn_wit, &template)
+            .block_template_suffix(coinbase_txn_wit, &template)
             .await
             .map_err(Either::Right)?;
         let mut res = suffix_left;
-        res.extend(suffix_right);
+        match coinbase_txn_wit {
+            typewit::const_marker::BoolWit::True(wit) => {
+                let wit = wit.map(CoinbaseTxouts);
+                let coinbase_txouts: &mut Vec<_> =
+                    wit.in_mut().to_right(&mut res.coinbase_txouts);
+                coinbase_txouts
+                    .extend(wit.to_right(suffix_right.coinbase_txouts));
+            }
+            typewit::const_marker::BoolWit::False(_) => (),
+        }
+        res.txs.extend(suffix_right.txs);
         Ok(res)
     }
 }
@@ -161,15 +195,15 @@ impl CusfBlockProducer for cusf_enforcer::DefaultEnforcer {
 
     type SuffixTxsError = Infallible;
 
-    async fn suffix_txs<const COINBASE_TXN: bool>(
+    async fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
         _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         _template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<Vec<(Transaction, bitcoin::Amount)>, Self::SuffixTxsError>
+    ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        Ok(Vec::new())
+        Ok(BlockTemplateSuffix::default())
     }
 }
 
@@ -206,21 +240,21 @@ where
 
     type SuffixTxsError = Either<C0::SuffixTxsError, C1::SuffixTxsError>;
 
-    async fn suffix_txs<const COINBASE_TXN: bool>(
+    async fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<Vec<(Transaction, bitcoin::Amount)>, Self::SuffixTxsError>
+    ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
         match self {
             Self::Left(left) => left
-                .suffix_txs(coinbase_txn_wit, template)
+                .block_template_suffix(coinbase_txn_wit, template)
                 .await
                 .map_err(Either::Left),
             Self::Right(right) => right
-                .suffix_txs(coinbase_txn_wit, template)
+                .block_template_suffix(coinbase_txn_wit, template)
                 .await
                 .map_err(Either::Right),
         }

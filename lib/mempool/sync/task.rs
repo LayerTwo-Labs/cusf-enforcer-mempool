@@ -16,12 +16,16 @@ use thiserror::Error;
 use tokio::{spawn, sync::RwLock, task::JoinHandle};
 
 use super::{
-    super::Mempool, batched_request, BatchedResponseItem, CombinedStreamItem,
-    RequestError, RequestQueue, ResponseItem,
+    super::{Conflicts, Mempool},
+    batched_request, BatchedResponseItem, CombinedStreamItem, RequestError,
+    RequestQueue, ResponseItem,
 };
 use crate::{
     cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
-    mempool::{sync::RequestItem, MempoolInsertError, MempoolRemoveError},
+    mempool::{
+        sync::RequestItem, MempoolInsertError, MempoolRemoveError,
+        MempoolUpdateError,
+    },
     zmq::{
         BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
         SequenceStreamError, TxHashEvent, TxHashMessage,
@@ -60,6 +64,8 @@ where
     MempoolInsert(#[from] MempoolInsertError),
     #[error(transparent)]
     MempoolRemove(#[from] MempoolRemoveError),
+    #[error(transparent)]
+    MempoolUpdate(#[from] MempoolUpdateError),
     #[error("Request error")]
     Request(#[from] RequestError),
     #[error("Sequence stream error")]
@@ -169,8 +175,9 @@ where
             source: err,
         })?;
 
-    tracing::trace!(block_hash = %block.hash, 
-        block_height = block.height, 
+    tracing::trace!(
+        block_hash = %block.hash,
+        block_height = block.height,
         "processed mempool, forwarding to enforcer block connection logic");
     match inner
         .enforcer
@@ -311,19 +318,26 @@ where
     let Some(fee_delta) = value_in.checked_sub(value_out) else {
         return Err(SyncTaskError::FeeOverflow);
     };
-    if inner
+    match inner
         .enforcer
         .accept_tx(tx, &input_txs)
         .map_err(cusf_enforcer::Error::AcceptTx)?
     {
-        inner.mempool.insert(tx.clone(), fee_delta.to_sat())?;
-        tracing::trace!("added {txid} to mempool");
-    } else {
-        tracing::trace!("rejecting {txid}");
-        sync_state.rejected_txs.insert(*txid);
-        sync_state
-            .request_queue
-            .push_front(RequestItem::RejectTx(*txid));
+        cusf_enforcer::TxAcceptAction::Accept { conflicts_with } => {
+            inner.mempool.insert(
+                tx.clone(),
+                fee_delta.to_sat(),
+                conflicts_with.into(),
+            )?;
+            tracing::trace!("added {txid} to mempool");
+        }
+        cusf_enforcer::TxAcceptAction::Reject => {
+            tracing::trace!("rejecting {txid}");
+            sync_state.rejected_txs.insert(*txid);
+            sync_state
+                .request_queue
+                .push_front(RequestItem::RejectTx(*txid));
+        }
     }
     let mempool_txs = inner.mempool.txs.0.len();
     tracing::debug!(%mempool_txs, "Syncing...");
@@ -488,6 +502,7 @@ where
             ref mut enforcer,
             ref mut mempool,
         } = *inner_write;
+        let mut conflicts = Conflicts::default();
         let rejected_txs = mempool
             .try_filter(true, |tx, mempool_inputs| {
                 let mut tx_inputs = mempool_inputs.clone();
@@ -499,7 +514,18 @@ where
                     let input_tx = &tx_cache[&input_txid];
                     tx_inputs.insert(input_txid, input_tx);
                 }
-                enforcer.accept_tx(tx, &tx_inputs)
+                match enforcer.accept_tx(tx, &tx_inputs)? {
+                    cusf_enforcer::TxAcceptAction::Accept {
+                        conflicts_with,
+                    } => {
+                        let txid = tx.compute_txid();
+                        for conflict_txid in conflicts_with {
+                            conflicts.insert(txid, conflict_txid);
+                        }
+                        Ok(true)
+                    }
+                    cusf_enforcer::TxAcceptAction::Reject => Ok(false),
+                }
             })
             .map_err(|err| match err {
                 either::Either::Left(mempool_remove_err) => {
@@ -513,6 +539,7 @@ where
             .keys()
             .copied()
             .collect();
+        let () = mempool.add_conflicts(conflicts)?;
         drop(inner_write);
         rejected_txs
     };
