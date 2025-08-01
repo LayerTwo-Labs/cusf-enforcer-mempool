@@ -298,7 +298,13 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &
     let mut mempool = mempool.clone();
     tracing::debug!("Inserting prefix txs into cloned mempool");
     for (tx, fee) in initial_block_template.prefix_txs.iter().cloned() {
-        let _txinfo: Option<_> = mempool.insert(tx, fee.to_sat())?;
+        match mempool.insert(tx, fee.to_sat(), Default::default()) {
+            Ok(_)
+            | Err(crate::mempool::MempoolInsertError::TxAlreadyExists {
+                ..
+            }) => (),
+            Err(err) => return Err(err.into()),
+        }
     }
     // depends field must be set later
     let mut res_txs: Vec<_> = {
@@ -370,13 +376,26 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &
             let tx = bitcoin::consensus::deserialize(&tx.data).unwrap();
             (tx, fee)
         }));
-    tracing::debug!("Adding suffix txs");
-    let suffix_txs = block_producer
-        .suffix_txs(typewit::MakeTypeWitness::MAKE, &initial_block_template)
+    tracing::debug!("Adding block template suffix");
+    let template_suffix = block_producer
+        .block_template_suffix(
+            typewit::MakeTypeWitness::MAKE,
+            &initial_block_template,
+        )
         .await
         .map_err(BuildBlockError::SuffixTxs)?;
+    let mut res_coinbase_txouts = initial_block_template.coinbase_txouts;
+    match typewit::MakeTypeWitness::MAKE {
+        typewit::const_marker::BoolWit::True(wit) => {
+            let wit = wit.map(cusf_block_producer::CoinbaseTxouts);
+            wit.in_mut()
+                .to_right(&mut res_coinbase_txouts)
+                .extend(wit.to_right(template_suffix.coinbase_txouts));
+        }
+        typewit::const_marker::BoolWit::False(_) => (),
+    }
     res_txs.extend(mempool_txs);
-    res_txs.extend(suffix_txs.iter().map(|(tx, fee)| {
+    res_txs.extend(template_suffix.txs.iter().map(|(tx, fee)| {
         BlockTemplateTransaction {
             data: bitcoin::consensus::serialize(tx),
             txid: tx.compute_txid(),
@@ -406,7 +425,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &
             tx.depends.dedup();
         }
     }
-    Ok((initial_block_template.coinbase_txouts, res_txs))
+    Ok((res_coinbase_txouts, res_txs))
 }
 
 #[async_trait]

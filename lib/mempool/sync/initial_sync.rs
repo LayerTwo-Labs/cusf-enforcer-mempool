@@ -369,7 +369,11 @@ where
     let Some(fee_delta) = value_in.checked_sub(value_out) else {
         return Err(SyncMempoolError::FeeOverflow);
     };
-    sync_state.mempool.insert(tx.clone(), fee_delta.to_sat())?;
+    sync_state.mempool.insert(
+        tx.clone(),
+        fee_delta.to_sat(),
+        imbl::OrdSet::new(),
+    )?;
     tracing::trace!("added {txid} to mempool");
     let mempool_txs = sync_state.mempool.txs.0.len();
     tracing::debug!(%mempool_txs, "Syncing...");
