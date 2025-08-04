@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use async_trait::async_trait;
 use bitcoin::{
     amount::CheckedSum, hashes::Hash as _, merkle_tree, script::PushBytesBuf,
-    Amount, Block, Network, ScriptBuf, Transaction, TxOut, Txid,
+    Amount, Block, BlockHash, Network, ScriptBuf, Transaction, TxOut, Txid,
     WitnessMerkleNode, Wtxid,
 };
 use bitcoin_jsonrpsee::client::{
@@ -260,7 +260,11 @@ where
 }
 
 // select block txs, and coinbase txouts if coinbasetxn is set
-async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &crate::mempool::Mempool)
+async fn block_txs<const COINBASE_TXN: bool, BP>(
+    block_producer: &BP,
+    mempool: &crate::mempool::Mempool,
+    parent_block_hash: &BlockHash,
+)
     -> Result<
             (<typewit::const_marker::Bool<COINBASE_TXN> as cusf_block_producer::CoinbaseTxn>::CoinbaseTxouts,
              Vec<BlockTemplateTransaction>),
@@ -274,6 +278,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &
     tracing::debug!("Generating initial block template");
     initial_block_template = block_producer
         .initial_block_template(
+            parent_block_hash,
             typewit::MakeTypeWitness::MAKE,
             initial_block_template,
         )
@@ -379,6 +384,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(block_producer: &BP, mempool: &
     tracing::debug!("Adding block template suffix");
     let template_suffix = block_producer
         .block_template_suffix(
+            parent_block_hash,
             typewit::MakeTypeWitness::MAKE,
             &initial_block_template,
         )
@@ -479,7 +485,12 @@ where
                         ) = if request.capabilities.contains("coinbasetxn") {
                             tracing::debug!("Filling block txs");
                             let (coinbase_txouts, block_txs) =
-                                block_txs::<true, _>(enforcer, mempool).await?;
+                                block_txs::<true, _>(
+                                    enforcer,
+                                    mempool,
+                                    &tip_block.hash,
+                                )
+                                .await?;
                             tracing::debug!("Finalizing coinbase txn");
                             let (coinbase_tx, witness_commitment_spk) =
                                 finalize_coinbase_tx(
@@ -498,9 +509,12 @@ where
                                 default_witness_commitment,
                             )
                         } else {
-                            let ((), block_txs) =
-                                block_txs::<false, _>(enforcer, mempool)
-                                    .await?;
+                            let ((), block_txs) = block_txs::<false, _>(
+                                enforcer,
+                                mempool,
+                                &tip_block.hash,
+                            )
+                            .await?;
                             (None, block_txs, None)
                         };
                         Ok((
