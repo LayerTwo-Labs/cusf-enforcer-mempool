@@ -2,7 +2,7 @@ use std::{
     collections::HashSet, convert::Infallible, fmt::Debug, future::Future,
 };
 
-use bitcoin::{Transaction, TxOut, Txid};
+use bitcoin::{BlockHash, Transaction, TxOut, Txid};
 use either::Either;
 
 use crate::cusf_enforcer::{self, CusfEnforcer};
@@ -66,6 +66,7 @@ pub trait CusfBlockProducer: CusfEnforcer {
 
     fn initial_block_template<const COINBASE_TXN: bool>(
         &self,
+        parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: InitialBlockTemplate<COINBASE_TXN>,
     ) -> impl Future<
@@ -82,6 +83,7 @@ pub trait CusfBlockProducer: CusfEnforcer {
     /// Add outputs / txs to a block template, after filling with proposed txs
     fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
+        parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: &InitialBlockTemplate<COINBASE_TXN>,
     ) -> impl Future<
@@ -104,6 +106,7 @@ where
 
     async fn initial_block_template<const COINBASE_TXN: bool>(
         &self,
+        parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         mut template: InitialBlockTemplate<COINBASE_TXN>,
     ) -> Result<
@@ -115,11 +118,19 @@ where
     {
         template = self
             .0
-            .initial_block_template(coinbase_txn_wit, template)
+            .initial_block_template(
+                parent_block_hash,
+                coinbase_txn_wit,
+                template,
+            )
             .await
             .map_err(Either::Left)?;
         self.1
-            .initial_block_template(coinbase_txn_wit, template)
+            .initial_block_template(
+                parent_block_hash,
+                coinbase_txn_wit,
+                template,
+            )
             .await
             .map_err(Either::Right)
     }
@@ -128,6 +139,7 @@ where
 
     async fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
+        parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: &InitialBlockTemplate<COINBASE_TXN>,
     ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
@@ -136,7 +148,11 @@ where
     {
         let suffix_left = self
             .0
-            .block_template_suffix(coinbase_txn_wit, template)
+            .block_template_suffix(
+                parent_block_hash,
+                coinbase_txn_wit,
+                template,
+            )
             .await
             .map_err(Either::Left)?;
         let mut template = template.clone();
@@ -157,7 +173,11 @@ where
         template.prefix_txs.extend(suffix_left.txs.iter().cloned());
         let suffix_right = self
             .1
-            .block_template_suffix(coinbase_txn_wit, &template)
+            .block_template_suffix(
+                parent_block_hash,
+                coinbase_txn_wit,
+                &template,
+            )
             .await
             .map_err(Either::Right)?;
         let mut res = suffix_left;
@@ -181,6 +201,7 @@ impl CusfBlockProducer for cusf_enforcer::DefaultEnforcer {
 
     async fn initial_block_template<const COINBASE_TXN: bool>(
         &self,
+        _parent_block_hash: &BlockHash,
         _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: InitialBlockTemplate<COINBASE_TXN>,
     ) -> Result<
@@ -197,6 +218,7 @@ impl CusfBlockProducer for cusf_enforcer::DefaultEnforcer {
 
     async fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
+        _parent_block_hash: &BlockHash,
         _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         _template: &InitialBlockTemplate<COINBASE_TXN>,
     ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
@@ -217,6 +239,7 @@ where
 
     async fn initial_block_template<const COINBASE_TXN: bool>(
         &self,
+        parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: InitialBlockTemplate<COINBASE_TXN>,
     ) -> Result<
@@ -228,11 +251,19 @@ where
     {
         match self {
             Self::Left(left) => left
-                .initial_block_template(coinbase_txn_wit, template)
+                .initial_block_template(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
                 .await
                 .map_err(Either::Left),
             Self::Right(right) => right
-                .initial_block_template(coinbase_txn_wit, template)
+                .initial_block_template(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
                 .await
                 .map_err(Either::Right),
         }
@@ -242,6 +273,7 @@ where
 
     async fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
+        parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
         template: &InitialBlockTemplate<COINBASE_TXN>,
     ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
@@ -250,11 +282,19 @@ where
     {
         match self {
             Self::Left(left) => left
-                .block_template_suffix(coinbase_txn_wit, template)
+                .block_template_suffix(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
                 .await
                 .map_err(Either::Left),
             Self::Right(right) => right
-                .block_template_suffix(coinbase_txn_wit, template)
+                .block_template_suffix(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
                 .await
                 .map_err(Either::Right),
         }
