@@ -6,7 +6,8 @@ use std::{
 };
 
 use bitcoin::{
-    hashes::Hash as _, Amount, BlockHash, OutPoint, Transaction, Txid,
+    consensus::Decodable, hashes::Hash as _, Amount, BlockHash, OutPoint,
+    Transaction, Txid,
 };
 use educe::Educe;
 use futures::{future::BoxFuture, stream, StreamExt as _};
@@ -14,6 +15,7 @@ use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
 use tokio::{spawn, sync::RwLock, task::JoinHandle};
+use tracing::instrument;
 
 use super::{
     super::{Conflicts, Mempool},
@@ -58,6 +60,11 @@ where
         block_hash: BlockHash,
         source: bitcoin::consensus::encode::Error,
     },
+    #[error("Failed to decode transaction: `{txid}`")]
+    DecodeTransaction {
+        txid: Txid,
+        source: bitcoin::consensus::encode::Error,
+    },
     #[error("Fee overflow")]
     FeeOverflow,
     #[error(transparent)]
@@ -79,8 +86,7 @@ struct MempoolSyncInner<Enforcer> {
     mempool: Mempool,
 }
 
-async fn handle_seq_message<Enforcer>(
-    inner: &RwLock<MempoolSyncInner<Enforcer>>,
+async fn handle_seq_message(
     sync_state: &mut SyncState,
     seq_msg: SequenceMessage,
 ) {
@@ -102,22 +108,16 @@ async fn handle_seq_message<Enforcer>(
             event: BlockHashEvent::Disconnected,
             ..
         }) => {
-            // FIXME: handle case in which block exists
-            // FIXME: remove
-            tracing::debug!("Adding block {block_hash} to req queue");
-            if !inner
-                .read()
-                .await
-                .mempool
-                .chain
-                .blocks
-                .contains_key(&block_hash)
-            {
-                sync_state
-                    .request_queue
-                    .push_back(RequestItem::Block(block_hash));
-            }
+            tracing::debug!(block_hash = %block_hash, "Adding disconnected block to req queue");
+
+            // This will cause us to fetch the block, and then handle the actual
+            // disconnect. Invalidated blocks return just fine from `getblock`,
+            // with a -1 confirmations count
+            sync_state
+                .request_queue
+                .push_back(RequestItem::Block(block_hash));
         }
+
         SequenceMessage::TxHash(TxHashMessage {
             txid,
             event: TxHashEvent::Added,
@@ -205,6 +205,49 @@ where
     Ok(())
 }
 
+#[instrument(skip_all, fields(block_hash = %block.hash))]
+async fn handle_disconnected_block<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    block: &bitcoin_jsonrpsee::client::Block<true>,
+) -> Result<(), SyncTaskError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    let mut inserted_txs = 0;
+    // Insert any block transactions back into the mempool
+    for tx_info in &block.tx {
+        let decoded =
+            Transaction::consensus_decode(&mut tx_info.hex.as_slice())
+                .map_err(|err| SyncTaskError::DecodeTransaction {
+                    txid: tx_info.txid,
+                    source: err,
+                })?;
+
+        // Skip coinbase TXs
+        if decoded.is_coinbase() {
+            continue;
+        }
+
+        // TODO: figure out fee/or conflicts?
+        inner.mempool.insert(decoded, 0, imbl::OrdSet::new())?;
+        inserted_txs += 1;
+    }
+
+    if inserted_txs > 0 {
+        tracing::debug!("inserted {inserted_txs} txs back into the mempool");
+    }
+
+    let () = inner
+        .enforcer
+        .disconnect_block(block.hash)
+        .await
+        .map_err(cusf_enforcer::Error::DisconnectBlock)?;
+
+    tracing::debug!("disconnected block");
+
+    Ok(())
+}
+
 async fn handle_resp_block<Enforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
@@ -240,16 +283,10 @@ where
             {
                 return Ok(());
             };
-            for _tx_info in &resp_block.tx {
-                // FIXME: insert without info
-                let () = todo!();
-            }
+
+            let () = handle_disconnected_block(inner, &resp_block).await?;
+
             inner.mempool.chain.tip = resp_block_parent;
-            let () = inner
-                .enforcer
-                .disconnect_block(block_hash_msg.block_hash)
-                .await
-                .map_err(cusf_enforcer::Error::DisconnectBlock)?;
             sync_state.seq_message_queue.pop_front();
         }
     }
@@ -360,21 +397,18 @@ where
                 ..
             })) => {
                 if inner.mempool.chain.tip != *block_hash {
+                    tracing::debug!(block_hash = %block_hash, "Block hash mismatch, skipping");
                     break 'res false;
                 };
-                let Some(block) = inner.mempool.chain.blocks.get(block_hash)
+                let Some(block) =
+                    inner.mempool.chain.blocks.get(block_hash).cloned()
                 else {
+                    tracing::debug!(block_hash = %block_hash, "Block not found, skipping");
                     break 'res false;
                 };
-                for _tx_info in &block.tx {
-                    // FIXME: insert without info
-                    let () = todo!();
-                }
-                let () = inner
-                    .enforcer
-                    .disconnect_block(*block_hash)
-                    .await
-                    .map_err(cusf_enforcer::Error::DisconnectBlock)?;
+
+                let () = handle_disconnected_block(inner, &block).await?;
+
                 inner.mempool.chain.tip = block
                     .previousblockhash
                     .unwrap_or_else(BlockHash::all_zeros);
@@ -455,8 +489,6 @@ where
             }
         }
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
-            // FIXME: remove
-            tracing::debug!(block_hash = %block.hash, "Handling block #{}", block.height);
             let () =
                 handle_resp_block(&mut inner_write, sync_state, *block).await?;
         }
@@ -566,14 +598,23 @@ where
         response_stream.map(CombinedStreamItem::Response),
     );
     loop {
-        match combined_stream
+        let msg = combined_stream
             .next()
             .await
-            .ok_or(SyncTaskError::CombinedStreamEnded)?
-        {
+            .ok_or(SyncTaskError::CombinedStreamEnded)?;
+
+        tracing::debug!(
+            "Received stream message: `{}`",
+            match msg {
+                CombinedStreamItem::ZmqSeq(_) => "sequence",
+                CombinedStreamItem::Response(_) => "response",
+                CombinedStreamItem::Shutdown => "shutdown",
+            }
+        );
+
+        match msg {
             CombinedStreamItem::ZmqSeq(seq_msg) => {
-                let () =
-                    handle_seq_message(&inner, &mut sync_state, seq_msg?).await;
+                let () = handle_seq_message(&mut sync_state, seq_msg?).await;
             }
             CombinedStreamItem::Response(resp) => {
                 let () = handle_resp(&inner, &mut sync_state, resp?).await?;
@@ -583,7 +624,7 @@ where
                 // This isn't really an error though...
                 return Err(SyncTaskError::Shutdown);
             }
-        }
+        };
     }
 }
 
