@@ -18,7 +18,7 @@ use bitcoin_jsonrpsee::{
 };
 
 use futures::{
-    future::{self, FusedFuture, FutureExt as _},
+    future::{self, BoxFuture, FusedFuture, FutureExt as _},
     stream::{self, BoxStream, Stream, StreamExt as _},
 };
 use hashlink::LinkedHashSet;
@@ -26,7 +26,10 @@ use nonempty::NonEmpty;
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::zmq::{SequenceMessage, SequenceStream, SequenceStreamError};
+use crate::zmq::{
+    BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
+    SequenceStreamError, TxHashEvent, TxHashMessage,
+};
 
 mod initial_sync;
 pub(in crate::mempool) mod task;
@@ -147,25 +150,33 @@ impl Stream for RequestQueue {
     }
 }
 
-/// Head of the sequence message queue.
-/// Includes the time at which the message reached the head of the queue.
+#[derive(Clone, Copy, Debug)]
+enum SyncAction {
+    /// Insert tx
+    InsertTx(Txid),
+    /// Apply ZMQ sequence message
+    SequenceMessage(SequenceMessage),
+}
+
+/// Head of the sync action queue.
+/// Includes the time at which the action reached the head of the queue.
 #[derive(Debug)]
-struct SeqMessageQueueHead {
-    msg: SequenceMessage,
-    /// The time at which the message reached the head of the queue.
+struct SyncActionQueueHead {
+    action: SyncAction,
+    /// The time at which the action reached the head of the queue.
     reached_head_time: Instant,
 }
 
-/// Queue of sequence messages.
-/// Tracks how long a message has been at the head of the queue.
+/// Queue of sync actions.
+/// Tracks how long an action has been at the head of the queue.
 #[derive(Debug, Default)]
-struct SeqMessageQueue {
-    head: Option<SeqMessageQueueHead>,
-    tail: VecDeque<SequenceMessage>,
+struct SyncActionQueue {
+    head: Option<SyncActionQueueHead>,
+    tail: VecDeque<SyncAction>,
 }
 
-impl SeqMessageQueue {
-    fn front(&self) -> &Option<SeqMessageQueueHead> {
+impl SyncActionQueue {
+    fn front(&self) -> &Option<SyncActionQueueHead> {
         &self.head
     }
 
@@ -173,40 +184,157 @@ impl SeqMessageQueue {
         self.head.is_none()
     }
 
-    fn pop_front(&mut self) -> Option<SequenceMessage> {
+    fn pop_front(&mut self) -> Option<SyncAction> {
         let Self { head, tail } = self;
-        let new_head = tail.pop_front().map(|msg| SeqMessageQueueHead {
-            msg,
+        let new_head = tail.pop_front().map(|action| SyncActionQueueHead {
+            action,
             reached_head_time: Instant::now(),
         });
-        std::mem::replace(head, new_head).map(|old_head| old_head.msg)
+        std::mem::replace(head, new_head).map(|old_head| old_head.action)
     }
 
-    fn push_back(&mut self, msg: SequenceMessage) {
+    fn push_back(&mut self, action: SyncAction) {
         let Self { head, tail } = self;
         if head.is_none() {
             assert!(tail.is_empty());
             let reached_head_time = Instant::now();
-            *head = Some(SeqMessageQueueHead {
-                msg,
+            *head = Some(SyncActionQueueHead {
+                action,
                 reached_head_time,
             });
         } else {
-            tail.push_back(msg);
+            tail.push_back(action);
+        }
+    }
+
+    fn push_front(&mut self, action: SyncAction) {
+        let Self { head, tail } = self;
+        if let Some(old_head) = head.take() {
+            tail.push_front(old_head.action);
+        }
+        let reached_head_time = Instant::now();
+        *head = Some(SyncActionQueueHead {
+            action,
+            reached_head_time,
+        });
+    }
+}
+
+impl FromIterator<SyncAction> for SyncActionQueue {
+    fn from_iter<T>(actions: T) -> Self
+    where
+        T: IntoIterator<Item = SyncAction>,
+    {
+        let mut res = Self::default();
+        for action in actions.into_iter() {
+            res.push_back(action)
+        }
+        res
+    }
+}
+
+/// Timeout waiting to apply the next sync action before its dependencies
+/// were available.
+const APPLY_SYNC_ACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Future that fires once the action at the head of `action_queue` has waited
+/// longer than APPLY_SYNC_ACTION_TIMEOUT for its dependencies, or stays pending
+/// forever while the queue is empty.
+fn apply_sync_action_timeout(
+    sync_action_queue: &SyncActionQueue,
+) -> BoxFuture<'static, ()> {
+    let sleep_until = sync_action_queue
+        .front()
+        .as_ref()
+        .map(|front| front.reached_head_time + APPLY_SYNC_ACTION_TIMEOUT);
+    async move {
+        if let Some(sleep_until) = sleep_until {
+            tokio::time::sleep_until(sleep_until.into()).await
+        } else {
+            futures::future::pending().await
+        }
+    }
+    .boxed()
+}
+
+#[derive(Debug, Error)]
+#[repr(transparent)]
+pub struct ApplySyncActionTimeoutError {
+    action: Option<SyncAction>,
+}
+
+impl std::fmt::Display for ApplySyncActionTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { action } = self;
+        match action {
+            Some(SyncAction::InsertTx(txid)) => {
+                write!(f, "Timeout while waiting to insert tx ({txid})")
+            }
+            Some(SyncAction::SequenceMessage(SequenceMessage::BlockHash(
+                block_hash_msg,
+            ))) => {
+                let BlockHashMessage {
+                    block_hash,
+                    event,
+                    zmq_seq: _,
+                } = block_hash_msg;
+                write!(
+                    f,
+                    "Timeout while waiting to apply sequence message (block {} {})",
+                    block_hash,
+                    match event {
+                        BlockHashEvent::Connected => "connected",
+                        BlockHashEvent::Disconnected => "disconnected",
+                    }
+                )
+            }
+            Some(SyncAction::SequenceMessage(SequenceMessage::TxHash(
+                tx_hash_msg,
+            ))) => {
+                let TxHashMessage {
+                    txid,
+                    event,
+                    mempool_seq: _,
+                    zmq_seq: _,
+                } = tx_hash_msg;
+                write!(
+                    f,
+                    "Timeout while waiting to apply sequence message (tx {} {})",
+                    txid,
+                    match event {
+                        TxHashEvent::Added => "added",
+                        TxHashEvent::Removed => "removed",
+                    }
+                )
+            }
+            None => {
+                write!(f, "Timeout while waiting to apply sequence message")
+            }
         }
     }
 }
 
-impl FromIterator<SequenceMessage> for SeqMessageQueue {
-    fn from_iter<T>(msgs: T) -> Self
-    where
-        T: IntoIterator<Item = SequenceMessage>,
-    {
-        let mut res = Self::default();
-        for msg in msgs.into_iter() {
-            res.push_back(msg)
+enum ApplySyncActionResult {
+    /// Sync action applied successfully
+    Success {
+        /// Txs that should be pushed at the front of the action queue to be
+        /// applied
+        push_txs_action_queue_front: Vec<Txid>,
+    },
+    /// Sync action could not be applied
+    Pending,
+}
+
+impl From<bool> for ApplySyncActionResult {
+    fn from(success: bool) -> Self {
+        if success {
+            Self::Success {
+                push_txs_action_queue_front: Vec::new(),
+            }
+        } else {
+            Self::Pending
         }
-        res
     }
 }
 
@@ -373,8 +501,8 @@ type ResponseStreamItem = Result<BatchedResponseItem, RequestError>;
 enum CombinedStreamItem {
     ZmqSeq(Result<SequenceMessage, SequenceStreamError>),
     Response(ResponseStreamItem),
-    /// Timeout while waiting to apply next sequence message
-    ApplySeqMessageTimeout,
+    /// Timeout while waiting to apply next sync action
+    ApplySyncActionTimeout,
     /// The sync was stopped
     Shutdown,
 }
@@ -383,37 +511,37 @@ enum CombinedStreamItem {
 struct CombinedStream<
     'sequence_msgs,
     'responses,
-    ApplySeqMsgTimeout,
+    ApplySyncActionTimeout,
     ShutdownSignal,
 > {
     pub sequence_msgs: stream::Fuse<SequenceStream<'sequence_msgs>>,
     pub responses: stream::Fuse<BoxStream<'responses, ResponseStreamItem>>,
-    pub apply_seq_msg_timeout: future::Fuse<ApplySeqMsgTimeout>,
+    pub apply_sync_action_timeout: future::Fuse<ApplySyncActionTimeout>,
     pub shutdown_signal: future::Fuse<ShutdownSignal>,
     position: u8,
 }
 
-impl<'sequence_msgs, 'responses, ApplySeqMessageTimeout, ShutdownSignal>
+impl<'sequence_msgs, 'responses, ApplySyncActionTimeout, ShutdownSignal>
     CombinedStream<
         'sequence_msgs,
         'responses,
-        ApplySeqMessageTimeout,
+        ApplySyncActionTimeout,
         ShutdownSignal,
     >
 where
-    ApplySeqMessageTimeout: Future<Output = ()>,
+    ApplySyncActionTimeout: Future<Output = ()>,
     ShutdownSignal: Future<Output = ()>,
 {
     fn new(
         sequence_msgs: SequenceStream<'sequence_msgs>,
         responses: BoxStream<'responses, ResponseStreamItem>,
-        apply_seq_msg_timeout: ApplySeqMessageTimeout,
+        apply_sync_action_timeout: ApplySyncActionTimeout,
         shutdown_signal: ShutdownSignal,
     ) -> Self {
         Self {
             sequence_msgs: sequence_msgs.fuse(),
             responses: responses.fuse(),
-            apply_seq_msg_timeout: apply_seq_msg_timeout.fuse(),
+            apply_sync_action_timeout: apply_sync_action_timeout.fuse(),
             shutdown_signal: shutdown_signal.fuse(),
             position: 0,
         }
@@ -423,13 +551,13 @@ where
         let Self {
             sequence_msgs,
             responses,
-            apply_seq_msg_timeout,
+            apply_sync_action_timeout,
             shutdown_signal,
             position: _,
         } = self;
         sequence_msgs.is_done()
             && responses.is_done()
-            && apply_seq_msg_timeout.is_terminated()
+            && apply_sync_action_timeout.is_terminated()
             && shutdown_signal.is_terminated()
     }
 }
@@ -477,13 +605,13 @@ where
                     }
                 }
                 2 => {
-                    if !self.apply_seq_msg_timeout.is_terminated()
+                    if !self.apply_sync_action_timeout.is_terminated()
                         && let Poll::Ready(()) =
-                            self.apply_seq_msg_timeout.poll_unpin(cx)
+                            self.apply_sync_action_timeout.poll_unpin(cx)
                     {
                         self.position = 3;
                         return Poll::Ready(Some(
-                            CombinedStreamItem::ApplySeqMessageTimeout,
+                            CombinedStreamItem::ApplySyncActionTimeout,
                         ));
                     }
                 }
