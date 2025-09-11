@@ -13,6 +13,7 @@ use futures::{FutureExt as _, TryFutureExt as _, TryStreamExt as _};
 use thiserror::Error;
 use tracing::instrument;
 
+// TODO: Enable specifying txs that can be restored to the mempool
 #[derive(Clone, Debug)]
 pub enum ConnectBlockAction {
     Accept { remove_mempool_txs: HashSet<Txid> },
@@ -25,6 +26,12 @@ impl Default for ConnectBlockAction {
             remove_mempool_txs: HashSet::new(),
         }
     }
+}
+
+// TODO: Enable specifying txs that can be restored to the mempool
+#[derive(Clone, Debug, Default)]
+pub struct DisconnectBlockAction {
+    pub remove_mempool_txs: HashSet<Txid>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,7 +67,9 @@ pub trait CusfEnforcer {
     fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
-    ) -> impl Future<Output = Result<(), Self::DisconnectBlockError>> + Send;
+    ) -> impl Future<
+        Output = Result<DisconnectBlockAction, Self::DisconnectBlockError>,
+    > + Send;
 
     type AcceptTxError: std::error::Error + Send + Sync + 'static;
 
@@ -315,7 +324,9 @@ where
                 }
             }
             BlockHashEvent::Disconnected => {
-                let () = enforcer
+                let DisconnectBlockAction {
+                    remove_mempool_txs: _,
+                } = enforcer
                     .disconnect_block(block_hash)
                     .map_err(TaskError::DisconnectBlock)
                     .await?;
@@ -410,7 +421,9 @@ where
                 },
             ) => {
                 // Disconnect block on right enforcer
-                let () = self
+                let DisconnectBlockAction {
+                    remove_mempool_txs: _,
+                } = self
                     .1
                     .disconnect_block(block.block_hash())
                     .map_err(|err| {
@@ -428,7 +441,9 @@ where
                 ConnectBlockAction::Reject,
             ) => {
                 // Disconnect block on left enforcer
-                let () = self
+                let DisconnectBlockAction {
+                    remove_mempool_txs: _,
+                } = self
                     .0
                     .disconnect_block(block.block_hash())
                     .map_err(|err| {
@@ -451,16 +466,19 @@ where
     async fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
-    ) -> Result<(), Self::DisconnectBlockError> {
-        let () = self
+    ) -> Result<DisconnectBlockAction, Self::DisconnectBlockError> {
+        let mut res = self
             .0
             .disconnect_block(block_hash)
             .map_err(Either::Left)
             .await?;
-        self.1
+        let DisconnectBlockAction { remove_mempool_txs } = self
+            .1
             .disconnect_block(block_hash)
             .map_err(Either::Right)
-            .await
+            .await?;
+        res.remove_mempool_txs.extend(remove_mempool_txs);
+        Ok(res)
     }
 
     type AcceptTxError = Either<C0::AcceptTxError, C1::AcceptTxError>;
@@ -521,8 +539,8 @@ impl CusfEnforcer for DefaultEnforcer {
     async fn disconnect_block(
         &mut self,
         _block_hash: BlockHash,
-    ) -> Result<(), Self::DisconnectBlockError> {
-        Ok(())
+    ) -> Result<DisconnectBlockAction, Self::DisconnectBlockError> {
+        Ok(DisconnectBlockAction::default())
     }
 
     type AcceptTxError = Infallible;
@@ -592,7 +610,7 @@ where
     async fn disconnect_block(
         &mut self,
         block_hash: BlockHash,
-    ) -> Result<(), Self::DisconnectBlockError> {
+    ) -> Result<DisconnectBlockAction, Self::DisconnectBlockError> {
         match self {
             Self::Left(left) => {
                 left.disconnect_block(block_hash)
