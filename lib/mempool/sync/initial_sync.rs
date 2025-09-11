@@ -26,7 +26,9 @@ use super::{
     RequestItem, RequestQueue, ResponseItem,
 };
 use crate::{
-    cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
+    cusf_enforcer::{
+        self, ConnectBlockAction, CusfEnforcer, DisconnectBlockAction,
+    },
     zmq::{
         BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
         SequenceStreamError, TxHashEvent, TxHashMessage,
@@ -173,11 +175,15 @@ where
         // FIXME: insert without info
         let () = todo!();
     }
-    let () = sync_state
+    let DisconnectBlockAction { remove_mempool_txs } = sync_state
         .enforcer
         .disconnect_block(block.hash)
         .await
         .map_err(cusf_enforcer::Error::DisconnectBlock)?;
+    sync_state
+        .post_sync
+        .remove_mempool_txs
+        .extend(remove_mempool_txs);
     sync_state.mempool.chain.tip =
         block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
     Ok(())
