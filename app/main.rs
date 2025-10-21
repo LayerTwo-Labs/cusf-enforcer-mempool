@@ -31,10 +31,13 @@ fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
     })
 }
 
-async fn spawn_rpc_server(
-    server: server::Server<DefaultEnforcer>,
+async fn spawn_rpc_server<RpcClient>(
+    server: server::Server<DefaultEnforcer, RpcClient>,
     serve_rpc_addr: SocketAddr,
-) -> anyhow::Result<ServerHandle> {
+) -> anyhow::Result<ServerHandle>
+where
+    RpcClient: bitcoin_jsonrpsee::MainClient + Send + Sync + 'static,
+{
     tracing::info!("serving RPC on {}", serve_rpc_addr);
 
     use server::RpcServer;
@@ -109,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         enforcer,
         mempool,
         tx_cache,
-        rpc_client,
+        rpc_client.clone(),
         sequence_stream,
         |err| async {
             let err = anyhow::Error::from(err);
@@ -121,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
         mempool,
         network,
         network_info,
+        rpc_client,
         sample_block_template,
     )?;
     let rpc_server_handle =

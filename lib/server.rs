@@ -28,6 +28,14 @@ pub trait Rpc {
         &self,
         request: BlockTemplateRequest,
     ) -> RpcResult<BlockTemplate>;
+
+    /// Returns None if the block is invalid, otherwise the error code
+    /// describing why the block was rejected.
+    #[method(name = "submitblock")]
+    async fn submit_block(
+        &self,
+        block_hex: String,
+    ) -> RpcResult<Option<String>>;
 }
 
 #[derive(Debug, Error)]
@@ -36,20 +44,22 @@ pub enum CreateServerError {
     SampleBlockTemplate,
 }
 
-pub struct Server<Enforcer> {
+pub struct Server<Enforcer, RpcClient> {
     coinbase_spk: ScriptBuf,
     mempool: MempoolSync<Enforcer>,
     network: Network,
     network_info: NetworkInfo,
+    rpc_client: RpcClient,
     sample_block_template: BlockTemplate,
 }
 
-impl<Enforcer> Server<Enforcer> {
+impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
     pub fn new(
         coinbase_spk: ScriptBuf,
         mempool: MempoolSync<Enforcer>,
         network: Network,
         network_info: NetworkInfo,
+        rpc_client: RpcClient,
         sample_block_template: BlockTemplate,
     ) -> Result<Self, CreateServerError> {
         if matches!(
@@ -63,6 +73,7 @@ impl<Enforcer> Server<Enforcer> {
             mempool,
             network,
             network_info,
+            rpc_client,
             sample_block_template,
         })
     }
@@ -435,9 +446,10 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
 }
 
 #[async_trait]
-impl<BP> RpcServer for Server<BP>
+impl<BP, RpcClient> RpcServer for Server<BP, RpcClient>
 where
     BP: CusfBlockProducer + Send + Sync + 'static,
+    RpcClient: bitcoin_jsonrpsee::client::MainClient + Send + Sync + 'static,
 {
     async fn get_block_template(
         &self,
@@ -595,5 +607,18 @@ where
             signet_challenge: signet_challenge.clone(),
         };
         Ok(res)
+    }
+
+    async fn submit_block(
+        &self,
+        block_hex: String,
+    ) -> RpcResult<Option<String>> {
+        self.rpc_client
+            .submit_block(block_hex)
+            .await
+            .map_err(|err| match err {
+                jsonrpsee::core::ClientError::Call(err) => err,
+                err => internal_error(err),
+            })
     }
 }
