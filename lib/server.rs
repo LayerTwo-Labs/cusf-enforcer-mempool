@@ -598,7 +598,7 @@ where
             coinbase_aux: coinbase_aux.clone(),
             coinbase_txn_or_value,
             long_poll_id: None,
-            target: target.to_le_bytes(),
+            target: target.to_be_bytes(),
             mintime,
             mutable: mutable.clone(),
             nonce_range: NONCE_RANGE,
