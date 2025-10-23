@@ -578,10 +578,15 @@ where
         } else {
             coinbase_txn_or_value.clone()
         };
-        let mintime = std::cmp::max(
-            tip_block_mediantime as u64 + 1,
-            current_time_adjusted,
-        );
+        let mintime =
+            // TODO: calculate this correctly
+            /*
+            std::cmp::max(
+                tip_block_mediantime as u64 + 1,
+                current_time_adjusted,
+            )
+            */
+            tip_block_mediantime as u64 + 1;
         let height = tip_block_height + 1;
         let res = BlockTemplate {
             version,
