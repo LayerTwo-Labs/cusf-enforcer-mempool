@@ -101,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         };
         mempool::init_sync_mempool(
             &mut enforcer,
+            network,
             &rpc_client,
             &cli.node_zmq_addr_sequence,
             shutdown_signal,

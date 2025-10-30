@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible};
 
 use async_trait::async_trait;
 use bitcoin::{
@@ -51,6 +51,8 @@ pub struct Server<Enforcer, RpcClient> {
     network_info: NetworkInfo,
     rpc_client: RpcClient,
     sample_block_template: BlockTemplate,
+    /// Map of block hashes to known targets for the next block
+    known_targets: parking_lot::RwLock<HashMap<BlockHash, bitcoin::Target>>,
 }
 
 impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
@@ -75,6 +77,7 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
             network_info,
             rpc_client,
             sample_block_template,
+            known_targets: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 }
@@ -552,6 +555,27 @@ where
                 let err = log_error(err);
                 internal_error(err)
             })?;
+        let target = {
+            let known_target =
+                self.known_targets.read().get(&prev_blockhash).copied();
+            if let Some(target) = known_target {
+                target
+            } else if let Some(target) = target {
+                target
+            } else {
+                let blockchain_info = self
+                    .rpc_client
+                    .get_blockchain_info()
+                    .await
+                    .map_err(internal_error)?;
+                let target =
+                    bitcoin::Target::from(blockchain_info.compact_target);
+                self.known_targets
+                    .write()
+                    .insert(blockchain_info.best_blockhash, target);
+                target
+            }
+        };
         let coinbase_txn_or_value = if let Some(coinbase_txn) = coinbase_txn {
             let fee = coinbase_txn
                 .output
