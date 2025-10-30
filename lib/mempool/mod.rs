@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use bitcoin::{BlockHash, Target, Transaction, Txid, Weight};
+use bitcoin::{BlockHash, Network, Target, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{ordmap, OrdMap, OrdSet};
@@ -261,6 +261,7 @@ struct MempoolTxs(imbl::HashMap<Txid, (Transaction, TxInfo)>);
 pub struct Mempool {
     by_ancestor_fee_rate: ByAncestorFeeRate,
     chain: Chain,
+    network: Network,
     /// Map of txs (which may not be in the mempool) to their direct child txs,
     /// which MUST be in the mempool
     tx_childs: TxChilds,
@@ -268,7 +269,7 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    fn new(prev_blockhash: BlockHash) -> Self {
+    fn new(network: Network, prev_blockhash: BlockHash) -> Self {
         let chain = Chain {
             tip: prev_blockhash,
             blocks: imbl::HashMap::new(),
@@ -276,6 +277,7 @@ impl Mempool {
         Self {
             by_ancestor_fee_rate: ByAncestorFeeRate::default(),
             chain,
+            network,
             tx_childs: TxChilds::default(),
             txs: MempoolTxs::default(),
         }
@@ -285,9 +287,32 @@ impl Mempool {
         &self.chain.blocks[&self.chain.tip]
     }
 
-    pub fn next_target(&self) -> Target {
-        // FIXME: calculate this properly
-        self.chain.blocks[&self.chain.tip].compact_target.into()
+    /// Next target, if known
+    pub fn next_target(&self) -> Option<Target> {
+        let tip = self.tip();
+        let next_height = tip.height + 1;
+        let network_params = self.network.params();
+        if !network_params.no_pow_retargeting
+            && next_height % network_params.miner_confirmation_window == 0
+        {
+            if let Some(first_block_in_period) = self
+                .chain
+                .iter()
+                .nth(network_params.miner_confirmation_window as usize - 1)
+            {
+                let spacing = tip.time - first_block_in_period.time;
+                let res = bitcoin::CompactTarget::from_next_work_required(
+                    tip.compact_target,
+                    spacing as u64,
+                    network_params,
+                );
+                Some(res.into())
+            } else {
+                None
+            }
+        } else {
+            Some(tip.compact_target.into())
+        }
     }
 
     /// Insert a tx into the mempool,

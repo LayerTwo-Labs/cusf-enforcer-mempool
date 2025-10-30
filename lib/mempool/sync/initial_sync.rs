@@ -503,6 +503,7 @@ pub async fn init_sync_mempool<
     RpcClient,
 >(
     enforcer: &mut Enforcer,
+    network: bitcoin::Network,
     rpc_client: &RpcClient,
     zmq_addr_sequence: &str,
     shutdown_signal: Signal, // Would it be better to return a Some/None, indicating sync stoppage?
@@ -546,7 +547,7 @@ where
             blocks_needed: LinkedHashSet::from_iter([best_block_hash]),
             enforcer,
             first_mempool_sequence: Some(mempool_sequence + 1),
-            mempool: Mempool::new(best_block_hash),
+            mempool: Mempool::new(network, best_block_hash),
             post_sync: PostSync::default(),
             request_queue,
             seq_message_queue,
