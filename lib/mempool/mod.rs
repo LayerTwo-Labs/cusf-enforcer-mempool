@@ -20,15 +20,15 @@ pub use sync::{
 #[derive(Clone, Copy, Debug, Eq)]
 pub struct FeeRate {
     fee: u64,
-    size: u64,
+    vsize: u64,
 }
 
 impl Ord for FeeRate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // (self.fee / self.size) > (other.fee / other.size) ==>
         // (self.fee * other.size) > (other.fee * self.size)
-        let lhs = self.fee as u128 * other.size as u128;
-        let rhs = other.fee as u128 * self.size as u128;
+        let lhs = self.fee as u128 * other.vsize as u128;
+        let rhs = other.fee as u128 * self.vsize as u128;
         lhs.cmp(&rhs)
     }
 }
@@ -47,10 +47,10 @@ impl PartialOrd for FeeRate {
 
 #[derive(Clone, Debug)]
 pub struct TxInfo {
-    pub ancestor_size: u64,
+    pub ancestor_vsize: u64,
     pub bip125_replaceable: bool,
     pub depends: OrdSet<Txid>,
-    pub descendant_size: u64,
+    pub descendant_vsize: u64,
     pub fees: RawMempoolTxFees,
     pub spent_by: OrdSet<Txid>,
     /// Conflicts due to reasons other than shared inputs
@@ -256,6 +256,65 @@ impl TxChilds {
 #[derive(Clone, Debug, Default)]
 struct MempoolTxs(imbl::HashMap<Txid, (Transaction, TxInfo)>);
 
+pub const MAX_USABLE_BLOCK_WEIGHT: Weight = {
+    const COINBASE_TXIN_WEIGHT: Weight = {
+        let weight_wu = Weight::from_non_witness_data_size(
+            // outpoint
+            36
+            // sequence
+            + 4
+            // SPK
+            + 5
+        ).to_wu()
+        // witness
+        + Weight::from_witness_data_size(33).to_wu();
+        Weight::from_wu(weight_wu)
+    };
+    const COINBASE_VALUE_TXOUT_WEIGHT: Weight = {
+        let weight_wu = Weight::from_non_witness_data_size(bitcoin::Amount::SIZE as u64).to_wu()
+            // SPK weight
+            + Weight::from_non_witness_data_size(23).to_wu();
+        Weight::from_wu(weight_wu)
+    };
+    const COINBASE_TX_WEIGHT: Weight = Weight::from_wu(
+        // version
+        Weight::from_non_witness_data_size(4).to_wu()
+        // locktime
+        + Weight::from_non_witness_data_size(4).to_wu()
+        // inputs
+        + Weight::from_non_witness_data_size(1).to_wu()
+        + COINBASE_TXIN_WEIGHT.to_wu()
+        // outputs
+        + Weight::from_non_witness_data_size(1).to_wu()
+        + COINBASE_VALUE_TXOUT_WEIGHT.to_wu(),
+    );
+    let res_wu = Weight::MAX_BLOCK.to_wu() - Weight::from_non_witness_data_size(
+            bitcoin::block::Header::SIZE as u64
+        ).to_wu()
+            // 2 bytes for encoding txs array length
+            - Weight::from_non_witness_data_size(2).to_wu()
+            - COINBASE_TX_WEIGHT.to_wu();
+    Weight::from_wu(res_wu)
+};
+
+#[inline(always)]
+fn saturating_add_weight(lhs: Weight, rhs: Weight) -> Weight {
+    let res_wu = lhs.to_wu().saturating_add(rhs.to_wu());
+    Weight::from_wu(res_wu)
+}
+
+#[inline(always)]
+fn saturating_add_signed_weight(lhs: Weight, rhs_wu: i64) -> Weight {
+    let res_wu = lhs.to_wu().saturating_add_signed(rhs_wu);
+    Weight::from_wu(res_wu)
+}
+
+#[inline(always)]
+fn saturating_sub_weight(lhs: Weight, rhs: Weight) -> Weight {
+    let res_wu = lhs.to_wu().saturating_sub(rhs.to_wu());
+    Weight::from_wu(res_wu)
+}
+
 // MUST be cheap to clone so that constructing block templates is cheap
 #[derive(Clone, Debug)]
 pub struct Mempool {
@@ -335,9 +394,9 @@ impl Mempool {
         let modified_fee = fee;
         let vsize = tx.vsize() as u64;
         // initially incorrect, must be computed after insertion
-        let mut ancestor_size = vsize;
+        let mut ancestor_vsize = vsize;
         // initially incorrect, must be computed after insertion
-        let mut descendant_size = vsize;
+        let mut descendant_vsize = vsize;
         // conflicts including ancestor conflicts
         let mut ancestry_conflicts = conflicts_with.clone();
         let depends = tx
@@ -366,10 +425,10 @@ impl Mempool {
             OrdSet::new()
         };
         let info = TxInfo {
-            ancestor_size,
+            ancestor_vsize,
             bip125_replaceable: tx.is_explicitly_rbf(),
             depends,
-            descendant_size,
+            descendant_vsize,
             fees: RawMempoolTxFees {
                 ancestor: ancestor_fees,
                 base: fee,
@@ -389,18 +448,18 @@ impl Mempool {
         );
         self.txs.ancestors_mut(txid).try_for_each(|ancestor_info| {
             let (ancestor_tx, ancestor_info) = ancestor_info?;
-            ancestor_size += ancestor_tx.vsize() as u64;
+            ancestor_vsize += ancestor_tx.vsize() as u64;
             ancestor_fees += ancestor_info.fees.modified;
-            ancestor_info.descendant_size += vsize;
+            ancestor_info.descendant_vsize += vsize;
             ancestor_info.fees.descendant += modified_fee;
             Result::<_, MempoolInsertError>::Ok(())
         })?;
         self.txs.descendants_mut(txid).skip(1).try_for_each(
             |descendant_info| {
                 let (descendant_tx, descendant_info) = descendant_info?;
-                descendant_size += descendant_tx.vsize() as u64;
+                descendant_vsize += descendant_tx.vsize() as u64;
                 descendant_fees += descendant_info.fees.modified;
-                descendant_info.ancestor_size += vsize;
+                descendant_info.ancestor_vsize += vsize;
                 descendant_info.fees.ancestor += modified_fee;
                 descendant_info.conflicts_with = descendant_info
                     .conflicts_with
@@ -421,11 +480,11 @@ impl Mempool {
         let (_, info) = self.txs.0.get_mut(&txid).unwrap();
         info.fees.ancestor = ancestor_fees;
         info.fees.descendant = descendant_fees;
-        info.ancestor_size = ancestor_size;
-        info.descendant_size = descendant_size;
+        info.ancestor_vsize = ancestor_vsize;
+        info.descendant_vsize = descendant_vsize;
         let ancestor_fee_rate = FeeRate {
             fee: ancestor_fees,
-            size: ancestor_size,
+            vsize: ancestor_vsize,
         };
         self.by_ancestor_fee_rate.insert(ancestor_fee_rate, txid);
         Ok(res)
@@ -439,7 +498,7 @@ impl Mempool {
         let Some((tx, info)) = self.txs.0.get(txid) else {
             return Ok(None);
         };
-        let ancestor_size = info.ancestor_size;
+        let ancestor_vsize = info.ancestor_vsize;
         let vsize = tx.vsize() as u64;
         let fees = RawMempoolTxFees { ..info.fees };
         for spent_tx in tx.input.iter().map(|input| input.previous_output.txid)
@@ -453,7 +512,7 @@ impl Mempool {
             let (desc_tx, desc_info) = desc?;
             let ancestor_fee_rate = FeeRate {
                 fee: desc_info.fees.ancestor,
-                size: desc_info.ancestor_size,
+                vsize: desc_info.ancestor_vsize,
             };
             let desc_txid = desc_tx.compute_txid();
             if !self
@@ -463,11 +522,11 @@ impl Mempool {
                 let err = MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
                 return Err(err.into());
             };
-            desc_info.ancestor_size -= vsize;
+            desc_info.ancestor_vsize -= vsize;
             desc_info.fees.ancestor -= fees.modified;
             let ancestor_fee_rate = FeeRate {
                 fee: desc_info.fees.ancestor,
-                size: desc_info.ancestor_size,
+                vsize: desc_info.ancestor_vsize,
             };
             self.by_ancestor_fee_rate
                 .insert(ancestor_fee_rate, desc_txid);
@@ -479,7 +538,7 @@ impl Mempool {
         // Update all ancestors
         let () = self.txs.ancestors_mut(*txid).try_for_each(|anc| {
             let (anc_tx, anc_info) = anc?;
-            anc_info.descendant_size -= vsize;
+            anc_info.descendant_vsize -= vsize;
             anc_info.fees.descendant -= fees.modified;
             let anc_txid = anc_tx.compute_txid();
             // FIXME: remove
@@ -489,7 +548,7 @@ impl Mempool {
         })?;
         let ancestor_fee_rate = FeeRate {
             fee: fees.ancestor,
-            size: ancestor_size,
+            vsize: ancestor_vsize,
         };
         // Update `self.by_ancestor_fee_rate`
         if !self.by_ancestor_fee_rate.remove(ancestor_fee_rate, *txid) {
@@ -628,21 +687,27 @@ impl Mempool {
         Ok(())
     }
 
-    /// choose txs for a block proposal, mutating the underlying mempool
+    /// choose txs for a block proposal, mutating the underlying mempool.
+    /// If no weight limit is specified, or the specified weight exceeds
+    /// `Weight::MAX_BLOCK`, then `Weight::MAX_BLOCK` will be used as the
+    /// weight limit.
     fn propose_txs_mut(
         &mut self,
+        weight_limit: Option<Weight>,
     ) -> Result<IndexSet<Txid>, MempoolRemoveError> {
         let mut res = IndexSet::new();
-        let mut total_size = 0;
+        let mut weight_remaining = weight_limit
+            .unwrap_or(MAX_USABLE_BLOCK_WEIGHT)
+            .min(MAX_USABLE_BLOCK_WEIGHT);
+        tracing::debug!(%weight_remaining, "Selecting txs");
         loop {
             let Some((ancestor_fee_rate, txid)) = self
                 .by_ancestor_fee_rate
                 .iter_rev()
                 .find(|(ancestor_fee_rate, _txid)| {
-                    let total_weight =
-                        Weight::from_vb(total_size + ancestor_fee_rate.size);
-                    total_weight
-                        .is_some_and(|weight| weight < Weight::MAX_BLOCK)
+                    Weight::from_vb(ancestor_fee_rate.vsize).is_some_and(
+                        |ancestors_weight| ancestors_weight <= weight_remaining,
+                    )
                 })
             else {
                 break;
@@ -677,15 +742,16 @@ impl Mempool {
                     to_add.extend(info.depends.iter().map(|dep| (*dep, false)))
                 }
             }
-            total_size += ancestor_fee_rate.size;
+            weight_remaining -= Weight::from_vb_unwrap(ancestor_fee_rate.vsize);
         }
         Ok(res)
     }
 
     pub fn propose_txs(
         &self,
+        weight_limit: Option<Weight>,
     ) -> Result<Vec<BlockTemplateTransaction>, MempoolRemoveError> {
-        let mut txs = self.clone().propose_txs_mut()?;
+        let mut txs = self.clone().propose_txs_mut(weight_limit)?;
         let mut res = Vec::new();
         // build result in reverse order
         while let Some(txid) = txs.pop() {

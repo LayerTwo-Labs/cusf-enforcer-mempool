@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use bitcoin::{
     amount::CheckedSum, hashes::Hash as _, merkle_tree, script::PushBytesBuf,
     Amount, Block, BlockHash, Network, ScriptBuf, Transaction, TxOut, Txid,
-    WitnessMerkleNode, Wtxid,
+    Weight, WitnessMerkleNode, Wtxid,
 };
 use bitcoin_jsonrpsee::client::{
     BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::{
     cusf_block_producer::{self, CusfBlockProducer, InitialBlockTemplate},
-    mempool::MempoolSync,
+    mempool::{self, MempoolSync},
 };
 
 #[rpc(client, server)]
@@ -376,7 +376,39 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             })?;
     }
     tracing::debug!("Proposing txs for inclusion in block");
-    let mempool_txs = mempool.propose_txs()?;
+    let coinbase_txouts_weight = {
+        let txouts_weight = match typewit::MakeTypeWitness::MAKE {
+            typewit::const_marker::BoolWit::True(wit) => {
+                let wit = wit.map(cusf_block_producer::CoinbaseTxouts);
+                wit.in_ref()
+                    .to_right(&initial_block_template.coinbase_txouts)
+                    .iter()
+                    .map(|tx_out| tx_out.weight())
+                    .sum()
+            }
+            typewit::const_marker::BoolWit::False(_) => Weight::ZERO,
+        };
+        const COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT: Weight = {
+            let weight_wu = Weight::from_non_witness_data_size(Amount::SIZE as u64).to_wu()
+                // SPK weight
+                + Weight::from_non_witness_data_size(39).to_wu();
+            Weight::from_wu(weight_wu)
+        };
+        Weight::from_wu(
+            txouts_weight.to_wu()
+                + COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT.to_wu(),
+        )
+    };
+    let prefix_txs_weight = initial_block_template
+        .prefix_txs
+        .iter()
+        .map(|(tx, _)| tx.weight())
+        .sum();
+    let initial_block_template_weight =
+        coinbase_txouts_weight + prefix_txs_weight;
+    let mempool_txs = mempool.propose_txs(Some(
+        mempool::MAX_USABLE_BLOCK_WEIGHT - initial_block_template_weight,
+    ))?;
     {
         let proposed_txids: String = format!(
             "[{}]",
