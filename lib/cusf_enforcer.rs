@@ -33,6 +33,9 @@ pub enum TxAcceptAction {
         /// Transactions that conflict with this one.
         /// It is not necessary to specify conflicts due to common inputs.
         conflicts_with: HashSet<Txid>,
+        /// Tweak the weight by the specified value, in wu.
+        /// The weight will saturate at zero and [`Weight::MAX`].
+        weight_tweak: i64,
     },
     Reject,
 }
@@ -476,14 +479,21 @@ where
         match self.0.accept_tx(tx, tx_inputs).map_err(Either::Left)? {
             TxAcceptAction::Accept {
                 conflicts_with: left_conflicts,
+                weight_tweak: left_weight_tweak,
             } => {
                 match self.1.accept_tx(tx, tx_inputs).map_err(Either::Right)? {
                     TxAcceptAction::Accept {
                         conflicts_with: right_conflicts,
+                        weight_tweak: right_weight_tweak,
                     } => {
                         let mut conflicts_with = left_conflicts;
                         conflicts_with.extend(right_conflicts);
-                        Ok(TxAcceptAction::Accept { conflicts_with })
+                        let weight_tweak = left_weight_tweak
+                            .saturating_add(right_weight_tweak);
+                        Ok(TxAcceptAction::Accept {
+                            conflicts_with,
+                            weight_tweak,
+                        })
                     }
                     TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
                 }
@@ -537,6 +547,7 @@ impl CusfEnforcer for DefaultEnforcer {
     {
         Ok(TxAcceptAction::Accept {
             conflicts_with: HashSet::new(),
+            weight_tweak: 0,
         })
     }
 }

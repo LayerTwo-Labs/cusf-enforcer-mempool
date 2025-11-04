@@ -373,6 +373,7 @@ where
         tx.clone(),
         fee_delta.to_sat(),
         imbl::OrdSet::new(),
+        tx.weight(),
     )?;
     tracing::trace!("added {txid} to mempool");
     let mempool_txs = sync_state.mempool.txs.0.len();

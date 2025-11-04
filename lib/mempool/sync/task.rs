@@ -7,7 +7,7 @@ use std::{
 
 use bitcoin::{
     consensus::Decodable, hashes::Hash as _, Amount, BlockHash, OutPoint,
-    Transaction, Txid,
+    Transaction, Txid, Weight,
 };
 use educe::Educe;
 use futures::{future::BoxFuture, stream, StreamExt as _};
@@ -229,7 +229,13 @@ where
         }
 
         // TODO: figure out fee/or conflicts?
-        inner.mempool.insert(decoded, 0, imbl::OrdSet::new())?;
+        let unmodified_weight = decoded.weight();
+        inner.mempool.insert(
+            decoded,
+            0,
+            imbl::OrdSet::new(),
+            unmodified_weight,
+        )?;
         inserted_txs += 1;
     }
 
@@ -360,11 +366,18 @@ where
         .accept_tx(tx, &input_txs)
         .map_err(cusf_enforcer::Error::AcceptTx)?
     {
-        cusf_enforcer::TxAcceptAction::Accept { conflicts_with } => {
+        cusf_enforcer::TxAcceptAction::Accept {
+            conflicts_with,
+            weight_tweak,
+        } => {
+            let modified_weight_wu =
+                tx.weight().to_wu().saturating_add_signed(weight_tweak);
+            let modified_weight = Weight::from_wu(modified_weight_wu);
             inner.mempool.insert(
                 tx.clone(),
                 fee_delta.to_sat(),
                 conflicts_with.into(),
+                modified_weight,
             )?;
             tracing::trace!("added {txid} to mempool");
         }
@@ -535,6 +548,7 @@ where
             ref mut mempool,
         } = *inner_write;
         let mut conflicts = Conflicts::default();
+        let mut weight_tweaks = Vec::new();
         let rejected_txs = mempool
             .try_filter(true, |tx, mempool_inputs| {
                 let mut tx_inputs = mempool_inputs.clone();
@@ -549,10 +563,14 @@ where
                 match enforcer.accept_tx(tx, &tx_inputs)? {
                     cusf_enforcer::TxAcceptAction::Accept {
                         conflicts_with,
+                        weight_tweak,
                     } => {
                         let txid = tx.compute_txid();
                         for conflict_txid in conflicts_with {
                             conflicts.insert(txid, conflict_txid);
+                        }
+                        if weight_tweak != 0 {
+                            weight_tweaks.push((txid, weight_tweak));
                         }
                         Ok(true)
                     }
@@ -572,6 +590,9 @@ where
             .copied()
             .collect();
         let () = mempool.add_conflicts(conflicts)?;
+        for (txid, weight_tweak) in weight_tweaks {
+            let () = mempool.tweak_weight(txid, weight_tweak)?;
+        }
         drop(inner_write);
         rejected_txs
     };
