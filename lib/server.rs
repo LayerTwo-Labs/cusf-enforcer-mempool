@@ -596,16 +596,13 @@ where
             } else if let Some(target) = target {
                 target
             } else {
-                let blockchain_info = self
+                let mining_info = self
                     .rpc_client
-                    .get_blockchain_info()
+                    .get_mining_info()
                     .await
                     .map_err(internal_error)?;
-                let target =
-                    bitcoin::Target::from(blockchain_info.compact_target);
-                self.known_targets
-                    .write()
-                    .insert(blockchain_info.best_blockhash, target);
+                let target = mining_info.next.target;
+                self.known_targets.write().insert(prev_blockhash, target);
                 target
             }
         };
