@@ -47,11 +47,14 @@ impl PartialOrd for FeeRate {
 
 #[derive(Clone, Debug)]
 pub struct TxInfo {
+    pub ancestor_modified_weight: Weight,
     pub ancestor_vsize: u64,
     pub bip125_replaceable: bool,
     pub depends: OrdSet<Txid>,
+    pub descendant_modified_weight: Weight,
     pub descendant_vsize: u64,
     pub fees: RawMempoolTxFees,
+    pub modified_weight: Weight,
     pub spent_by: OrdSet<Txid>,
     /// Conflicts due to reasons other than shared inputs
     pub conflicts_with: OrdSet<Txid>,
@@ -382,6 +385,7 @@ impl Mempool {
         tx: Transaction,
         fee: u64,
         conflicts_with: imbl::OrdSet<Txid>,
+        modified_weight: Weight,
     ) -> Result<Option<TxInfo>, MempoolInsertError> {
         let txid = tx.compute_txid();
         if self.txs.0.contains_key(&txid) {
@@ -394,7 +398,11 @@ impl Mempool {
         let modified_fee = fee;
         let vsize = tx.vsize() as u64;
         // initially incorrect, must be computed after insertion
+        let mut ancestor_modified_weight = modified_weight;
+        // initially incorrect, must be computed after insertion
         let mut ancestor_vsize = vsize;
+        // initially incorrect, must be computed after insertion
+        let mut descendant_modified_weight = modified_weight;
         // initially incorrect, must be computed after insertion
         let mut descendant_vsize = vsize;
         // conflicts including ancestor conflicts
@@ -425,9 +433,11 @@ impl Mempool {
             OrdSet::new()
         };
         let info = TxInfo {
+            ancestor_modified_weight,
             ancestor_vsize,
             bip125_replaceable: tx.is_explicitly_rbf(),
             depends,
+            descendant_modified_weight,
             descendant_vsize,
             fees: RawMempoolTxFees {
                 ancestor: ancestor_fees,
@@ -435,6 +445,7 @@ impl Mempool {
                 descendant: descendant_fees,
                 modified: modified_fee,
             },
+            modified_weight,
             spent_by,
             conflicts_with: ancestry_conflicts,
         };
@@ -449,8 +460,16 @@ impl Mempool {
         self.txs.ancestors_mut(txid).try_for_each(|ancestor_info| {
             let (ancestor_tx, ancestor_info) = ancestor_info?;
             ancestor_vsize += ancestor_tx.vsize() as u64;
+            ancestor_modified_weight = saturating_add_weight(
+                ancestor_modified_weight,
+                ancestor_info.modified_weight,
+            );
             ancestor_fees += ancestor_info.fees.modified;
             ancestor_info.descendant_vsize += vsize;
+            ancestor_info.descendant_modified_weight = saturating_add_weight(
+                ancestor_info.descendant_modified_weight,
+                modified_weight,
+            );
             ancestor_info.fees.descendant += modified_fee;
             Result::<_, MempoolInsertError>::Ok(())
         })?;
@@ -458,8 +477,17 @@ impl Mempool {
             |descendant_info| {
                 let (descendant_tx, descendant_info) = descendant_info?;
                 descendant_vsize += descendant_tx.vsize() as u64;
+                descendant_modified_weight = saturating_add_weight(
+                    descendant_modified_weight,
+                    descendant_info.modified_weight,
+                );
                 descendant_fees += descendant_info.fees.modified;
                 descendant_info.ancestor_vsize += vsize;
+                descendant_info.ancestor_modified_weight =
+                    saturating_add_weight(
+                        descendant_info.ancestor_modified_weight,
+                        modified_weight,
+                    );
                 descendant_info.fees.ancestor += modified_fee;
                 descendant_info.conflicts_with = descendant_info
                     .conflicts_with
@@ -480,11 +508,13 @@ impl Mempool {
         let (_, info) = self.txs.0.get_mut(&txid).unwrap();
         info.fees.ancestor = ancestor_fees;
         info.fees.descendant = descendant_fees;
+        info.ancestor_modified_weight = ancestor_modified_weight;
         info.ancestor_vsize = ancestor_vsize;
+        info.descendant_modified_weight = descendant_modified_weight;
         info.descendant_vsize = descendant_vsize;
         let ancestor_fee_rate = FeeRate {
             fee: ancestor_fees,
-            vsize: ancestor_vsize,
+            vsize: ancestor_modified_weight.to_vbytes_ceil(),
         };
         self.by_ancestor_fee_rate.insert(ancestor_fee_rate, txid);
         Ok(res)
@@ -498,7 +528,8 @@ impl Mempool {
         let Some((tx, info)) = self.txs.0.get(txid) else {
             return Ok(None);
         };
-        let ancestor_vsize = info.ancestor_vsize;
+        let ancestor_modified_weight = info.ancestor_modified_weight;
+        let modified_weight = info.modified_weight;
         let vsize = tx.vsize() as u64;
         let fees = RawMempoolTxFees { ..info.fees };
         for spent_tx in tx.input.iter().map(|input| input.previous_output.txid)
@@ -512,7 +543,7 @@ impl Mempool {
             let (desc_tx, desc_info) = desc?;
             let ancestor_fee_rate = FeeRate {
                 fee: desc_info.fees.ancestor,
-                vsize: desc_info.ancestor_vsize,
+                vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
             };
             let desc_txid = desc_tx.compute_txid();
             if !self
@@ -522,11 +553,15 @@ impl Mempool {
                 let err = MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
                 return Err(err.into());
             };
+            desc_info.ancestor_modified_weight = saturating_sub_weight(
+                desc_info.ancestor_modified_weight,
+                modified_weight,
+            );
             desc_info.ancestor_vsize -= vsize;
             desc_info.fees.ancestor -= fees.modified;
             let ancestor_fee_rate = FeeRate {
                 fee: desc_info.fees.ancestor,
-                vsize: desc_info.ancestor_vsize,
+                vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
             };
             self.by_ancestor_fee_rate
                 .insert(ancestor_fee_rate, desc_txid);
@@ -538,6 +573,10 @@ impl Mempool {
         // Update all ancestors
         let () = self.txs.ancestors_mut(*txid).try_for_each(|anc| {
             let (anc_tx, anc_info) = anc?;
+            anc_info.descendant_modified_weight = saturating_sub_weight(
+                anc_info.descendant_modified_weight,
+                modified_weight,
+            );
             anc_info.descendant_vsize -= vsize;
             anc_info.fees.descendant -= fees.modified;
             let anc_txid = anc_tx.compute_txid();
@@ -548,7 +587,7 @@ impl Mempool {
         })?;
         let ancestor_fee_rate = FeeRate {
             fee: fees.ancestor,
-            vsize: ancestor_vsize,
+            vsize: ancestor_modified_weight.to_vbytes_ceil(),
         };
         // Update `self.by_ancestor_fee_rate`
         if !self.by_ancestor_fee_rate.remove(ancestor_fee_rate, *txid) {
@@ -660,6 +699,9 @@ impl Mempool {
     ) -> Result<(), MempoolUpdateError> {
         for (txid_lo, conflict_txids) in conflicts.iter() {
             let conflict_txids = OrdSet::from(conflict_txids);
+            if conflict_txids.is_empty() {
+                break;
+            }
             self.txs.descendants_mut(*txid_lo).try_for_each(
                 |descendant_info| {
                     let (_desc_tx, desc_info) = descendant_info?;
@@ -673,6 +715,9 @@ impl Mempool {
         }
         for (txid_hi, conflict_txids) in conflicts.iter_inverted() {
             let conflict_txids = OrdSet::from(conflict_txids);
+            if conflict_txids.is_empty() {
+                break;
+            }
             self.txs.descendants_mut(txid_hi).try_for_each(
                 |descendant_info| {
                     let (_desc_tx, desc_info) = descendant_info?;
@@ -684,6 +729,71 @@ impl Mempool {
                 },
             )?;
         }
+        Ok(())
+    }
+
+    /// Tweak the weight for a tx
+    fn tweak_weight(
+        &mut self,
+        txid: Txid,
+        tweak: i64,
+    ) -> Result<(), MempoolRemoveError> {
+        if tweak == 0 {
+            return Ok(());
+        }
+        let Some((_, tx_info)) = self.txs.0.get_mut(&txid) else {
+            return Ok(());
+        };
+        let modified_weight =
+            saturating_add_signed_weight(tx_info.modified_weight, tweak);
+        // weight amount that was actually tweaked. May have lower absolute
+        // value due to saturating addition
+        let tweaked_wu = if tweak >= 0 {
+            (modified_weight - tx_info.modified_weight).to_wu() as i64
+        } else {
+            -((tx_info.modified_weight - modified_weight).to_wu() as i64)
+        };
+        tx_info.modified_weight = modified_weight;
+        tx_info.descendant_modified_weight = saturating_add_signed_weight(
+            tx_info.descendant_modified_weight,
+            tweaked_wu,
+        );
+        self.txs.ancestors_mut(txid).try_for_each(|ancestor_info| {
+            let (_, anc_info) = ancestor_info?;
+            anc_info.descendant_modified_weight = saturating_add_signed_weight(
+                anc_info.descendant_modified_weight,
+                tweaked_wu,
+            );
+            Ok::<_, MempoolRemoveError>(())
+        })?;
+        self.txs
+            .descendants_mut(txid)
+            .try_for_each(|descendant_info| {
+                let (desc_tx, desc_info) = descendant_info?;
+                let desc_txid = desc_tx.compute_txid();
+                let mut ancestor_fee_rate = FeeRate {
+                    fee: desc_info.fees.ancestor,
+                    vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
+                };
+                if !self
+                    .by_ancestor_fee_rate
+                    .remove(ancestor_fee_rate, desc_txid)
+                {
+                    let err =
+                        MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
+                    return Err(err.into());
+                };
+                desc_info.ancestor_modified_weight =
+                    saturating_add_signed_weight(
+                        desc_info.ancestor_modified_weight,
+                        tweaked_wu,
+                    );
+                ancestor_fee_rate.vsize =
+                    desc_info.ancestor_modified_weight.to_vbytes_ceil();
+                self.by_ancestor_fee_rate
+                    .insert(ancestor_fee_rate, desc_txid);
+                Ok::<_, MempoolRemoveError>(())
+            })?;
         Ok(())
     }
 
