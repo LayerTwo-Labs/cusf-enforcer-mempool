@@ -411,14 +411,32 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         mempool::MAX_USABLE_BLOCK_WEIGHT - initial_block_template_weight,
     ))?;
     {
-        let proposed_txids: String = format!(
-            "[{}]",
-            mempool_txs
-                .iter()
-                .map(|tx| tx.txid.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let proposed_txids: String = {
+            use std::fmt::Write;
+            // Above this number of txs, truncate txids to save space in logs
+            const SHOW_FULL_TXIDS_MAX_TXS: usize = 10;
+            let mut proposed_txids = "[".to_owned();
+            let n_txs = mempool_txs.len();
+            for (idx, tx) in mempool_txs.iter().enumerate() {
+                if idx < SHOW_FULL_TXIDS_MAX_TXS {
+                    write!(&mut proposed_txids, "{}", tx.txid).unwrap();
+                } else {
+                    let txid_bytes = tx.txid.as_byte_array();
+                    for byte in txid_bytes.iter().rev().take(4) {
+                        write!(&mut proposed_txids, "{byte:02x}").unwrap();
+                    }
+                    write!(&mut proposed_txids, "...").unwrap();
+                    for byte in txid_bytes[..4].iter().rev() {
+                        write!(&mut proposed_txids, "{byte:02x}").unwrap();
+                    }
+                }
+                if idx + 1 < n_txs {
+                    write!(&mut proposed_txids, ", ").unwrap();
+                }
+            }
+            write!(&mut proposed_txids, "]").unwrap();
+            proposed_txids
+        };
         tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
     }
     initial_block_template

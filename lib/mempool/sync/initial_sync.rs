@@ -377,7 +377,7 @@ where
     )?;
     tracing::trace!("added {txid} to mempool");
     let mempool_txs = sync_state.mempool.txs.0.len();
-    tracing::debug!(%mempool_txs, "Syncing...");
+    tracing::trace!(%mempool_txs, "Syncing...");
     Ok(true)
 }
 

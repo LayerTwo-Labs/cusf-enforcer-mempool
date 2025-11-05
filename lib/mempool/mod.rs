@@ -17,31 +17,249 @@ pub use sync::{
     MempoolSync,
 };
 
-#[derive(Clone, Copy, Debug, Eq)]
+mod refinement_cmp {
+    //! Refinement comparison traits and wrappers, for types that have more than
+    //! one possible ordering/equality relation.
+    //! The traits in this module must obey the same laws as their counterparts
+    //! in [`std::cmp`].
+
+    use std::cmp::Ordering;
+
+    pub trait RefinementPartialEq<Rhs = Self>
+    where
+        Rhs: ?Sized,
+    {
+        #[must_use]
+        fn eq(&self, other: &Rhs) -> bool;
+
+        #[inline]
+        #[must_use]
+        fn ne(&self, other: &Rhs) -> bool {
+            !self.eq(other)
+        }
+    }
+
+    pub trait RefinementPartialOrd<Rhs = Self>:
+        RefinementPartialEq<Rhs>
+    where
+        Rhs: ?Sized,
+    {
+        #[must_use]
+        fn partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
+
+        #[inline]
+        #[must_use]
+        fn lt(&self, other: &Rhs) -> bool {
+            self.partial_cmp(other).is_some_and(Ordering::is_lt)
+        }
+
+        #[inline]
+        #[must_use]
+        fn le(&self, other: &Rhs) -> bool {
+            self.partial_cmp(other).is_some_and(Ordering::is_le)
+        }
+
+        #[inline]
+        #[must_use]
+        fn gt(&self, other: &Rhs) -> bool {
+            self.partial_cmp(other).is_some_and(Ordering::is_gt)
+        }
+
+        #[inline]
+        #[must_use]
+        fn ge(&self, other: &Rhs) -> bool {
+            self.partial_cmp(other).is_some_and(Ordering::is_ge)
+        }
+    }
+
+    pub trait RefinementEq: RefinementPartialEq {}
+
+    pub trait RefinementOrd: RefinementEq + RefinementPartialOrd {
+        #[must_use]
+        fn cmp(&self, other: &Self) -> Ordering;
+
+        #[inline]
+        #[must_use]
+        fn max(self, other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            if other.lt(&self) {
+                self
+            } else {
+                other
+            }
+        }
+
+        #[inline]
+        #[must_use]
+        fn min(self, other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            if other.lt(&self) {
+                other
+            } else {
+                self
+            }
+        }
+
+        #[inline]
+        #[must_use]
+        fn clamp(self, min: Self, max: Self) -> Self
+        where
+            Self: Sized,
+        {
+            assert!(min.le(&max));
+            if self.lt(&min) {
+                min
+            } else if self.gt(&max) {
+                max
+            } else {
+                self
+            }
+        }
+    }
+
+    /// Wrapper struct that implements comparison traits from [`std::cmp`].
+    #[derive(Clone, Copy, Debug)]
+    #[repr(transparent)]
+    pub struct RefinementCmp<T: ?Sized>(pub T);
+
+    impl<T, Rhs: ?Sized> PartialEq<RefinementCmp<Rhs>> for RefinementCmp<T>
+    where
+        T: RefinementPartialEq<Rhs>,
+    {
+        #[inline(always)]
+        fn eq(&self, other: &RefinementCmp<Rhs>) -> bool {
+            <T as RefinementPartialEq<Rhs>>::eq(&self.0, &other.0)
+        }
+
+        #[allow(clippy::partialeq_ne_impl)]
+        #[inline(always)]
+        fn ne(&self, other: &RefinementCmp<Rhs>) -> bool {
+            <T as RefinementPartialEq<Rhs>>::ne(&self.0, &other.0)
+        }
+    }
+
+    impl<T, Rhs: ?Sized> PartialOrd<RefinementCmp<Rhs>> for RefinementCmp<T>
+    where
+        T: RefinementPartialOrd<Rhs>,
+    {
+        #[inline(always)]
+        fn partial_cmp(&self, other: &RefinementCmp<Rhs>) -> Option<Ordering> {
+            <T as RefinementPartialOrd<Rhs>>::partial_cmp(&self.0, &other.0)
+        }
+
+        #[inline(always)]
+        fn lt(&self, other: &RefinementCmp<Rhs>) -> bool {
+            <T as RefinementPartialOrd<Rhs>>::lt(&self.0, &other.0)
+        }
+
+        #[inline(always)]
+        fn le(&self, other: &RefinementCmp<Rhs>) -> bool {
+            <T as RefinementPartialOrd<Rhs>>::le(&self.0, &other.0)
+        }
+
+        #[inline(always)]
+        fn gt(&self, other: &RefinementCmp<Rhs>) -> bool {
+            <T as RefinementPartialOrd<Rhs>>::gt(&self.0, &other.0)
+        }
+
+        #[inline(always)]
+        fn ge(&self, other: &RefinementCmp<Rhs>) -> bool {
+            <T as RefinementPartialOrd<Rhs>>::ge(&self.0, &other.0)
+        }
+    }
+
+    impl<T> Eq for RefinementCmp<T> where T: RefinementEq {}
+
+    impl<T> Ord for RefinementCmp<T>
+    where
+        T: RefinementOrd,
+    {
+        #[inline(always)]
+        fn cmp(&self, other: &Self) -> Ordering {
+            <T as RefinementOrd>::cmp(&self.0, &other.0)
+        }
+
+        #[inline(always)]
+        fn max(self, other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            Self(<T as RefinementOrd>::max(self.0, other.0))
+        }
+
+        #[inline(always)]
+        fn min(self, other: Self) -> Self
+        where
+            Self: Sized,
+        {
+            Self(<T as RefinementOrd>::min(self.0, other.0))
+        }
+
+        #[inline(always)]
+        fn clamp(self, min: Self, max: Self) -> Self
+        where
+            Self: Sized,
+        {
+            Self(<T as RefinementOrd>::clamp(self.0, min.0, max.0))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct FeeRate {
     fee: u64,
     vsize: u64,
 }
 
-impl Ord for FeeRate {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+impl FeeRate {
+    /// Refinement comparison (refinement of canonical quotient comparison).
+    /// This will always be equivalent to canonical quotient comparison if
+    /// `self` and `other` are not equal when comparing as quotients.
+    /// If `self` and `other` are equal when comparing as quotients,
+    /// orders by `vsize`.
+    /// ```
+    /// (self.fee / self.vsize) < (other.fee / other.vsize) ==> self < other,
+    /// (self.fee / self.vsize) > (other.fee / other.vsize) ==> self > other,
+    /// (self.fee == other.fee /\ other.fee == other.vsize) <==> self == other,
+    /// ((self.fee / self.vsize) == (other.fee / other.vsize)
+    /// /\ self.vsize < other.vsize) ==> self < other,
+    /// ((self.fee / self.vsize) == (other.fee / other.vsize)
+    /// /\ self.vsize > other.vsize) ==> self > other
+    /// ```
+    fn refinement_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
         // (self.fee / self.size) > (other.fee / other.size) ==>
         // (self.fee * other.size) > (other.fee * self.size)
         let lhs = self.fee as u128 * other.vsize as u128;
         let rhs = other.fee as u128 * self.vsize as u128;
-        lhs.cmp(&rhs)
+        match lhs.cmp(&rhs) {
+            Ordering::Equal => self.vsize.cmp(&other.vsize),
+            res => res,
+        }
     }
 }
 
-impl PartialEq for FeeRate {
+impl refinement_cmp::RefinementOrd for FeeRate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.refinement_cmp(other)
+    }
+}
+
+impl refinement_cmp::RefinementPartialEq for FeeRate {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other).is_eq()
+        <Self as refinement_cmp::RefinementOrd>::cmp(self, other).is_eq()
     }
 }
 
-impl PartialOrd for FeeRate {
+impl refinement_cmp::RefinementEq for FeeRate {}
+
+impl refinement_cmp::RefinementPartialOrd for FeeRate {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+        Some(<Self as refinement_cmp::RefinementOrd>::cmp(self, other))
     }
 }
 
@@ -165,16 +383,21 @@ impl Conflicts {
 }
 
 #[derive(Clone, Debug, Default)]
-struct ByAncestorFeeRate(OrdMap<FeeRate, LinkedHashSet<Txid>>);
+struct ByAncestorFeeRate(
+    OrdMap<refinement_cmp::RefinementCmp<FeeRate>, LinkedHashSet<Txid>>,
+);
 
 impl ByAncestorFeeRate {
     fn insert(&mut self, fee_rate: FeeRate, txid: Txid) {
-        self.0.entry(fee_rate).or_default().insert(txid);
+        self.0
+            .entry(refinement_cmp::RefinementCmp(fee_rate))
+            .or_default()
+            .insert(txid);
     }
 
     /// returns `true` if removed successfully, or `false` if not found
     fn remove(&mut self, fee_rate: FeeRate, txid: Txid) -> bool {
-        match self.0.entry(fee_rate) {
+        match self.0.entry(refinement_cmp::RefinementCmp(fee_rate)) {
             ordmap::Entry::Occupied(mut entry) => {
                 let txs = entry.get_mut();
                 txs.remove(&txid);
@@ -191,7 +414,7 @@ impl ByAncestorFeeRate {
     #[allow(dead_code)]
     fn iter(&self) -> impl DoubleEndedIterator<Item = (FeeRate, Txid)> + '_ {
         self.0.iter().flat_map(|(fee_rate, txids)| {
-            txids.iter().map(|txid| (*fee_rate, *txid))
+            txids.iter().map(|txid| (fee_rate.0, *txid))
         })
     }
 
@@ -200,7 +423,7 @@ impl ByAncestorFeeRate {
         &self,
     ) -> impl DoubleEndedIterator<Item = (FeeRate, Txid)> + '_ {
         self.0.iter().rev().flat_map(|(fee_rate, txids)| {
-            txids.iter().map(|txid| (*fee_rate, *txid))
+            txids.iter().map(|txid| (fee_rate.0, *txid))
         })
     }
 }
@@ -451,7 +674,7 @@ impl Mempool {
         };
         let (ndeps, nspenders) = (info.depends.len(), info.spent_by.len());
         let res = self.txs.0.insert(txid, (tx, info)).map(|(_, info)| info);
-        tracing::debug!(
+        tracing::trace!(
             fee = %bitcoin::Amount::from_sat(fee).display_dynamic(),
             modified_fee = %bitcoin::Amount::from_sat(modified_fee).display_dynamic(),
             %txid,
@@ -566,22 +789,19 @@ impl Mempool {
             self.by_ancestor_fee_rate
                 .insert(ancestor_fee_rate, desc_txid);
             // FIXME: remove
-            tracing::debug!("removing {txid} as a dep of {desc_txid}");
+            tracing::trace!("removing {txid} as a dep of {desc_txid}");
             desc_info.depends.remove(txid);
             Result::<_, MempoolRemoveError>::Ok(())
         })?;
         // Update all ancestors
         let () = self.txs.ancestors_mut(*txid).try_for_each(|anc| {
-            let (anc_tx, anc_info) = anc?;
+            let (_anc_tx, anc_info) = anc?;
             anc_info.descendant_modified_weight = saturating_sub_weight(
                 anc_info.descendant_modified_weight,
                 modified_weight,
             );
             anc_info.descendant_vsize -= vsize;
             anc_info.fees.descendant -= fees.modified;
-            let anc_txid = anc_tx.compute_txid();
-            // FIXME: remove
-            tracing::debug!("removing {txid} as a spender of {anc_txid}");
             anc_info.spent_by.remove(txid);
             Result::<_, MempoolRemoveError>::Ok(())
         })?;
@@ -595,8 +815,6 @@ impl Mempool {
             return Err(err.into());
         };
         let res = self.txs.0.remove(txid);
-        // FIXME: remove
-        tracing::debug!("Removed {txid} from mempool");
         Ok(res)
     }
 
@@ -852,7 +1070,8 @@ impl Mempool {
                     to_add.extend(info.depends.iter().map(|dep| (*dep, false)))
                 }
             }
-            weight_remaining -= Weight::from_vb_unwrap(ancestor_fee_rate.vsize);
+            let txs_weight = Weight::from_vb_unwrap(ancestor_fee_rate.vsize);
+            weight_remaining -= txs_weight;
         }
         Ok(res)
     }
