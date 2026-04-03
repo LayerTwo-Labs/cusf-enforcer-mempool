@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use bitcoin_jsonrpsee::{
-    jsonrpsee::http_client::HttpClientBuilder, MainClient as _,
+    MainClient as _, jsonrpsee::http_client::HttpClientBuilder,
 };
 use clap::Parser;
 use jsonrpsee::server::ServerHandle;
@@ -126,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
         network,
         network_info,
         rpc_client,
+        None,
         sample_block_template,
     )?;
     let rpc_server_handle =

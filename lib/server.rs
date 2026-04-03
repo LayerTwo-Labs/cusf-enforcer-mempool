@@ -1,16 +1,16 @@
-use std::{collections::HashMap, convert::Infallible};
+use std::{collections::HashMap, convert::Infallible, time::Duration};
 
 use async_trait::async_trait;
 use bitcoin::{
-    amount::CheckedSum, hashes::Hash as _, merkle_tree, script::PushBytesBuf,
     Amount, Block, BlockHash, Network, ScriptBuf, Transaction, TxOut, Txid,
-    Weight, WitnessMerkleNode, Wtxid,
+    Weight, WitnessMerkleNode, Wtxid, amount::CheckedSum, hashes::Hash as _,
+    merkle_tree, script::PushBytesBuf,
 };
 use bitcoin_jsonrpsee::client::{
     BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
     CoinbaseTxnOrValue, NetworkInfo,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use educe::Educe;
 use futures::FutureExt;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorCode};
@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::{
     cusf_block_producer::{self, CusfBlockProducer, InitialBlockTemplate},
-    mempool::{self, MempoolSync},
+    mempool::{self, Mempool, MempoolSync},
 };
 
 #[rpc(client, server)]
@@ -38,6 +38,58 @@ pub trait Rpc {
     ) -> RpcResult<Option<String>>;
 }
 
+// cached block templates, with their generation timestamp
+#[derive(Clone, Debug)]
+struct CachedBlockTemplates {
+    coinbasetxn: Option<(Box<BlockTemplate>, DateTime<Utc>)>,
+    coinbasevalue: Option<(Box<BlockTemplate>, DateTime<Utc>)>,
+    cache_lifetime: Duration,
+}
+
+impl CachedBlockTemplates {
+    fn new(cache_lifetime: Duration) -> Self {
+        Self {
+            coinbasetxn: None,
+            coinbasevalue: None,
+            cache_lifetime,
+        }
+    }
+
+    /// returns a cached block template, if it is not expired
+    fn try_take(
+        self,
+        coinbasetxn: bool,
+        now: DateTime<Utc>,
+        tip_block_hash: BlockHash,
+    ) -> Option<Box<BlockTemplate>> {
+        let (block_template, generated_ts) = if coinbasetxn {
+            self.coinbasetxn
+        } else {
+            self.coinbasevalue
+        }?;
+        let age = now.signed_duration_since(generated_ts).to_std().ok()?;
+        if age > self.cache_lifetime {
+            return None;
+        }
+        if tip_block_hash == block_template.prev_blockhash {
+            Some(block_template)
+        } else {
+            None
+        }
+    }
+
+    fn put(&mut self, block_template: Box<BlockTemplate>, now: DateTime<Utc>) {
+        match &block_template.coinbase_txn_or_value {
+            CoinbaseTxnOrValue::Txn(_) => {
+                self.coinbasetxn = Some((block_template, now))
+            }
+            CoinbaseTxnOrValue::ValueSats(_) => {
+                self.coinbasevalue = Some((block_template, now))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CreateServerError {
     #[error("Sample block template cannot set coinbasetxn field")]
@@ -50,18 +102,24 @@ pub struct Server<Enforcer, RpcClient> {
     network: Network,
     network_info: NetworkInfo,
     rpc_client: RpcClient,
+    cached_block_templates: Option<parking_lot::RwLock<CachedBlockTemplates>>,
     sample_block_template: BlockTemplate,
     /// Map of block hashes to known targets for the next block
     known_targets: parking_lot::RwLock<HashMap<BlockHash, bitcoin::Target>>,
 }
 
 impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
+    /// `cached_template_lifetime`, if set, allows a block template to be
+    /// cached for up to the specified duration.
+    /// The block template will be regenerated if the cached template is older
+    /// than the specified duration.
     pub fn new(
         coinbase_spk: ScriptBuf,
         mempool: MempoolSync<Enforcer>,
         network: Network,
         network_info: NetworkInfo,
         rpc_client: RpcClient,
+        cached_template_lifetime: Option<Duration>,
         sample_block_template: BlockTemplate,
     ) -> Result<Self, CreateServerError> {
         if matches!(
@@ -70,12 +128,19 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
         ) {
             return Err(CreateServerError::SampleBlockTemplate);
         };
+        let cached_block_templates =
+            cached_template_lifetime.map(|cached_template_lifetime| {
+                parking_lot::RwLock::new(CachedBlockTemplates::new(
+                    cached_template_lifetime,
+                ))
+            });
         Ok(Self {
             coinbase_spk,
             mempool,
             network,
             network_info,
             rpc_client,
+            cached_block_templates,
             sample_block_template,
             known_targets: parking_lot::RwLock::new(HashMap::new()),
         })
@@ -499,6 +564,64 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     Ok((res_coinbase_txouts, res_txs))
 }
 
+struct MempoolQueryOutput {
+    target: Option<bitcoin::Target>,
+    prev_blockhash: BlockHash,
+    tip_block_mediantime: u32,
+    tip_block_height: u32,
+    coinbase_txn: Option<Transaction>,
+    block_txs: Vec<BlockTemplateTransaction>,
+    default_witness_commitment: Option<Vec<u8>>,
+}
+
+/// Query the mempool state during GBT
+async fn query_mempool<'a, Enforcer>(
+    coinbase_spk: ScriptBuf,
+    coinbasetxn: bool,
+    network: Network,
+    mempool: &'a Mempool,
+    enforcer: &'a Enforcer,
+) -> Result<MempoolQueryOutput, BuildBlockError<Enforcer>>
+where
+    Enforcer: CusfBlockProducer,
+{
+    let tip_block = mempool.tip();
+    let (coinbase_txn, block_txs, default_witness_commitment) = if coinbasetxn {
+        tracing::debug!("Filling block txs");
+        let (coinbase_txouts, block_txs) =
+            block_txs::<true, _>(enforcer, mempool, &tip_block.hash).await?;
+        tracing::debug!("Finalizing coinbase txn");
+        let (coinbase_tx, witness_commitment_spk) = finalize_coinbase_tx(
+            coinbase_spk,
+            tip_block.height + 1,
+            network,
+            coinbase_txouts,
+            &block_txs,
+        )?;
+        let default_witness_commitment =
+            witness_commitment_spk.map(|spk| spk.to_bytes());
+        (Some(coinbase_tx), block_txs, default_witness_commitment)
+    } else {
+        let ((), block_txs) =
+            block_txs::<false, _>(enforcer, mempool, &tip_block.hash).await?;
+        (None, block_txs, None)
+    };
+    Ok(MempoolQueryOutput {
+        target: mempool.next_target(),
+        prev_blockhash: tip_block.hash,
+        tip_block_mediantime: tip_block.mediantime,
+        tip_block_height: tip_block.height,
+        coinbase_txn,
+        block_txs,
+        default_witness_commitment,
+    })
+}
+
+enum CachedMempoolQueryOutput {
+    Cached(Box<BlockTemplate>),
+    Queried(Box<MempoolQueryOutput>),
+}
+
 #[async_trait]
 impl<BP, RpcClient> RpcServer for Server<BP, RpcClient>
 where
@@ -528,70 +651,44 @@ where
         } = self.sample_block_template;
         let current_time_adjusted =
             (now.timestamp() + self.network_info.time_offset_s) as u64;
-        let (
-            target,
-            prev_blockhash,
-            tip_block_mediantime,
-            tip_block_height,
-            coinbase_txn,
-            block_txs,
-            default_witness_commitment,
-        ) = self
+        let cached_mempool_query_output = self
             .mempool
             .with(|mempool, enforcer| {
-                {
-                    let coinbase_spk = self.coinbase_spk.clone();
-                    let network = self.network;
-                    async move {
-                        let tip_block = mempool.tip();
-                        let (
-                            coinbase_txn,
-                            block_txs,
-                            default_witness_commitment,
-                        ) = if request.capabilities.contains("coinbasetxn") {
-                            tracing::debug!("Filling block txs");
-                            let (coinbase_txouts, block_txs) =
-                                block_txs::<true, _>(
-                                    enforcer,
-                                    mempool,
-                                    &tip_block.hash,
-                                )
-                                .await?;
-                            tracing::debug!("Finalizing coinbase txn");
-                            let (coinbase_tx, witness_commitment_spk) =
-                                finalize_coinbase_tx(
-                                    coinbase_spk,
-                                    tip_block.height + 1,
-                                    network,
-                                    coinbase_txouts,
-                                    &block_txs,
-                                )?;
-                            let default_witness_commitment =
-                                witness_commitment_spk
-                                    .map(|spk| spk.to_bytes());
-                            (
-                                Some(coinbase_tx),
-                                block_txs,
-                                default_witness_commitment,
+                let coinbasetxn = request.capabilities.contains("coinbasetxn");
+                let cached_block_templates = self
+                    .cached_block_templates
+                    .as_ref()
+                    .map(|cached_block_templates| {
+                        cached_block_templates.read().clone()
+                    });
+                let coinbase_spk = self.coinbase_spk.clone();
+                let network = self.network;
+                async move {
+                    if let Some(cached_block_templates) = cached_block_templates
+                        && let Some(cached_block_template) =
+                            cached_block_templates.try_take(
+                                coinbasetxn,
+                                now,
+                                mempool.tip().hash,
                             )
-                        } else {
-                            let ((), block_txs) = block_txs::<false, _>(
-                                enforcer,
-                                mempool,
-                                &tip_block.hash,
-                            )
-                            .await?;
-                            (None, block_txs, None)
-                        };
-                        Ok((
-                            mempool.next_target(),
-                            tip_block.hash,
-                            tip_block.mediantime,
-                            tip_block.height,
-                            coinbase_txn,
-                            block_txs,
-                            default_witness_commitment,
+                    {
+                        Ok(CachedMempoolQueryOutput::Cached(
+                            cached_block_template,
                         ))
+                    } else {
+                        query_mempool(
+                            coinbase_spk,
+                            request.capabilities.contains("coinbasetxn"),
+                            network,
+                            mempool,
+                            enforcer,
+                        )
+                        .await
+                        .map(|query_mempool_output| {
+                            CachedMempoolQueryOutput::Queried(Box::new(
+                                query_mempool_output,
+                            ))
+                        })
                     }
                 }
                 .boxed()
@@ -606,6 +703,20 @@ where
                 let err = log_error(err);
                 internal_error(err)
             })?;
+        let MempoolQueryOutput {
+            target,
+            prev_blockhash,
+            tip_block_mediantime,
+            tip_block_height,
+            coinbase_txn,
+            block_txs,
+            default_witness_commitment,
+        } = match cached_mempool_query_output {
+            CachedMempoolQueryOutput::Cached(block_template) => {
+                return Ok(*block_template);
+            }
+            CachedMempoolQueryOutput::Queried(query_output) => *query_output,
+        };
         let target = {
             let known_target =
                 self.known_targets.read().get(&prev_blockhash).copied();
@@ -683,6 +794,11 @@ where
             default_witness_commitment,
             signet_challenge: signet_challenge.clone(),
         };
+        if let Some(cached_block_templates) = &self.cached_block_templates {
+            let () = cached_block_templates
+                .write()
+                .put(Box::new(res.clone()), now);
+        }
         Ok(res)
     }
 

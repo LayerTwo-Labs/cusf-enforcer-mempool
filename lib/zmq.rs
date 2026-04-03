@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-use bitcoin::{hashes::Hash as _, BlockHash, Txid};
+use bitcoin::{BlockHash, Txid, hashes::Hash as _};
 use futures::{
-    stream::{self, BoxStream},
     Stream, StreamExt, TryStreamExt as _,
+    stream::{self, BoxStream},
 };
 use thiserror::Error;
 use zeromq::{Socket as _, SocketRecv as _, ZmqError, ZmqMessage};
@@ -137,7 +137,7 @@ impl TryFrom<ZmqMessage> for SequenceMessage {
                 })
             }
             message_type => {
-                return Err(Self::Error::UnknownMessageType(message_type))
+                return Err(Self::Error::UnknownMessageType(message_type));
             }
         };
         Ok(res)
@@ -148,7 +148,9 @@ impl TryFrom<ZmqMessage> for SequenceMessage {
 pub enum SequenceStreamError {
     #[error("Error deserializing message")]
     Deserialize(#[from] DeserializeSequenceMessageError),
-    #[error("Expected message with mempool sequence at least {min_next_seq}, but received {seq}")]
+    #[error(
+        "Expected message with mempool sequence at least {min_next_seq}, but received {seq}"
+    )]
     ExpectedMempoolSequenceAtLeast { min_next_seq: u64, seq: u64 },
     #[error("Missing message with mempool sequence {0}")]
     MissingMempoolSequence(u64),

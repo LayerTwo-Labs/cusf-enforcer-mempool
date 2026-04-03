@@ -11,8 +11,8 @@ use bitcoin_jsonrpsee::{
         GetRawTransactionVerbose, U8Witness,
     },
     jsonrpsee::core::{
-        params::{ArrayParams, BatchRequestBuilder, ObjectParams},
         ClientError as JsonRpcError,
+        params::{ArrayParams, BatchRequestBuilder, ObjectParams},
     },
 };
 
@@ -28,7 +28,7 @@ mod initial_sync;
 pub(in crate::mempool) mod task;
 
 pub use initial_sync::{
-    init_sync_mempool, SyncMempoolError as InitialSyncMempoolError,
+    SyncMempoolError as InitialSyncMempoolError, init_sync_mempool,
 };
 pub use task::MempoolSync;
 

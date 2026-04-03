@@ -55,8 +55,9 @@ pub trait CusfEnforcer {
     fn connect_block(
         &mut self,
         block: &bitcoin::Block,
-    ) -> impl Future<Output = Result<ConnectBlockAction, Self::ConnectBlockError>>
-           + Send;
+    ) -> impl Future<
+        Output = Result<ConnectBlockAction, Self::ConnectBlockError>,
+    > + Send;
 
     type DisconnectBlockError: std::error::Error + Send + Sync + 'static;
 
