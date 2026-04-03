@@ -15,15 +15,15 @@ use bitcoin_jsonrpsee::{
     jsonrpsee::core::ClientError as JsonRpcError,
 };
 use educe::Educe;
-use futures::{stream, StreamExt as _};
+use futures::{StreamExt as _, stream};
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
 
 use super::{
     super::{Mempool, MempoolInsertError, MempoolRemoveError},
-    batched_request, BatchedResponseItem, CombinedStreamItem, RequestError,
-    RequestItem, RequestQueue, ResponseItem,
+    BatchedResponseItem, CombinedStreamItem, RequestError, RequestItem,
+    RequestQueue, ResponseItem, batched_request,
 };
 use crate::{
     cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
@@ -226,7 +226,7 @@ where
             Ordering::Greater => {
                 return Err(SyncMempoolError::FirstMempoolSequence(
                     first_mempool_seq,
-                ))
+                ));
             }
         }
     }

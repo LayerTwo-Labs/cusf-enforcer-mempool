@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use bitcoin::{BlockHash, Network, Target, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use hashlink::{LinkedHashMap, LinkedHashSet};
-use imbl::{ordmap, OrdMap, OrdSet};
+use imbl::{OrdMap, OrdSet, ordmap};
 use indexmap::IndexSet;
 use lending_iterator::LendingIterator as _;
 use thiserror::Error;
@@ -13,8 +13,8 @@ pub mod iter_mut;
 mod sync;
 
 pub use sync::{
-    init_sync_mempool, task::SyncTaskError, InitialSyncMempoolError,
-    MempoolSync,
+    InitialSyncMempoolError, MempoolSync, init_sync_mempool,
+    task::SyncTaskError,
 };
 
 mod refinement_cmp {
@@ -84,11 +84,7 @@ mod refinement_cmp {
         where
             Self: Sized,
         {
-            if other.lt(&self) {
-                self
-            } else {
-                other
-            }
+            if other.lt(&self) { self } else { other }
         }
 
         #[inline]
@@ -97,11 +93,7 @@ mod refinement_cmp {
         where
             Self: Sized,
         {
-            if other.lt(&self) {
-                other
-            } else {
-                self
-            }
+            if other.lt(&self) { other } else { self }
         }
 
         #[inline]

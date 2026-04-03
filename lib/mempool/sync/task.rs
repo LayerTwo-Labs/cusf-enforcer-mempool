@@ -6,11 +6,11 @@ use std::{
 };
 
 use bitcoin::{
-    consensus::Decodable, hashes::Hash as _, Amount, BlockHash, OutPoint,
-    Transaction, Txid, Weight,
+    Amount, BlockHash, OutPoint, Transaction, Txid, Weight,
+    consensus::Decodable, hashes::Hash as _,
 };
 use educe::Educe;
-use futures::{future::BoxFuture, stream, StreamExt as _};
+use futures::{StreamExt as _, future::BoxFuture, stream};
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
@@ -19,14 +19,14 @@ use tracing::instrument;
 
 use super::{
     super::{Conflicts, Mempool},
-    batched_request, BatchedResponseItem, CombinedStreamItem, RequestError,
-    RequestQueue, ResponseItem,
+    BatchedResponseItem, CombinedStreamItem, RequestError, RequestQueue,
+    ResponseItem, batched_request,
 };
 use crate::{
     cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
     mempool::{
-        sync::RequestItem, MempoolInsertError, MempoolRemoveError,
-        MempoolUpdateError,
+        MempoolInsertError, MempoolRemoveError, MempoolUpdateError,
+        sync::RequestItem,
     },
     zmq::{
         BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
