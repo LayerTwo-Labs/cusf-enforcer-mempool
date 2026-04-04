@@ -712,6 +712,11 @@ impl Mempool {
             },
         )?;
         for conflict_txid in conflicts_with {
+            // The conflicting tx may have already been removed from the
+            // mempool (e.g. confirmed in a block). Skip it.
+            if !self.txs.0.contains_key(&conflict_txid) {
+                continue;
+            }
             self.txs.descendants_mut(conflict_txid).try_for_each(
                 |descendant_info| {
                     let (_descendant_tx, descendant_info) = descendant_info?;
@@ -908,6 +913,9 @@ impl Mempool {
         conflicts: Conflicts,
     ) -> Result<(), MempoolUpdateError> {
         for (txid_lo, conflict_txids) in conflicts.iter() {
+            if !self.txs.0.contains_key(txid_lo) {
+                continue;
+            }
             let conflict_txids = OrdSet::from(conflict_txids);
             if conflict_txids.is_empty() {
                 break;
@@ -924,6 +932,9 @@ impl Mempool {
             )?;
         }
         for (txid_hi, conflict_txids) in conflicts.iter_inverted() {
+            if !self.txs.0.contains_key(&txid_hi) {
+                continue;
+            }
             let conflict_txids = OrdSet::from(conflict_txids);
             if conflict_txids.is_empty() {
                 break;
@@ -1111,5 +1122,75 @@ impl Mempool {
         }
         res.reverse();
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{
+        Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
+        absolute::LockTime, hashes::Hash as _, transaction::Version,
+    };
+
+    fn make_tx(inputs: &[OutPoint], num_outputs: usize) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|prev| TxIn {
+                    previous_output: *prev,
+                    sequence: Sequence::MAX,
+                    script_sig: ScriptBuf::new(),
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: (0..num_outputs)
+                .map(|i| TxOut {
+                    value: Amount::from_sat(1000 * (i as u64 + 1)),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn test_mempool() -> Mempool {
+        Mempool::new(Network::Regtest, BlockHash::all_zeros())
+    }
+
+    /// Reproduces the prod crash: inserting a tx whose `conflicts_with`
+    /// references a txid not present in the mempool (e.g. already confirmed
+    /// in a block) must not panic or error.
+    #[test]
+    fn insert_with_nonexistent_conflict_succeeds() {
+        let mut mempool = test_mempool();
+
+        let tx = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let weight = tx.weight();
+        let absent_txid = Txid::from_byte_array([0x42; 32]);
+
+        let result = mempool.insert(tx, 100, OrdSet::unit(absent_txid), weight);
+
+        assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    /// Same scenario through `add_conflicts`: conflict references a txid
+    /// that is no longer in the mempool.
+    #[test]
+    fn add_conflicts_with_nonexistent_txid_succeeds() {
+        let mut mempool = test_mempool();
+
+        let tx = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let txid = tx.compute_txid();
+        let weight = tx.weight();
+        mempool.insert(tx, 100, OrdSet::new(), weight).unwrap();
+
+        let absent_txid = Txid::from_byte_array([0x42; 32]);
+        let mut conflicts = Conflicts::default();
+        conflicts.insert(txid, absent_txid);
+
+        let result = mempool.add_conflicts(conflicts);
+        assert!(result.is_ok(), "add_conflicts failed: {result:?}");
     }
 }
