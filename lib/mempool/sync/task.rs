@@ -15,7 +15,7 @@ use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
 use tokio::{spawn, sync::RwLock, task::JoinHandle};
-use tracing::instrument;
+use tracing::{Instrument as _, instrument};
 
 use super::{
     super::{Conflicts, Mempool},
@@ -124,8 +124,7 @@ async fn handle_seq_message(
             mempool_seq: _,
             zmq_seq: _,
         }) => {
-            // FIXME: remove
-            tracing::debug!("Added {txid} to req queue");
+            tracing::debug!("Added tx {txid} to req queue");
             sync_state
                 .request_queue
                 .push_back(RequestItem::Tx(txid, true));
@@ -624,24 +623,32 @@ where
             .await
             .ok_or(SyncTaskError::CombinedStreamEnded)?;
 
-        tracing::debug!(
-            "Received stream message: `{}`",
-            match msg {
-                CombinedStreamItem::ZmqSeq(_) => "sequence",
-                CombinedStreamItem::Response(_) => "response",
-                CombinedStreamItem::Shutdown => "shutdown",
-            }
+        let msg_kind = match &msg {
+            CombinedStreamItem::ZmqSeq(_) => "sequence",
+            CombinedStreamItem::Response(_) => "response",
+            CombinedStreamItem::Shutdown => "shutdown",
+        };
+
+        let span = tracing::debug_span!(
+            "handle_stream_msg",
+            sequence_id = ulid::Ulid::new().to_string(), // ULIDs are clickable, short and sorts naturally by time
         );
+
+        tracing::debug!(parent: &span, "Processing {msg_kind} stream message");
 
         match msg {
             CombinedStreamItem::ZmqSeq(seq_msg) => {
-                let () = handle_seq_message(&mut sync_state, seq_msg?).await;
+                handle_seq_message(&mut sync_state, seq_msg?)
+                    .instrument(span)
+                    .await;
             }
             CombinedStreamItem::Response(resp) => {
-                let () = handle_resp(&inner, &mut sync_state, resp?).await?;
+                handle_resp(&inner, &mut sync_state, resp?)
+                    .instrument(span)
+                    .await?;
             }
             CombinedStreamItem::Shutdown => {
-                tracing::info!("shutdown signal received, aborting");
+                tracing::info!(parent: &span, "shutdown signal received, aborting");
                 // This isn't really an error though...
                 return Err(SyncTaskError::Shutdown);
             }

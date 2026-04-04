@@ -31,6 +31,7 @@ tokio = "1.38.0"
 tracing = "0.1.40"
 typewit = "1.11.0"
 zeromq = "0.4.1"
+ulid = "1.2.1"
 
 [lints]
 workspace = true
