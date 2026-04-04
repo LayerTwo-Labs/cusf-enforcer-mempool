@@ -213,7 +213,7 @@ impl FeeRate {
     /// `self` and `other` are not equal when comparing as quotients.
     /// If `self` and `other` are equal when comparing as quotients,
     /// orders by `vsize`.
-    /// ```
+    /// ```text
     /// (self.fee / self.vsize) < (other.fee / other.vsize) ==> self < other,
     /// (self.fee / self.vsize) > (other.fee / other.vsize) ==> self > other,
     /// (self.fee == other.fee /\ other.fee == other.vsize) <==> self == other,
