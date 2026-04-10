@@ -2,11 +2,7 @@
 
 use core::future::Future;
 use futures::FutureExt as _;
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, VecDeque},
-    convert::Infallible,
-};
+use std::{cmp::Ordering, collections::HashMap, convert::Infallible};
 
 use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid};
 use bitcoin_jsonrpsee::{
@@ -15,15 +11,15 @@ use bitcoin_jsonrpsee::{
     jsonrpsee::core::ClientError as JsonRpcError,
 };
 use educe::Educe;
-use futures::{StreamExt as _, stream};
+use futures::StreamExt as _;
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
 
 use super::{
     super::{Mempool, MempoolInsertError, MempoolRemoveError},
-    BatchedResponseItem, CombinedStreamItem, RequestError, RequestItem,
-    RequestQueue, ResponseItem, batched_request,
+    BatchedResponseItem, CombinedStream, CombinedStreamItem, RequestError,
+    RequestItem, RequestQueue, ResponseItem, SeqMessageQueue, batched_request,
 };
 use crate::{
     cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
@@ -67,7 +63,7 @@ struct MempoolSyncing<'a, Enforcer> {
     mempool: Mempool,
     post_sync: PostSync,
     request_queue: RequestQueue,
-    seq_message_queue: VecDeque<SequenceMessage>,
+    seq_message_queue: SeqMessageQueue,
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: HashMap<Txid, Transaction>,
     txs_needed: LinkedHashSet<Txid>,
@@ -88,6 +84,8 @@ pub enum SyncMempoolError<Enforcer>
 where
     Enforcer: CusfEnforcer,
 {
+    #[error("Timeout while waiting to apply sequence message")]
+    ApplySeqMessageTimeout,
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
     // TODO - this is not really an error...
@@ -276,12 +274,17 @@ where
     Enforcer: CusfEnforcer,
 {
     sync_state.blocks_needed.remove(&resp_block.hash);
-    match sync_state.seq_message_queue.front() {
+    match sync_state
+        .seq_message_queue
+        .front()
+        .as_ref()
+        .map(|front| front.msg)
+    {
         Some(SequenceMessage::BlockHash(BlockHashMessage {
             block_hash,
             event: BlockHashEvent::Connected,
             ..
-        })) if *block_hash == resp_block.hash => {
+        })) if block_hash == resp_block.hash => {
             let () = connect_block(sync_state, &resp_block).await?;
             sync_state.seq_message_queue.pop_front();
         }
@@ -289,7 +292,7 @@ where
             block_hash,
             event: BlockHashEvent::Disconnected,
             ..
-        })) if *block_hash == resp_block.hash
+        })) if block_hash == resp_block.hash
             && sync_state.mempool.chain.tip == resp_block.hash =>
         {
             let () = disconnect_block(sync_state, &resp_block).await?;
@@ -389,17 +392,22 @@ where
     Enforcer: CusfEnforcer,
 {
     let res = 'res: {
-        match sync_state.seq_message_queue.front() {
+        match sync_state
+            .seq_message_queue
+            .front()
+            .as_ref()
+            .map(|front| front.msg)
+        {
             Some(SequenceMessage::BlockHash(BlockHashMessage {
                 block_hash,
                 event: BlockHashEvent::Disconnected,
                 ..
             })) => {
-                if sync_state.mempool.chain.tip != *block_hash {
+                if sync_state.mempool.chain.tip != block_hash {
                     break 'res false;
                 };
                 let Some(block) =
-                    sync_state.mempool.chain.blocks.get(block_hash).cloned()
+                    sync_state.mempool.chain.blocks.get(&block_hash).cloned()
                 else {
                     break 'res false;
                 };
@@ -411,10 +419,7 @@ where
                 event: TxHashEvent::Added,
                 mempool_seq: _,
                 zmq_seq: _,
-            })) => {
-                let txid = *txid;
-                try_add_tx_from_cache(sync_state, &txid)?
-            }
+            })) => try_add_tx_from_cache(sync_state, &txid)?,
             Some(SequenceMessage::TxHash(TxHashMessage {
                 txid,
                 event: TxHashEvent::Removed,
@@ -422,7 +427,7 @@ where
                 zmq_seq: _,
             })) => {
                 // FIXME: review -- looks sus
-                sync_state.mempool.remove(txid)?.is_some()
+                sync_state.mempool.remove(&txid)?.is_some()
             }
             Some(SequenceMessage::BlockHash(_)) | None => false,
         }
@@ -536,14 +541,15 @@ where
         for txid in &txids {
             request_queue.push_back(RequestItem::Tx(*txid, true));
         }
-        let seq_message_queue = VecDeque::from_iter(txids.iter().map(|txid| {
-            SequenceMessage::TxHash(TxHashMessage {
-                txid: *txid,
-                event: TxHashEvent::Added,
-                mempool_seq: mempool_sequence,
-                zmq_seq: 0,
-            })
-        }));
+        let seq_message_queue =
+            SeqMessageQueue::from_iter(txids.iter().map(|txid| {
+                SequenceMessage::TxHash(TxHashMessage {
+                    txid: *txid,
+                    event: TxHashEvent::Added,
+                    mempool_seq: mempool_sequence,
+                    zmq_seq: 0,
+                })
+            }));
         MempoolSyncing {
             blocks_needed: LinkedHashSet::from_iter([best_block_hash]),
             enforcer,
@@ -563,19 +569,30 @@ where
         .then(|request| batched_request(rpc_client, request))
         .boxed();
 
+    let apply_seq_msg_timeout = |seq_msg_queue: &SeqMessageQueue| {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let sleep_until = seq_msg_queue
+            .front()
+            .as_ref()
+            .map(|front| front.reached_head_time + TIMEOUT);
+        async move {
+            if let Some(sleep_until) = sleep_until {
+                tokio::time::sleep_until(sleep_until.into()).await
+            } else {
+                futures::future::pending().await
+            }
+        }
+        .boxed()
+    };
+
     // Pin the shutdown signal
     futures::pin_mut!(shutdown_signal);
-    let shutdown_stream = shutdown_signal.into_stream();
 
-    // This is kinda wonky - but the select() function is only able to operate on
-    // two streams. There's the stream_select! macro, but that consumes the streams.
-    // We need to retrieve them below, therefore the nested stream::select()
-    let mut combined_stream = stream::select(
-        sequence_stream.map(CombinedStreamItem::ZmqSeq),
-        stream::select(
-            response_stream.map(CombinedStreamItem::Response),
-            shutdown_stream.map(|_| CombinedStreamItem::Shutdown),
-        ),
+    let mut combined_stream = CombinedStream::new(
+        sequence_stream,
+        response_stream,
+        apply_seq_msg_timeout(&sync_state.seq_message_queue),
+        shutdown_signal,
     );
     while !sync_state.is_synced() {
         match combined_stream
@@ -585,9 +602,16 @@ where
         {
             CombinedStreamItem::ZmqSeq(seq_msg) => {
                 let () = handle_seq_message(&mut sync_state, seq_msg?)?;
+                combined_stream.apply_seq_msg_timeout =
+                    apply_seq_msg_timeout(&sync_state.seq_message_queue).fuse();
             }
             CombinedStreamItem::Response(resp) => {
                 let () = handle_resp(&mut sync_state, resp?).await?;
+                combined_stream.apply_seq_msg_timeout =
+                    apply_seq_msg_timeout(&sync_state.seq_message_queue).fuse();
+            }
+            CombinedStreamItem::ApplySeqMessageTimeout => {
+                return Err(SyncMempoolError::ApplySeqMessageTimeout);
             }
             CombinedStreamItem::Shutdown => {
                 return Err(SyncMempoolError::Shutdown);
@@ -601,9 +625,6 @@ where
         ..
     } = sync_state;
     let () = post_sync.apply(&mut mempool)?;
-    let sequence_stream = {
-        let (sequence_stream, _) = combined_stream.into_inner();
-        sequence_stream.into_inner()
-    };
+    let sequence_stream = combined_stream.sequence_msgs.into_inner();
     Ok((sequence_stream, mempool, tx_cache))
 }
