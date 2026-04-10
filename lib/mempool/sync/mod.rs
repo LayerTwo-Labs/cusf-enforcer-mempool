@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Arc,
     task::{Poll, Waker},
+    time::Instant,
 };
 
 use bitcoin::{BlockHash, Transaction, Txid};
@@ -16,13 +17,16 @@ use bitcoin_jsonrpsee::{
     },
 };
 
-use futures::{FutureExt as _, Stream};
+use futures::{
+    future::{self, FusedFuture, FutureExt as _},
+    stream::{self, BoxStream, Stream, StreamExt as _},
+};
 use hashlink::LinkedHashSet;
 use nonempty::NonEmpty;
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::zmq::{SequenceMessage, SequenceStreamError};
+use crate::zmq::{SequenceMessage, SequenceStream, SequenceStreamError};
 
 mod initial_sync;
 pub(in crate::mempool) mod task;
@@ -143,6 +147,69 @@ impl Stream for RequestQueue {
     }
 }
 
+/// Head of the sequence message queue.
+/// Includes the time at which the message reached the head of the queue.
+#[derive(Debug)]
+struct SeqMessageQueueHead {
+    msg: SequenceMessage,
+    /// The time at which the message reached the head of the queue.
+    reached_head_time: Instant,
+}
+
+/// Queue of sequence messages.
+/// Tracks how long a message has been at the head of the queue.
+#[derive(Debug, Default)]
+struct SeqMessageQueue {
+    head: Option<SeqMessageQueueHead>,
+    tail: VecDeque<SequenceMessage>,
+}
+
+impl SeqMessageQueue {
+    fn front(&self) -> &Option<SeqMessageQueueHead> {
+        &self.head
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    fn pop_front(&mut self) -> Option<SequenceMessage> {
+        let Self { head, tail } = self;
+        let new_head = tail.pop_front().map(|msg| SeqMessageQueueHead {
+            msg,
+            reached_head_time: Instant::now(),
+        });
+        std::mem::replace(head, new_head).map(|old_head| old_head.msg)
+    }
+
+    fn push_back(&mut self, msg: SequenceMessage) {
+        let Self { head, tail } = self;
+        if head.is_none() {
+            assert!(tail.is_empty());
+            let reached_head_time = Instant::now();
+            *head = Some(SeqMessageQueueHead {
+                msg,
+                reached_head_time,
+            });
+        } else {
+            tail.push_back(msg);
+        }
+    }
+}
+
+impl FromIterator<SequenceMessage> for SeqMessageQueue {
+    fn from_iter<T>(msgs: T) -> Self
+    where
+        T: IntoIterator<Item = SequenceMessage>,
+    {
+        let mut res = Self::default();
+        for msg in msgs.into_iter() {
+            res.push_back(msg)
+        }
+        res
+    }
+}
+
 /// Responses received while syncing
 #[derive(Clone, Debug)]
 enum ResponseItem {
@@ -258,11 +325,146 @@ where
     }
 }
 
+type ResponseStreamItem = Result<BatchedResponseItem, RequestError>;
+
 /// Items processed while syncing
 #[derive(Debug)]
+#[must_use]
 enum CombinedStreamItem {
     ZmqSeq(Result<SequenceMessage, SequenceStreamError>),
-    Response(Result<BatchedResponseItem, RequestError>),
+    Response(ResponseStreamItem),
+    /// Timeout while waiting to apply next sequence message
+    ApplySeqMessageTimeout,
     /// The sync was stopped
     Shutdown,
+}
+
+/// Polls streams in a round-robin manner
+struct CombinedStream<
+    'sequence_msgs,
+    'responses,
+    ApplySeqMsgTimeout,
+    ShutdownSignal,
+> {
+    pub sequence_msgs: stream::Fuse<SequenceStream<'sequence_msgs>>,
+    pub responses: stream::Fuse<BoxStream<'responses, ResponseStreamItem>>,
+    pub apply_seq_msg_timeout: future::Fuse<ApplySeqMsgTimeout>,
+    pub shutdown_signal: future::Fuse<ShutdownSignal>,
+    position: u8,
+}
+
+impl<'sequence_msgs, 'responses, ApplySeqMessageTimeout, ShutdownSignal>
+    CombinedStream<
+        'sequence_msgs,
+        'responses,
+        ApplySeqMessageTimeout,
+        ShutdownSignal,
+    >
+where
+    ApplySeqMessageTimeout: Future<Output = ()>,
+    ShutdownSignal: Future<Output = ()>,
+{
+    fn new(
+        sequence_msgs: SequenceStream<'sequence_msgs>,
+        responses: BoxStream<'responses, ResponseStreamItem>,
+        apply_seq_msg_timeout: ApplySeqMessageTimeout,
+        shutdown_signal: ShutdownSignal,
+    ) -> Self {
+        Self {
+            sequence_msgs: sequence_msgs.fuse(),
+            responses: responses.fuse(),
+            apply_seq_msg_timeout: apply_seq_msg_timeout.fuse(),
+            shutdown_signal: shutdown_signal.fuse(),
+            position: 0,
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        let Self {
+            sequence_msgs,
+            responses,
+            apply_seq_msg_timeout,
+            shutdown_signal,
+            position: _,
+        } = self;
+        sequence_msgs.is_done()
+            && responses.is_done()
+            && apply_seq_msg_timeout.is_terminated()
+            && shutdown_signal.is_terminated()
+    }
+}
+
+impl<'sequence_msgs, 'responses, ApplySeqMessageTimeout, ShutdownSignal> Stream
+    for CombinedStream<
+        'sequence_msgs,
+        'responses,
+        ApplySeqMessageTimeout,
+        ShutdownSignal,
+    >
+where
+    ApplySeqMessageTimeout: Future<Output = ()> + Send + Unpin,
+    ShutdownSignal: Future<Output = ()> + Send + Unpin,
+{
+    type Item = CombinedStreamItem;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let mut attempts = 0;
+        while attempts < 4 {
+            match self.position {
+                0 => {
+                    if !self.sequence_msgs.is_done()
+                        && let Poll::Ready(Some(res)) =
+                            self.sequence_msgs.poll_next_unpin(cx)
+                    {
+                        self.position = 1;
+                        return Poll::Ready(Some(CombinedStreamItem::ZmqSeq(
+                            res,
+                        )));
+                    }
+                }
+                1 => {
+                    if !self.responses.is_done()
+                        && let Poll::Ready(Some(res)) =
+                            self.responses.poll_next_unpin(cx)
+                    {
+                        self.position = 2;
+                        return Poll::Ready(Some(
+                            CombinedStreamItem::Response(res),
+                        ));
+                    }
+                }
+                2 => {
+                    if !self.apply_seq_msg_timeout.is_terminated()
+                        && let Poll::Ready(()) =
+                            self.apply_seq_msg_timeout.poll_unpin(cx)
+                    {
+                        self.position = 3;
+                        return Poll::Ready(Some(
+                            CombinedStreamItem::ApplySeqMessageTimeout,
+                        ));
+                    }
+                }
+                3 => {
+                    if !self.shutdown_signal.is_terminated()
+                        && let Poll::Ready(()) =
+                            self.shutdown_signal.poll_unpin(cx)
+                    {
+                        self.position = 0;
+                        return Poll::Ready(Some(CombinedStreamItem::Shutdown));
+                    }
+                }
+                _ => unreachable!(),
+            }
+            attempts += 1;
+            self.position = (self.position + 1) % 4;
+        }
+        if self.is_done() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    }
 }

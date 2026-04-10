@@ -1,8 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    convert::Infallible,
-    future::Future,
-    sync::Arc,
+    collections::HashMap, convert::Infallible, future::Future, sync::Arc,
 };
 
 use bitcoin::{
@@ -10,7 +7,10 @@ use bitcoin::{
     consensus::Decodable, hashes::Hash as _,
 };
 use educe::Educe;
-use futures::{StreamExt as _, future::BoxFuture, stream};
+use futures::{
+    StreamExt as _,
+    future::{BoxFuture, FutureExt as _},
+};
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
@@ -19,8 +19,9 @@ use tracing::{Instrument as _, instrument};
 
 use super::{
     super::{Conflicts, Mempool},
-    BatchedResponseItem, CombinedStreamItem, RequestError, RequestQueue,
-    ResponseItem, batched_request,
+    BatchedResponseItem, CombinedStream, CombinedStreamItem, RequestError,
+    RequestQueue, ResponseItem, SeqMessageQueue, SeqMessageQueueHead,
+    batched_request,
 };
 use crate::{
     cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
@@ -39,7 +40,7 @@ pub struct SyncState {
     /// Txs rejected by the CUSF enforcer
     rejected_txs: HashSet<Txid>,
     request_queue: RequestQueue,
-    seq_message_queue: VecDeque<SequenceMessage>,
+    seq_message_queue: SeqMessageQueue,
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: HashMap<Txid, Transaction>,
 }
@@ -51,6 +52,8 @@ pub enum SyncTaskError<Enforcer>
 where
     Enforcer: CusfEnforcer,
 {
+    #[error("Timeout while waiting to apply sequence message")]
+    ApplySeqMessageTimeout,
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
     #[error(transparent)]
@@ -269,8 +272,10 @@ where
         .chain
         .blocks
         .insert(resp_block.hash, resp_block.clone());
-    let Some(SequenceMessage::BlockHash(block_hash_msg)) =
-        sync_state.seq_message_queue.front()
+    let Some(SeqMessageQueueHead {
+        msg: SequenceMessage::BlockHash(block_hash_msg),
+        reached_head_time: _,
+    }) = sync_state.seq_message_queue.front()
     else {
         return Ok(());
     };
@@ -401,21 +406,33 @@ async fn try_apply_next_seq_message<Enforcer>(
 where
     Enforcer: CusfEnforcer,
 {
+    let Some(next_seq_msg) = sync_state.seq_message_queue.front() else {
+        tracing::trace!("no sequence messages to apply in queue");
+        return Ok(false);
+    };
     let res = 'res: {
-        match sync_state.seq_message_queue.front() {
-            Some(SequenceMessage::BlockHash(BlockHashMessage {
+        match next_seq_msg.msg {
+            SequenceMessage::BlockHash(BlockHashMessage {
                 block_hash,
                 event: BlockHashEvent::Disconnected,
                 ..
-            })) => {
-                if inner.mempool.chain.tip != *block_hash {
-                    tracing::debug!(block_hash = %block_hash, "Block hash mismatch, skipping");
+            }) => {
+                let mempool_tip = inner.mempool.chain.tip;
+                if mempool_tip != block_hash {
+                    tracing::debug!(
+                        %block_hash,
+                        %mempool_tip,
+                        "waiting for mempool tip to match before disconnecting"
+                    );
                     break 'res false;
                 };
                 let Some(block) =
-                    inner.mempool.chain.blocks.get(block_hash).cloned()
+                    inner.mempool.chain.blocks.get(&block_hash).cloned()
                 else {
-                    tracing::debug!(block_hash = %block_hash, "Block not found, skipping");
+                    tracing::debug!(
+                        %block_hash,
+                        "waiting for block to disconnect",
+                    );
                     break 'res false;
                 };
 
@@ -426,32 +443,50 @@ where
                     .unwrap_or_else(BlockHash::all_zeros);
                 true
             }
-            Some(SequenceMessage::TxHash(TxHashMessage {
+            SequenceMessage::TxHash(TxHashMessage {
                 txid,
                 event: TxHashEvent::Added,
                 mempool_seq: _,
                 zmq_seq: _,
-            })) => {
-                let txid = *txid;
-                try_add_tx_from_cache(inner, sync_state, &txid).await?
+            }) => {
+                let added =
+                    try_add_tx_from_cache(inner, sync_state, &txid).await?;
+                if !added {
+                    tracing::debug!(
+                        %txid,
+                        "waiting for tx to insert into mempool",
+                    );
+                }
+                added
             }
-            Some(SequenceMessage::TxHash(TxHashMessage {
+            SequenceMessage::TxHash(TxHashMessage {
                 txid,
                 event: TxHashEvent::Removed,
                 mempool_seq: _,
                 zmq_seq: _,
-            })) => {
+            }) => {
                 // FIXME: review -- looks sus
-                inner.mempool.remove(txid)?.is_some()
+                let removed = inner.mempool.remove(&txid)?.is_some();
+                if !removed {
+                    tracing::debug!(
+                        %txid,
+                        "waiting for tx to remove from mempool",
+                    );
+                }
+                removed
             }
-            Some(SequenceMessage::BlockHash(BlockHashMessage {
+            SequenceMessage::BlockHash(BlockHashMessage {
                 block_hash,
                 event: BlockHashEvent::Connected,
                 ..
-            })) => {
+            }) => {
                 let Some(block) =
-                    inner.mempool.chain.blocks.get(block_hash).cloned()
+                    inner.mempool.chain.blocks.get(&block_hash).cloned()
                 else {
+                    tracing::debug!(
+                        %block_hash,
+                        "waiting for block to connect"
+                    );
                     break 'res false;
                 };
                 let parent = block
@@ -461,7 +496,6 @@ where
                 let () = connect_block(inner, sync_state, &block).await?;
                 true
             }
-            None => false,
         }
     };
     if res {
@@ -605,7 +639,7 @@ where
     let mut sync_state = SyncState {
         rejected_txs,
         request_queue,
-        seq_message_queue: VecDeque::new(),
+        seq_message_queue: SeqMessageQueue::default(),
         tx_cache,
     };
     let response_stream = sync_state
@@ -613,9 +647,28 @@ where
         .clone()
         .then(|request| batched_request(&rpc_client, request))
         .boxed();
-    let mut combined_stream = stream::select(
-        sequence_stream.map(CombinedStreamItem::ZmqSeq),
-        response_stream.map(CombinedStreamItem::Response),
+
+    let apply_seq_msg_timeout = |seq_msg_queue: &SeqMessageQueue| {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        let sleep_until = seq_msg_queue
+            .front()
+            .as_ref()
+            .map(|front| front.reached_head_time + TIMEOUT);
+        async move {
+            if let Some(sleep_until) = sleep_until {
+                tokio::time::sleep_until(sleep_until.into()).await
+            } else {
+                futures::future::pending().await
+            }
+        }
+        .boxed()
+    };
+
+    let mut combined_stream = CombinedStream::new(
+        sequence_stream,
+        response_stream,
+        apply_seq_msg_timeout(&sync_state.seq_message_queue),
+        futures::future::pending(),
     );
     loop {
         let msg = combined_stream
@@ -626,6 +679,9 @@ where
         let msg_kind = match &msg {
             CombinedStreamItem::ZmqSeq(_) => "sequence",
             CombinedStreamItem::Response(_) => "response",
+            CombinedStreamItem::ApplySeqMessageTimeout => {
+                "apply seq msg timeout"
+            }
             CombinedStreamItem::Shutdown => "shutdown",
         };
 
@@ -641,11 +697,18 @@ where
                 handle_seq_message(&mut sync_state, seq_msg?)
                     .instrument(span)
                     .await;
+                combined_stream.apply_seq_msg_timeout =
+                    apply_seq_msg_timeout(&sync_state.seq_message_queue).fuse();
             }
             CombinedStreamItem::Response(resp) => {
                 handle_resp(&inner, &mut sync_state, resp?)
                     .instrument(span)
                     .await?;
+                combined_stream.apply_seq_msg_timeout =
+                    apply_seq_msg_timeout(&sync_state.seq_message_queue).fuse();
+            }
+            CombinedStreamItem::ApplySeqMessageTimeout => {
+                return Err(SyncTaskError::ApplySeqMessageTimeout);
             }
             CombinedStreamItem::Shutdown => {
                 tracing::info!(parent: &span, "shutdown signal received, aborting");
