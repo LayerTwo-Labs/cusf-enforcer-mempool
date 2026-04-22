@@ -9,12 +9,17 @@ version = "0.3.0"
 license-file = "LICENSE.txt"
 publish = false
 
+[workspace.dependencies]
+anyhow = "1.0.86"
+bitcoin = { version = "0.32.2", features = ["serde"] }
+futures = "0.3.30"
+jsonrpsee = "0.26.0"
+tokio = "1.38.0"
+tracing = "0.1.40"
+
 [workspace.dependencies.bitcoin-jsonrpsee]
 git = "https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git"
-rev = "b21948fb434b8fd76bc6a2deeeb2133e7bd78a63"
-
-[workspace.dependencies.futures]
-version = "0.3.30"
+rev = "db1fdfd5ecddfc7855cd872546b47429cb29a0bf"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
