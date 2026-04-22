@@ -22,7 +22,7 @@ imbl = "7.0.0"
 indexmap = "2.4.0"
 jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
 lending-iterator = "0.1.7"
-nonempty = "0.11.0"
+nonempty = "0.12.0"
 num-traits = "0.2.19"
 parking_lot = "0.12.3"
 serde = { version = "1.0.208", features = ["derive"] }
