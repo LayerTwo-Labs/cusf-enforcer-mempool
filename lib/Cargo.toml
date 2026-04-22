@@ -26,7 +26,7 @@ nonempty = "0.12.0"
 num-traits = "0.2.19"
 parking_lot = "0.12.3"
 serde = { version = "1.0.208", features = ["derive"] }
-thiserror = "1.0.63"
+thiserror = "2.0.17"
 tokio = { workspace = true }
 tracing = { workspace = true }
 typewit = "1.11.0"
