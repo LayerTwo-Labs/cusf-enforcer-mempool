@@ -30,7 +30,7 @@ thiserror = "2.0.17"
 tokio = { workspace = true }
 tracing = { workspace = true }
 typewit = "1.11.0"
-zeromq = "0.4.1"
+zeromq = "0.5.0"
 ulid = "1.2.1"
 
 [lints]
