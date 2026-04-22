@@ -11,8 +11,6 @@ anyhow = { workspace = true }
 async-trait = "0.1.81"
 bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
 bitcoin = { workspace = true }
-blake3 = "1.8.4"
-borsh = "1.6.1"
 chrono = "0.4.44"
 educe = "0.6.0"
 either = "1.13.0"
@@ -23,9 +21,7 @@ indexmap = "2.14.0"
 jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
 lending-iterator = "0.1.7"
 nonempty = "0.12.0"
-num-traits = "0.2.19"
 parking_lot = "0.12.3"
-serde = { version = "1.0.208", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { workspace = true }
 tracing = { workspace = true }
