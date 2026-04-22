@@ -7,15 +7,15 @@ publish.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow = "1.0.86"
-bitcoin = { version = "0.32.2", features = ["serde"] }
+anyhow = { workspace = true }
+bitcoin = { workspace = true }
 bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
 clap = { version = "4.5.15", features = ["derive"] }
 cusf-enforcer-mempool = { path = "../lib" }
 futures = { workspace = true }
-jsonrpsee = { version = "0.25.1", features = ["macros", "server"] }
-tokio = { version = "1.38.0", features = ["rt-multi-thread"] }
-tracing = "0.1.40"
+jsonrpsee = { workspace = true, features = ["macros", "server"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing = { workspace = true }
 tracing-subscriber = "0.3.18"
 
 [lints]

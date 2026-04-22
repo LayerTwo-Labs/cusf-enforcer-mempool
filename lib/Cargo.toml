@@ -7,10 +7,10 @@ publish.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow = "1.0.86"
+anyhow = { workspace = true }
 async-trait = "0.1.81"
 bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
-bitcoin = { version = "0.32.2", features = ["serde"] }
+bitcoin = { workspace = true }
 blake3 = "1.5.3"
 borsh = "1.5.1"
 chrono = "0.4.38"
@@ -20,15 +20,15 @@ futures = { workspace = true }
 hashlink = "0.10.0"
 imbl = "3.0.0"
 indexmap = "2.4.0"
-jsonrpsee = { version = "0.25.1", features = ["client", "macros", "server"] }
+jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
 lending-iterator = "0.1.7"
 nonempty = "0.11.0"
 num-traits = "0.2.19"
 parking_lot = "0.12.3"
 serde = { version = "1.0.208", features = ["derive"] }
 thiserror = "1.0.63"
-tokio = "1.38.0"
-tracing = "0.1.40"
+tokio = { workspace = true }
+tracing = { workspace = true }
 typewit = "1.11.0"
 zeromq = "0.4.1"
 ulid = "1.2.1"
