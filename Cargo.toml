@@ -10,12 +10,12 @@ license-file = "LICENSE.txt"
 publish = false
 
 [workspace.dependencies]
-anyhow = "1.0.86"
-bitcoin = { version = "0.32.2", features = ["serde"] }
-futures = "0.3.30"
+anyhow = "1.0.102"
+bitcoin = { version = "0.32.8", features = ["serde"] }
+futures = "0.3.32"
 jsonrpsee = "0.26.0"
-tokio = "1.38.0"
-tracing = "0.1.40"
+tokio = "1.50.0"
+tracing = "0.1.44"
 
 [workspace.dependencies.bitcoin-jsonrpsee]
 git = "https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git"
