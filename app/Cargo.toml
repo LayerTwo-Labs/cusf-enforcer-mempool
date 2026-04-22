@@ -10,13 +10,13 @@ version.workspace = true
 anyhow = { workspace = true }
 bitcoin = { workspace = true }
 bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
-clap = { version = "4.5.15", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
 cusf-enforcer-mempool = { path = "../lib" }
 futures = { workspace = true }
 jsonrpsee = { workspace = true, features = ["macros", "server"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing = { workspace = true }
-tracing-subscriber = "0.3.18"
+tracing-subscriber = "0.3.23"
 
 [lints]
 workspace = true
