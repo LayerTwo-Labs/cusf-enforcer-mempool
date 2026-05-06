@@ -8,27 +8,26 @@ version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-async-trait = "0.1.81"
+async-trait = { workspace = true }
 bitcoin-jsonrpsee = { workspace = true, features = ["tracing"] }
 bitcoin = { workspace = true }
-chrono = "0.4.44"
-educe = "0.6.0"
-either = "1.13.0"
+chrono = { workspace = true }
+educe = { workspace = true }
+either = { workspace = true }
 futures = { workspace = true }
-hashlink = "0.11.0"
-imbl = "7.0.0"
-indexmap = "2.14.0"
+hashlink = { workspace = true }
+imbl = { workspace = true }
+indexmap = { workspace = true }
 jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
-lending-iterator = "0.1.7"
-nonempty = "0.12.0"
-parking_lot = "0.12.3"
-# pinned due to a bug in fatality
-thiserror = "=2.0.16"
+lending-iterator = { workspace = true }
+nonempty = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-typewit = "1.15.2"
-zeromq = "0.5.0"
-ulid = "1.2.1"
+typewit = { workspace = true }
+ulid = { workspace = true }
+zeromq = { workspace = true }
 
 [lints]
 workspace = true
