@@ -9,7 +9,7 @@ use tokio::time::Duration;
 use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 
 use cusf_enforcer_mempool::{
-    cusf_enforcer::DefaultEnforcer,
+    cusf_enforcer::{Cancellable, DefaultEnforcer},
     mempool::{self, MempoolSync},
     server,
 };
@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
         let shutdown_signal = async move {
             let _ = shutdown_rx.await;
         };
-        mempool::init_sync_mempool(
+        match mempool::init_sync_mempool(
             &mut enforcer,
             network,
             &rpc_client,
@@ -107,6 +107,13 @@ async fn main() -> anyhow::Result<()> {
             shutdown_signal,
         )
         .await?
+        {
+            Cancellable::Completed(res) => res,
+            Cancellable::Cancelled => {
+                tracing::info!("Initial mempool sync cancelled");
+                return Ok(());
+            }
+        }
     };
     tracing::info!("Initial mempool sync complete");
     let mempool = MempoolSync::new(
