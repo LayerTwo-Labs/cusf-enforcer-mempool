@@ -92,19 +92,16 @@ async fn main() -> anyhow::Result<()> {
             })?
     };
     // We're not actually going to send anything on the shutdown signal.
-    let (_, shutdown_rx) = futures::channel::oneshot::channel::<()>();
+    let shutdown_signal = futures::future::pending();
 
     let mut enforcer = DefaultEnforcer;
     let (sequence_stream, mempool, tx_cache) = {
-        let shutdown_signal = async move {
-            let _ = shutdown_rx.await;
-        };
         match mempool::init_sync_mempool(
             &mut enforcer,
             network,
             &rpc_client,
             &cli.node_zmq_addr_sequence,
-            shutdown_signal,
+            shutdown_signal.clone(),
         )
         .await?
         {
@@ -116,16 +113,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     tracing::info!("Initial mempool sync complete");
-    let mempool = MempoolSync::new(
+    let (mempool, mempool_task) = MempoolSync::new(
         enforcer,
         mempool,
         tx_cache,
         rpc_client.clone(),
         sequence_stream,
-        |err| async {
-            let err = anyhow::Error::from(err);
-            tracing::error!("{err:#}")
-        },
+        shutdown_signal,
     );
     let server = server::Server::new(
         mining_reward_address.script_pubkey(),
@@ -138,6 +132,11 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let rpc_server_handle =
         spawn_rpc_server(server, cli.serve_rpc_addr).await?;
-    let () = rpc_server_handle.stopped().await;
-    Ok(())
+    tokio::select! {
+        _ = rpc_server_handle.stopped() => Ok(()),
+        mempool_task_res = mempool_task => match mempool_task_res {
+            Ok(Cancellable::Cancelled) => Ok(()),
+            Err(err) => Err(anyhow::Error::from(err)),
+        }
+    }
 }
