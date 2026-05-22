@@ -9,6 +9,7 @@ use cusf_enforcer_mempool::{
     cusf_enforcer::CusfEnforcer,
     mempool::{self, MempoolSync, SyncTaskError},
 };
+use futures::FutureExt;
 use parking_lot::Mutex;
 use reserve_port::ReservedPort;
 use temp_dir::TempDir;
@@ -180,12 +181,12 @@ pub async fn start_mempool_sync<E>(
 where
     E: CusfEnforcer + Clone + Send + Sync + 'static,
 {
-    let (sequence_stream, mempool, tx_cache) = mempool::init_sync_mempool(
+    let mempool_synced = mempool::init_sync_mempool(
         &mut enforcer,
         Network::Regtest,
-        &node.rpc_client,
+        node.rpc_client.clone(),
         &node.bitcoind.zmq_addr(),
-        std::future::pending::<()>(),
+        std::future::pending::<()>().fuse(),
     )
     .await
     .context("init_sync_mempool")?;
@@ -194,10 +195,7 @@ where
     let errors_for_handler = task_errors.clone();
     let mempool_sync = MempoolSync::new(
         enforcer,
-        mempool,
-        tx_cache,
-        node.rpc_client.clone(),
-        sequence_stream,
+        mempool_synced,
         move |err: SyncTaskError<E>| async move {
             let msg = format!("{err:#}");
             tracing::error!(err = %msg, "MempoolSync task error");

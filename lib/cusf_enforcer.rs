@@ -135,13 +135,13 @@ where
 // 4. If best block hash has changed, drop messages up to and including
 //    (dis)connecting to best block hash, and go to step 2.
 #[instrument(skip_all)]
-pub async fn initial_sync<'a, Enforcer, MainClient, Signal>(
+pub async fn initial_sync<Enforcer, MainClient, Signal>(
     enforcer: &mut Enforcer,
     main_client: &MainClient,
     zmq_addr_sequence: &str,
     shutdown_signal: Signal,
 ) -> Result<
-    (BlockHash, crate::zmq::SequenceStream<'a>),
+    (BlockHash, crate::zmq::SequenceStream<'static>),
     InitialSyncError<Enforcer>,
 >
 where
@@ -398,58 +398,36 @@ where
         &mut self,
         block: &bitcoin::Block,
     ) -> Result<ConnectBlockAction, Self::ConnectBlockError> {
-        let res_left = self
+        let mut remove_mempool_txs = match self
             .0
             .connect_block(block)
             .map_err(|err| {
                 Self::ConnectBlockError::ConnectBlock(Either::Left(err))
             })
-            .await?;
-        let res_right = self
+            .await?
+        {
+            ConnectBlockAction::Accept { remove_mempool_txs } => {
+                remove_mempool_txs
+            }
+            ConnectBlockAction::Reject => {
+                return Ok(ConnectBlockAction::Reject);
+            }
+        };
+        match self
             .1
             .connect_block(block)
             .map_err(|err| {
                 Self::ConnectBlockError::ConnectBlock(Either::Right(err))
             })
-            .await?;
-        match (res_left, res_right) {
-            (
-                ConnectBlockAction::Accept {
-                    mut remove_mempool_txs,
-                },
-                ConnectBlockAction::Accept {
-                    remove_mempool_txs: txs_right,
-                },
-            ) => {
+            .await?
+        {
+            ConnectBlockAction::Accept {
+                remove_mempool_txs: txs_right,
+            } => {
                 remove_mempool_txs.extend(txs_right);
                 Ok(ConnectBlockAction::Accept { remove_mempool_txs })
             }
-            (
-                ConnectBlockAction::Reject,
-                ConnectBlockAction::Accept {
-                    remove_mempool_txs: _,
-                },
-            ) => {
-                // Disconnect block on right enforcer
-                let DisconnectBlockAction {
-                    remove_mempool_txs: _,
-                } = self
-                    .1
-                    .disconnect_block(block.block_hash())
-                    .map_err(|err| {
-                        Self::ConnectBlockError::DisconnectBlock(Either::Right(
-                            err,
-                        ))
-                    })
-                    .await?;
-                Ok(ConnectBlockAction::Reject)
-            }
-            (
-                ConnectBlockAction::Accept {
-                    remove_mempool_txs: _,
-                },
-                ConnectBlockAction::Reject,
-            ) => {
+            ConnectBlockAction::Reject => {
                 // Disconnect block on left enforcer
                 let DisconnectBlockAction {
                     remove_mempool_txs: _,
@@ -462,9 +440,6 @@ where
                         ))
                     })
                     .await?;
-                Ok(ConnectBlockAction::Reject)
-            }
-            (ConnectBlockAction::Reject, ConnectBlockAction::Reject) => {
                 Ok(ConnectBlockAction::Reject)
             }
         }

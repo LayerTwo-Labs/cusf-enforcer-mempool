@@ -18,7 +18,7 @@ use bitcoin_jsonrpsee::{
 };
 
 use futures::{
-    future::{self, BoxFuture, FusedFuture, FutureExt as _},
+    future::{BoxFuture, FusedFuture, FutureExt as _},
     stream::{self, BoxStream, Stream, StreamExt as _},
 };
 use hashlink::LinkedHashSet;
@@ -31,18 +31,18 @@ use crate::zmq::{
     SequenceStreamError, TxHashEvent, TxHashMessage,
 };
 
-mod initial_sync;
+mod abandoned_pool;
 pub(in crate::mempool) mod task;
 
-pub use initial_sync::{
-    SyncMempoolError as InitialSyncMempoolError, init_sync_mempool,
-};
 pub use task::MempoolSync;
+pub use task::{SyncTaskError as InitialSyncMempoolError, init_sync_mempool};
 
 /// Items requested while syncing
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum RequestItem {
     Block(BlockHash),
+    /// Reject a block
+    RejectBlock(BlockHash),
     /// Reject a tx
     RejectTx(Txid),
     /// Bool indicating if the tx is a mempool tx.
@@ -58,6 +58,22 @@ enum BatchedRequestItem {
     /// `false` if the tx is needed as a dependency for a mempool tx
     BatchTx(NonEmpty<(Txid, bool)>),
     Single(RequestItem),
+}
+
+impl BatchedRequestItem {
+    /// The bitcoind RPC method this request is dispatched as.
+    fn rpc_method(&self) -> &'static str {
+        match self {
+            Self::BatchRejectTx(_) | Self::Single(RequestItem::RejectTx(_)) => {
+                "prioritisetransaction"
+            }
+            Self::Single(RequestItem::RejectBlock(_)) => "invalidateblock",
+            Self::BatchTx(_) | Self::Single(RequestItem::Tx(..)) => {
+                "getrawtransaction"
+            }
+            Self::Single(RequestItem::Block(_)) => "getblock",
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -107,9 +123,9 @@ impl Stream for RequestQueue {
         let mut queue_lock = self.inner.queue.lock();
         *self.inner.waker.lock() = Some(cx.waker().clone());
         match queue_lock.pop_front() {
-            Some(request @ RequestItem::Block(_)) => {
-                Poll::Ready(Some(BatchedRequestItem::Single(request)))
-            }
+            Some(
+                request @ (RequestItem::Block(_) | RequestItem::RejectBlock(_)),
+            ) => Poll::Ready(Some(BatchedRequestItem::Single(request))),
             Some(RequestItem::RejectTx(txid)) => {
                 let mut txids = NonEmpty::new(txid);
                 while let Some(&RequestItem::RejectTx(txid)) =
@@ -342,6 +358,7 @@ impl From<bool> for ApplySyncActionResult {
 #[derive(Clone, Debug)]
 enum ResponseItem {
     Block(Box<bitcoin_jsonrpsee::client::Block<true>>),
+    RejectBlock,
     RejectTx,
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
@@ -356,21 +373,6 @@ enum BatchedResponseItem {
     /// `false` if the tx is needed as a dependency for a mempool tx
     BatchTx(Vec<(Transaction, bool)>),
     Single(ResponseItem),
-}
-
-impl BatchedRequestItem {
-    /// The bitcoind RPC method this request is dispatched as.
-    fn rpc_method(&self) -> &'static str {
-        match self {
-            Self::BatchRejectTx(_) | Self::Single(RequestItem::RejectTx(_)) => {
-                "prioritisetransaction"
-            }
-            Self::BatchTx(_) | Self::Single(RequestItem::Tx(..)) => {
-                "getrawtransaction"
-            }
-            Self::Single(RequestItem::Block(_)) => "getblock",
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -464,6 +466,14 @@ where
             let resp = ResponseItem::Block(Box::new(block));
             Ok(BatchedResponseItem::Single(resp))
         }
+        BatchedRequestItem::Single(RequestItem::RejectBlock(block_hash)) => {
+            let () = rpc_client
+                .invalidate_block(block_hash)
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+            let resp = ResponseItem::RejectBlock;
+            Ok(BatchedResponseItem::Single(resp))
+        }
         BatchedRequestItem::Single(RequestItem::RejectTx(txid)) => {
             // set priority fee to extremely negative so that it is cleared
             // from mempool as soon as possible
@@ -516,8 +526,8 @@ struct CombinedStream<
 > {
     pub sequence_msgs: stream::Fuse<SequenceStream<'sequence_msgs>>,
     pub responses: stream::Fuse<BoxStream<'responses, ResponseStreamItem>>,
-    pub apply_sync_action_timeout: future::Fuse<ApplySyncActionTimeout>,
-    pub shutdown_signal: future::Fuse<ShutdownSignal>,
+    pub apply_sync_action_timeout: ApplySyncActionTimeout,
+    pub shutdown_signal: ShutdownSignal,
     position: u8,
 }
 
@@ -529,8 +539,8 @@ impl<'sequence_msgs, 'responses, ApplySyncActionTimeout, ShutdownSignal>
         ShutdownSignal,
     >
 where
-    ApplySyncActionTimeout: Future<Output = ()>,
-    ShutdownSignal: Future<Output = ()>,
+    ApplySyncActionTimeout: FusedFuture<Output = ()>,
+    ShutdownSignal: FusedFuture<Output = ()>,
 {
     fn new(
         sequence_msgs: SequenceStream<'sequence_msgs>,
@@ -541,8 +551,8 @@ where
         Self {
             sequence_msgs: sequence_msgs.fuse(),
             responses: responses.fuse(),
-            apply_sync_action_timeout: apply_sync_action_timeout.fuse(),
-            shutdown_signal: shutdown_signal.fuse(),
+            apply_sync_action_timeout,
+            shutdown_signal,
             position: 0,
         }
     }
@@ -570,8 +580,8 @@ impl<'sequence_msgs, 'responses, ApplySeqMessageTimeout, ShutdownSignal> Stream
         ShutdownSignal,
     >
 where
-    ApplySeqMessageTimeout: Future<Output = ()> + Send + Unpin,
-    ShutdownSignal: Future<Output = ()> + Send + Unpin,
+    ApplySeqMessageTimeout: FusedFuture<Output = ()> + Send + Unpin,
+    ShutdownSignal: FusedFuture<Output = ()> + Send + Unpin,
 {
     type Item = CombinedStreamItem;
 

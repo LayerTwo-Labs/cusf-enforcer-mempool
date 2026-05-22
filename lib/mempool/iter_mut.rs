@@ -77,8 +77,10 @@ impl<'mempool_txs> LendingIterator for AncestorsMut<'mempool_txs> {
 
 type DescendantsItem<'a> = (&'a Transaction, &'a mut TxInfo);
 
-/// Iterator over descendants, including the specified txid, where ancestors
-/// occur before descendants
+/// Iterator over descendants, including the specified txid, where
+/// closer descendants occur before further descendants.
+/// This is NOT a preorder iterator, and ancestors are not guaranteed to occur
+/// before descendants.
 pub struct DescendantsMut<'mempool_txs> {
     mempool_txs: &'mempool_txs mut MempoolTxs,
     to_visit: VecDeque<Txid>,
@@ -133,8 +135,10 @@ impl MempoolTxs {
         }
     }
 
-    /// Iterator over descendants, including the specified txid, where ancestors
-    /// occur before descendants
+    /// Iterator over descendants, including the specified txid, where
+    /// closer descendants occur before further descendants.
+    /// This is NOT a preorder iterator, and ancestors are not guaranteed to
+    /// occur before descendants.
     pub fn descendants_mut(&mut self, txid: Txid) -> DescendantsMut<'_> {
         DescendantsMut {
             mempool_txs: self,

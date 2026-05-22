@@ -4,6 +4,7 @@ use bitcoin_jsonrpsee::{
     MainClient as _, jsonrpsee::http_client::HttpClientBuilder,
 };
 use clap::Parser;
+use futures::FutureExt;
 use jsonrpsee::server::ServerHandle;
 use tokio::time::Duration;
 use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
@@ -95,31 +96,22 @@ async fn main() -> anyhow::Result<()> {
     let (_, shutdown_rx) = futures::channel::oneshot::channel::<()>();
 
     let mut enforcer = DefaultEnforcer;
-    let (sequence_stream, mempool, tx_cache) = {
-        let shutdown_signal = async move {
-            let _ = shutdown_rx.await;
-        };
+    let mempool_synced = {
+        let shutdown_signal = shutdown_rx.map(|_: Result<_, _>| ());
         mempool::init_sync_mempool(
             &mut enforcer,
             network,
-            &rpc_client,
+            rpc_client.clone(),
             &cli.node_zmq_addr_sequence,
-            shutdown_signal,
+            shutdown_signal.fuse(),
         )
         .await?
     };
     tracing::info!("Initial mempool sync complete");
-    let mempool = MempoolSync::new(
-        enforcer,
-        mempool,
-        tx_cache,
-        rpc_client.clone(),
-        sequence_stream,
-        |err| async {
-            let err = anyhow::Error::from(err);
-            tracing::error!("{err:#}")
-        },
-    );
+    let mempool = MempoolSync::new(enforcer, mempool_synced, |err| async {
+        let err = anyhow::Error::from(err);
+        tracing::error!("{err:#}")
+    });
     let server = server::Server::new(
         mining_reward_address.script_pubkey(),
         mempool,
