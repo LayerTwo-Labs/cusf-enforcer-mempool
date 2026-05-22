@@ -2,7 +2,6 @@ pub mod mock_enforcer;
 pub mod setup;
 pub mod test_accept_tx_paths;
 pub mod test_block_connect_smoke;
-pub mod test_compose_drops_remove_mempool_txs;
 pub mod test_double_insert_after_reorg;
 pub mod test_enforcer_rejection_during_reorg;
 pub mod test_rbf_removed_for_absent_tx;

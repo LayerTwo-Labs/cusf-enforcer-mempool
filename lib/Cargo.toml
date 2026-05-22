@@ -22,8 +22,10 @@ jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
 lending-iterator = { workspace = true }
 nonempty = { workspace = true }
 parking_lot = { workspace = true }
+polonius-the-crab = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 typewit = { workspace = true }
 ulid = { workspace = true }

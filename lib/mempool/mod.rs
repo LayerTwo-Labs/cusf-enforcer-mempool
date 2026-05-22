@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::HashMap;
 
 use bitcoin::{BlockHash, Network, Target, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
@@ -324,56 +324,6 @@ pub enum MempoolUpdateError {
     MissingDescendant(#[from] MissingDescendantError),
 }
 
-/// Description of conflicts between txs
-#[derive(Debug, Default)]
-pub(crate) struct Conflicts(
-    /// Conflicts between txids a and b, where a < b, are stored by inserting
-    /// b into the set of conflicts with a.
-    BTreeMap<Txid, std::collections::HashSet<Txid>>,
-);
-
-impl Conflicts {
-    fn insert(&mut self, txid_a: Txid, txid_b: Txid) {
-        let (txid_lo, txid_hi) = match txid_a.cmp(&txid_b) {
-            std::cmp::Ordering::Less => (txid_a, txid_b),
-            std::cmp::Ordering::Equal => return,
-            std::cmp::Ordering::Greater => (txid_b, txid_a),
-        };
-        self.0.entry(txid_lo).or_default().insert(txid_hi);
-    }
-
-    /// Iterate over conflicts, where the first element is the lower txid.
-    /// Each conflict will be visited only once - if txids `a` and `b` conflict,
-    /// where `a < b`, the conflict will be expressed as `(a, conflicts_a)`,
-    /// where `b` is an element of `conflicts_a`.
-    /// If `b` is visited, as `(b, conflicts_b)`, then `a` will not be an
-    /// element of `conflicts_b`.
-    fn iter(
-        &self,
-    ) -> impl Iterator<Item = (&Txid, &std::collections::HashSet<Txid>)> {
-        self.0.iter()
-    }
-
-    /// Iterate over conflicts, where the first element is the greater txid.
-    /// Each conflict will be visited only once - if txids `a` and `b` conflict,
-    /// where `a > b`, the conflict will be expressed as `(a, conflicts_a)`,
-    /// where `b` is an element of `conflicts_a`.
-    /// If `b` is visited, as `(b, conflicts_b)`, then `a` will not be an
-    /// element of `conflicts_b`.
-    fn iter_inverted(
-        self,
-    ) -> impl Iterator<Item = (Txid, std::collections::HashSet<Txid>)> {
-        let mut inverted =
-            BTreeMap::<Txid, std::collections::HashSet<Txid>>::new();
-        for (txid_lo, conflicts) in self.0 {
-            for txid_hi in conflicts {
-                inverted.entry(txid_hi).or_default().insert(txid_lo);
-            }
-        }
-        inverted.into_iter()
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 struct ByAncestorFeeRate(
     OrdMap<refinement_cmp::RefinementCmp<FeeRate>, LinkedHashSet<Txid>>,
@@ -518,12 +468,6 @@ pub const MAX_USABLE_BLOCK_WEIGHT: Weight = {
 #[inline(always)]
 fn saturating_add_weight(lhs: Weight, rhs: Weight) -> Weight {
     let res_wu = lhs.to_wu().saturating_add(rhs.to_wu());
-    Weight::from_wu(res_wu)
-}
-
-#[inline(always)]
-fn saturating_add_signed_weight(lhs: Weight, rhs_wu: i64) -> Weight {
-    let res_wu = lhs.to_wu().saturating_add_signed(rhs_wu);
     Weight::from_wu(res_wu)
 }
 
@@ -816,19 +760,33 @@ impl Mempool {
     }
 
     /// Remove a tx from mempool, and all descendants.
-    /// Returns the removed tx and descendants.
+    /// Returns the removed tx (if it was present) and any descendants.
     fn remove_with_descendants(
         &mut self,
         txid: &Txid,
     ) -> Result<LinkedHashMap<Txid, Transaction>, MempoolRemoveError> {
         let mut res = LinkedHashMap::new();
-        let mut remove_stack = VecDeque::from_iter([*txid]);
-        while let Some(next) = remove_stack.pop_front() {
-            let Some((tx, tx_info)) = self.remove(&next)? else {
-                continue;
+        if let Some((tx, _tx_info)) = self.remove(txid)? {
+            res.replace(*txid, tx);
+        }
+        let mut remove_stack = LinkedHashSet::<Txid>::from_iter(
+            self.tx_childs
+                .0
+                .get(txid)
+                .iter()
+                .flat_map(|tx_childs| tx_childs.iter().cloned()),
+        );
+        while let Some(txid) = remove_stack.pop_front() {
+            if let Some((tx, _tx_info)) = self.remove(&txid)? {
+                res.replace(txid, tx);
             };
-            remove_stack.extend(tx_info.spent_by);
-            res.replace(next, tx);
+            remove_stack.extend(
+                self.tx_childs
+                    .0
+                    .get(&txid)
+                    .iter()
+                    .flat_map(|tx_childs| tx_childs.iter().cloned()),
+            );
         }
         Ok(res)
     }
@@ -905,117 +863,6 @@ impl Mempool {
             }
         }
         Ok(res)
-    }
-
-    /// Add a set of conflicts between txs
-    fn add_conflicts(
-        &mut self,
-        conflicts: Conflicts,
-    ) -> Result<(), MempoolUpdateError> {
-        for (txid_lo, conflict_txids) in conflicts.iter() {
-            if !self.txs.0.contains_key(txid_lo) {
-                continue;
-            }
-            let conflict_txids = OrdSet::from(conflict_txids);
-            if conflict_txids.is_empty() {
-                break;
-            }
-            self.txs.descendants_mut(*txid_lo).try_for_each(
-                |descendant_info| {
-                    let (_desc_tx, desc_info) = descendant_info?;
-                    desc_info.conflicts_with = desc_info
-                        .conflicts_with
-                        .clone()
-                        .union(conflict_txids.clone());
-                    Result::<_, MissingDescendantError>::Ok(())
-                },
-            )?;
-        }
-        for (txid_hi, conflict_txids) in conflicts.iter_inverted() {
-            if !self.txs.0.contains_key(&txid_hi) {
-                continue;
-            }
-            let conflict_txids = OrdSet::from(conflict_txids);
-            if conflict_txids.is_empty() {
-                break;
-            }
-            self.txs.descendants_mut(txid_hi).try_for_each(
-                |descendant_info| {
-                    let (_desc_tx, desc_info) = descendant_info?;
-                    desc_info.conflicts_with = desc_info
-                        .conflicts_with
-                        .clone()
-                        .union(conflict_txids.clone());
-                    Result::<_, MissingDescendantError>::Ok(())
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Tweak the weight for a tx
-    fn tweak_weight(
-        &mut self,
-        txid: Txid,
-        tweak: i64,
-    ) -> Result<(), MempoolRemoveError> {
-        if tweak == 0 {
-            return Ok(());
-        }
-        let Some((_, tx_info)) = self.txs.0.get_mut(&txid) else {
-            return Ok(());
-        };
-        let modified_weight =
-            saturating_add_signed_weight(tx_info.modified_weight, tweak);
-        // weight amount that was actually tweaked. May have lower absolute
-        // value due to saturating addition
-        let tweaked_wu = if tweak >= 0 {
-            (modified_weight - tx_info.modified_weight).to_wu() as i64
-        } else {
-            -((tx_info.modified_weight - modified_weight).to_wu() as i64)
-        };
-        tx_info.modified_weight = modified_weight;
-        tx_info.descendant_modified_weight = saturating_add_signed_weight(
-            tx_info.descendant_modified_weight,
-            tweaked_wu,
-        );
-        self.txs.ancestors_mut(txid).try_for_each(|ancestor_info| {
-            let (_, anc_info) = ancestor_info?;
-            anc_info.descendant_modified_weight = saturating_add_signed_weight(
-                anc_info.descendant_modified_weight,
-                tweaked_wu,
-            );
-            Ok::<_, MempoolRemoveError>(())
-        })?;
-        self.txs
-            .descendants_mut(txid)
-            .try_for_each(|descendant_info| {
-                let (desc_tx, desc_info) = descendant_info?;
-                let desc_txid = desc_tx.compute_txid();
-                let mut ancestor_fee_rate = FeeRate {
-                    fee: desc_info.fees.ancestor,
-                    vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
-                };
-                if !self
-                    .by_ancestor_fee_rate
-                    .remove(ancestor_fee_rate, desc_txid)
-                {
-                    let err =
-                        MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
-                    return Err(err.into());
-                };
-                desc_info.ancestor_modified_weight =
-                    saturating_add_signed_weight(
-                        desc_info.ancestor_modified_weight,
-                        tweaked_wu,
-                    );
-                ancestor_fee_rate.vsize =
-                    desc_info.ancestor_modified_weight.to_vbytes_ceil();
-                self.by_ancestor_fee_rate
-                    .insert(ancestor_fee_rate, desc_txid);
-                Ok::<_, MempoolRemoveError>(())
-            })?;
-        Ok(())
     }
 
     /// choose txs for a block proposal, mutating the underlying mempool.
@@ -1173,24 +1020,5 @@ mod tests {
         let result = mempool.insert(tx, 100, OrdSet::unit(absent_txid), weight);
 
         assert!(result.is_ok(), "insert failed: {result:?}");
-    }
-
-    /// Same scenario through `add_conflicts`: conflict references a txid
-    /// that is no longer in the mempool.
-    #[test]
-    fn add_conflicts_with_nonexistent_txid_succeeds() {
-        let mut mempool = test_mempool();
-
-        let tx = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
-        let txid = tx.compute_txid();
-        let weight = tx.weight();
-        mempool.insert(tx, 100, OrdSet::new(), weight).unwrap();
-
-        let absent_txid = Txid::from_byte_array([0x42; 32]);
-        let mut conflicts = Conflicts::default();
-        conflicts.insert(txid, absent_txid);
-
-        let result = mempool.add_conflicts(conflicts);
-        assert!(result.is_ok(), "add_conflicts failed: {result:?}");
     }
 }
