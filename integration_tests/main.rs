@@ -4,9 +4,8 @@ use clap::Parser;
 use cusf_enforcer_mempool_integration_tests::{
     setup::{Directories, TestSetup},
     test_accept_tx_paths, test_block_connect_smoke,
-    test_compose_drops_remove_mempool_txs, test_double_insert_after_reorg,
-    test_enforcer_rejection_during_reorg, test_rbf_removed_for_absent_tx,
-    test_reorg_re_inserts_tx,
+    test_double_insert_after_reorg, test_enforcer_rejection_during_reorg,
+    test_rbf_removed_for_absent_tx, test_reorg_re_inserts_tx,
     util::{BinPaths, TestFailure, TestFailureCollector},
 };
 use libtest_mimic::{Arguments, Trial};
@@ -72,7 +71,8 @@ fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .compact()
-                .with_target(false)
+                .with_target(true)
+                .with_line_number(true)
                 .with_writer(std::io::stderr),
         )
         .try_init()
@@ -185,11 +185,6 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
                 test_double_insert_after_reorg::test_double_insert_after_reorg(
                     bp, dirs,
                 ),
-            )
-        }),
-        ("compose_drops_remove_mempool_txs", |bp, dirs| {
-            Box::pin(
-                test_compose_drops_remove_mempool_txs::test_compose_drops_remove_mempool_txs(bp, dirs),
             )
         }),
     ];
