@@ -22,10 +22,14 @@ use crate::{
     },
 };
 
-/// Per-test directory layout: a leaked temp dir with a `bitcoind/` subdir
-/// (where the bitcoind process writes its data and `stdout.txt`/`stderr.txt`).
-/// Leaked so logs survive after the test ends — helpful for debugging and
-/// for the end-of-run failure summary.
+/// Per-test directory layout: `<base>/bitcoind/` with the bitcoind process's
+/// data dir, `stdout.txt`, and `stderr.txt`.
+///
+/// Path selection:
+/// - If `CUSF_TEST_ARTIFACTS_DIR` is set, place per-test directories under
+///   `$CUSF_TEST_ARTIFACTS_DIR/<test_name>/`. CI uses this to collect logs
+///   as build artifacts.
+/// - Otherwise use a tempdir under the system temp.
 #[derive(Clone, Debug)]
 pub struct Directories {
     pub base_dir: PathBuf,
@@ -33,12 +37,24 @@ pub struct Directories {
 }
 
 impl Directories {
-    pub fn new() -> anyhow::Result<Self> {
-        let temp = TempDir::new().context("creating temp dir")?;
-        let base_dir = temp.path().to_path_buf();
+    pub fn new(test_name: &str) -> anyhow::Result<Self> {
+        let base_dir = match std::env::var("CUSF_TEST_ARTIFACTS_DIR") {
+            Ok(root) => {
+                let dir = PathBuf::from(root).join(test_name);
+                std::fs::create_dir_all(&dir).with_context(|| {
+                    format!("creating artifact dir at {}", dir.display())
+                })?;
+                dir
+            }
+            Err(_) => {
+                let temp = TempDir::new().context("creating temp dir")?;
+                let path = temp.path().to_path_buf();
+                temp.leak();
+                path
+            }
+        };
         let bitcoind_dir = base_dir.join("bitcoind");
-        std::fs::create_dir(&bitcoind_dir)?;
-        temp.leak();
+        std::fs::create_dir_all(&bitcoind_dir)?;
         Ok(Self {
             base_dir,
             bitcoind_dir,

@@ -107,7 +107,7 @@ where
             rt.block_on(async move {
                 let span = tracing::info_span!("test", name = %span_name);
                 let _entered = span.enter();
-                let dirs = Directories::new()?;
+                let dirs = Directories::new(&test_name)?;
                 let bitcoind_dir = dirs.bitcoind_dir.clone();
                 let handle =
                     AbortOnDropHandle::new(tokio::spawn(f(bin_paths, dirs)));

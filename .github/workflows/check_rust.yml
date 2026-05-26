@@ -113,8 +113,19 @@ jobs:
         run: cargo build --bin integration_tests
 
       - name: Run integration tests
+        env:
+          CUSF_TEST_ARTIFACTS_DIR: ${{ runner.temp }}/test-artifacts
         run: |
           set -a
           source ./integrationtests.env
           set +a
           cargo run --bin integration_tests -- --test-threads=1
+
+      - name: Upload integration test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-logs
+          path: ${{ runner.temp }}/test-artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
