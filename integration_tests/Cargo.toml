@@ -1,0 +1,44 @@
+[package]
+name = "cusf-enforcer-mempool-integration-tests"
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = "0.22"
+bitcoin = { workspace = true }
+bitcoin-jsonrpsee = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+cusf-enforcer-mempool = { path = "../lib" }
+futures = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# Integration-test-only dependencies (not used elsewhere in the workspace,
+# so kept out of `[workspace.dependencies]`).
+libtest-mimic = "0.8.1"
+reserve-port = "2.2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+temp-dir = "0.1.13"
+
+[lints]
+workspace = true
+
+[lib]
+name = "cusf_enforcer_mempool_integration_tests"
+path = "lib.rs"
+test = false
+doctest = false
+
+[[bin]]
+name = "integration_tests"
+path = "main.rs"
+test = false

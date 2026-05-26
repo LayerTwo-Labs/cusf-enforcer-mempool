@@ -84,3 +84,37 @@ jobs:
 
       - name: Check for unused dependencies
         run: cargo shear --deny-warnings
+
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: x86_64-unknown-linux-gnu
+
+      # Caches bitcoind across CI runs so we don't re-download it every time.
+      # Keyed on the script (which pins the version) and OS.
+      - name: Cache integration-test deps
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: .integration-deps
+          key: integration-deps-${{ runner.os }}-${{ hashFiles('scripts/setup_integration_tests.sh') }}
+
+      - name: Set up bitcoind and integrationtests.env
+        run: ./scripts/setup_integration_tests.sh
+
+      - name: Build integration_tests binary
+        run: cargo build --bin integration_tests
+
+      - name: Run integration tests
+        run: |
+          set -a
+          source ./integrationtests.env
+          set +a
+          cargo run --bin integration_tests -- --test-threads=1
