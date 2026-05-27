@@ -472,6 +472,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cusf-enforcer-mempool-integration-tests"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bitcoin",
+ "bitcoin-jsonrpsee",
+ "clap",
+ "cusf-enforcer-mempool",
+ "futures",
+ "libtest-mimic",
+ "parking_lot",
+ "reserve-port",
+ "serde",
+ "serde_json",
+ "temp-dir",
+ "thiserror 2.0.16",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -589,6 +613,12 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "escape8259"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5692dd7b5a1978a5aeb0ce83b7655c58ca8efdcb79d21036ea249da95afec2c6"
 
 [[package]]
 name = "ext-trait"
@@ -1439,6 +1469,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
+name = "libtest-mimic"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "14e6ba06f0ade6e504aff834d7c34298e5155c6baca353cc6a4aaff2f9fd7f33"
+dependencies = [
+ "anstream",
+ "anstyle",
+ "clap",
+ "escape8259",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1480,6 +1522,15 @@ name = "macro_rules_attribute-proc_macro"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58093314a45e00c77d5c508f76e77c3396afbbc0d01506e7fae47b018bac2b1d"
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
 
 [[package]]
 name = "memchr"
@@ -1850,6 +1901,15 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "reserve-port"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21918d6644020c6f6ef1993242989bf6d4952d2e025617744f184c02df51c356"
+dependencies = [
+ "thiserror 2.0.16",
+]
 
 [[package]]
 name = "ring"
@@ -2284,6 +2344,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "temp-dir"
+version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83176759e9416cf81ee66cb6508dbfe9c96f20b8b56265a39917551c23c70964"
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2421,6 +2487,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -2530,10 +2597,14 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]

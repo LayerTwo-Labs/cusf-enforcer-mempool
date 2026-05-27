@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["app", "lib"]
+members = ["app", "integration_tests", "lib"]
 
 [workspace.package]
 authors = ["Ash Manning <ash@layertwolabs.com>"]

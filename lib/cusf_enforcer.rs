@@ -357,8 +357,14 @@ where
 }
 
 /// Compose two [`CusfEnforcer`]s, left-before-right
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Compose<C0, C1>(pub(crate) C0, pub(crate) C1);
+
+impl<C0, C1> Compose<C0, C1> {
+    pub fn new(c0: C0, c1: C1) -> Self {
+        Self(c0, c1)
+    }
+}
 
 impl<C0, C1> CusfEnforcer for Compose<C0, C1>
 where

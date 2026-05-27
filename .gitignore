@@ -1,3 +1,4 @@
 /target
 .envrc
 shell.nix
+integrationtests.env
