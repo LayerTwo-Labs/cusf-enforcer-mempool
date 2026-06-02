@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use bitcoin::{BlockHash, Txid, hashes::Hash as _};
+use bitcoin::{BlockHash, Txid, hashes::Hash as _, hex::DisplayHex as _};
 use futures::{
     Stream, StreamExt, TryStreamExt as _,
     stream::{self, BoxStream},
@@ -81,73 +81,86 @@ impl TryFrom<ZmqMessage> for SequenceMessage {
     type Error = DeserializeSequenceMessageError;
 
     fn try_from(msg: ZmqMessage) -> Result<Self, Self::Error> {
-        let msgs = &msg.into_vec();
-        let Some(b"sequence") = msgs.first().map(|msg| &**msg) else {
-            return Err(Self::Error::MissingPrefix);
-        };
-        let Some((hash, rest)) =
-            msgs.get(1).and_then(|msg| msg.split_first_chunk())
-        else {
-            return Err(Self::Error::MissingHash);
-        };
-        let mut hash = *hash;
-        hash.reverse();
-        let Some(([message_type], rest)) = rest.split_first_chunk() else {
-            return Err(Self::Error::MissingMessageType);
-        };
-        let Some((zmq_seq, _rest)) =
-            msgs.get(2).and_then(|msg| msg.split_first_chunk())
-        else {
-            return Err(Self::Error::MissingZmqSequence);
-        };
-        let zmq_seq = u32::from_le_bytes(*zmq_seq);
-        let res = match *message_type {
-            b'C' => Self::BlockHash(BlockHashMessage {
-                block_hash: BlockHash::from_byte_array(hash),
-                event: BlockHashEvent::Connected,
-                zmq_seq,
-            }),
-            b'D' => Self::BlockHash(BlockHashMessage {
-                block_hash: BlockHash::from_byte_array(hash),
-                event: BlockHashEvent::Disconnected,
-                zmq_seq,
-            }),
-            b'A' => {
-                let Some((mempool_seq, _rest)) = rest.split_first_chunk()
-                else {
-                    return Err(Self::Error::MissingMempoolSequence);
-                };
-                Self::TxHash(TxHashMessage {
-                    txid: Txid::from_byte_array(hash),
-                    event: TxHashEvent::Added,
-                    mempool_seq: u64::from_le_bytes(*mempool_seq),
-                    zmq_seq,
-                })
-            }
-            b'R' => {
-                let Some((mempool_seq, _rest)) = rest.split_first_chunk()
-                else {
-                    return Err(Self::Error::MissingMempoolSequence);
-                };
-                SequenceMessage::TxHash(TxHashMessage {
-                    txid: Txid::from_byte_array(hash),
-                    event: TxHashEvent::Removed,
-                    mempool_seq: u64::from_le_bytes(*mempool_seq),
-                    zmq_seq,
-                })
-            }
-            message_type => {
-                return Err(Self::Error::UnknownMessageType(message_type));
-            }
-        };
-        Ok(res)
+        parse_sequence_message(&msg.into_vec())
     }
+}
+
+fn parse_sequence_message<T: AsRef<[u8]>>(
+    frames: &[T],
+) -> Result<SequenceMessage, DeserializeSequenceMessageError> {
+    use DeserializeSequenceMessageError as Error;
+    let Some(b"sequence") = frames.first().map(|frame| frame.as_ref()) else {
+        return Err(Error::MissingPrefix);
+    };
+    let Some((hash, rest)) = frames
+        .get(1)
+        .and_then(|frame| frame.as_ref().split_first_chunk())
+    else {
+        return Err(Error::MissingHash);
+    };
+    let mut hash = *hash;
+    hash.reverse();
+    let Some(([message_type], rest)) = rest.split_first_chunk() else {
+        return Err(Error::MissingMessageType);
+    };
+    let Some((zmq_seq, _rest)) = frames
+        .get(2)
+        .and_then(|frame| frame.as_ref().split_first_chunk())
+    else {
+        return Err(Error::MissingZmqSequence);
+    };
+    let zmq_seq = u32::from_le_bytes(*zmq_seq);
+    let res = match *message_type {
+        b'C' => SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash: BlockHash::from_byte_array(hash),
+            event: BlockHashEvent::Connected,
+            zmq_seq,
+        }),
+        b'D' => SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash: BlockHash::from_byte_array(hash),
+            event: BlockHashEvent::Disconnected,
+            zmq_seq,
+        }),
+        b'A' => {
+            let Some((mempool_seq, _rest)) = rest.split_first_chunk() else {
+                return Err(Error::MissingMempoolSequence);
+            };
+            SequenceMessage::TxHash(TxHashMessage {
+                txid: Txid::from_byte_array(hash),
+                event: TxHashEvent::Added,
+                mempool_seq: u64::from_le_bytes(*mempool_seq),
+                zmq_seq,
+            })
+        }
+        b'R' => {
+            let Some((mempool_seq, _rest)) = rest.split_first_chunk() else {
+                return Err(Error::MissingMempoolSequence);
+            };
+            SequenceMessage::TxHash(TxHashMessage {
+                txid: Txid::from_byte_array(hash),
+                event: TxHashEvent::Removed,
+                mempool_seq: u64::from_le_bytes(*mempool_seq),
+                zmq_seq,
+            })
+        }
+        message_type => {
+            return Err(Error::UnknownMessageType(message_type));
+        }
+    };
+    Ok(res)
 }
 
 #[derive(Debug, Error)]
 pub enum SequenceStreamError {
-    #[error("Error deserializing message")]
-    Deserialize(#[from] DeserializeSequenceMessageError),
+    #[error(
+        "failed to deserialize ZMQ sequence message from frames {frames:?}"
+    )]
+    Deserialize {
+        /// Hex-encoded frames, for diagnostics.
+        frames: Vec<String>,
+        #[source]
+        source: DeserializeSequenceMessageError,
+    },
     #[error(
         "Expected message with mempool sequence at least {min_next_seq}, but received {seq}"
     )]
@@ -156,8 +169,12 @@ pub enum SequenceStreamError {
     MissingMempoolSequence(u64),
     #[error("Missing message with zmq sequence {0}")]
     MissingZmqSequence(u32),
-    #[error("ZMQ error")]
-    Zmq(#[from] ZmqError),
+    #[error("failed to receive message on ZMQ `{topic}` stream")]
+    Recv {
+        topic: String,
+        #[source]
+        source: ZmqError,
+    },
 }
 
 pub struct SequenceStream<'a>(
@@ -271,10 +288,27 @@ fn check_seq_numbers(
 
 #[derive(Debug, Error)]
 pub enum SubscribeSequenceError {
-    #[error("Connection timeout")]
-    Timeout(#[from] tokio::time::error::Elapsed),
-    #[error(transparent)]
-    Zmq(#[from] ZmqError),
+    #[error(
+        "ZMQ connection timeout after {timeout:?} connecting to `{target}`"
+    )]
+    Timeout {
+        target: String,
+        timeout: Duration,
+        #[source]
+        source: tokio::time::error::Elapsed,
+    },
+    #[error("failed to connect to ZMQ server at `{target}`")]
+    Connect {
+        target: String,
+        #[source]
+        source: ZmqError,
+    },
+    #[error("failed to subscribe to ZMQ topic `{topic}`")]
+    Subscribe {
+        topic: String,
+        #[source]
+        source: ZmqError,
+    },
 }
 
 /// Subscribe to ZMQ sequence stream.
@@ -290,13 +324,45 @@ pub async fn subscribe_sequence<'a>(
     const CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
     let mut socket = zeromq::SubSocket::new();
     tokio::time::timeout(CONNECTION_TIMEOUT, socket.connect(zmq_addr_sequence))
-        .await??;
+        .await
+        .map_err(|source| SubscribeSequenceError::Timeout {
+            target: zmq_addr_sequence.to_string(),
+            timeout: CONNECTION_TIMEOUT,
+            source,
+        })?
+        .map_err(|source| SubscribeSequenceError::Connect {
+            target: zmq_addr_sequence.to_string(),
+            source,
+        })?;
     tracing::info!("Connected to ZMQ server");
-    tracing::debug!("Attempting to subscribe to `sequence` topic...");
-    socket.subscribe("sequence").await?;
-    tracing::info!("Subscribed to `sequence`");
+
+    const TOPIC: &str = "sequence";
+    tracing::debug!("Attempting to subscribe to `{TOPIC}` topic...");
+
+    socket.subscribe(TOPIC).await.map_err(|source| {
+        SubscribeSequenceError::Subscribe {
+            topic: TOPIC.to_string(),
+            source,
+        }
+    })?;
+    tracing::info!("Subscribed to `{TOPIC}`");
     let inner = stream::try_unfold(socket, |mut socket| async {
-        let msg: SequenceMessage = socket.recv().await?.try_into()?;
+        let raw = socket.recv().await.map_err(|source| {
+            SequenceStreamError::Recv {
+                topic: TOPIC.to_string(),
+                source,
+            }
+        })?;
+        let frames = raw.into_vec();
+        let msg = parse_sequence_message(&frames).map_err(|source| {
+            SequenceStreamError::Deserialize {
+                frames: frames
+                    .iter()
+                    .map(|frame| frame.as_ref().to_lower_hex_string())
+                    .collect(),
+                source,
+            }
+        })?;
         Ok(Some((msg, socket)))
     })
     .try_filter_map({

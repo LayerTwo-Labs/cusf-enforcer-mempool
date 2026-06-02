@@ -230,12 +230,35 @@ enum BatchedResponseItem {
     Single(ResponseItem),
 }
 
+impl BatchedRequestItem {
+    /// The bitcoind RPC method this request is dispatched as.
+    fn rpc_method(&self) -> &'static str {
+        match self {
+            Self::BatchRejectTx(_) | Self::Single(RequestItem::RejectTx(_)) => {
+                "prioritisetransaction"
+            }
+            Self::BatchTx(_) | Self::Single(RequestItem::Tx(..)) => {
+                "getrawtransaction"
+            }
+            Self::Single(RequestItem::Block(_)) => "getblock",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RequestError {
-    #[error("Error deserializing tx")]
-    DeserializeTx(#[from] bitcoin::consensus::encode::FromHexError),
-    #[error("RPC error")]
-    JsonRpc(#[from] JsonRpcError),
+    #[error("`{method}` RPC call failed")]
+    JsonRpc {
+        method: &'static str,
+        #[source]
+        source: JsonRpcError,
+    },
+    #[error("failed to deserialize `{method}` response")]
+    DeserializeResponse {
+        method: &'static str,
+        #[source]
+        source: bitcoin::consensus::encode::FromHexError,
+    },
 }
 
 async fn batched_request<RpcClient>(
@@ -246,6 +269,7 @@ where
     RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
 {
     const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
+    let method = request.rpc_method();
     match request {
         BatchedRequestItem::BatchRejectTx(txs) => {
             let mut request = BatchRequestBuilder::new();
@@ -261,9 +285,13 @@ where
                 .batch_request(request)
                 // Must box due to https://github.com/rust-lang/rust/issues/100013
                 .boxed()
-                .await?
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?
                 .into_ok()
-                .map_err(|mut errs| JsonRpcError::from(errs.next().unwrap()))?
+                .map_err(|mut errs| RequestError::JsonRpc {
+                    method,
+                    source: JsonRpcError::from(errs.next().unwrap()),
+                })?
                 .collect();
             Ok(BatchedResponseItem::BatchRejectTx)
         }
@@ -280,23 +308,31 @@ where
                 .batch_request(request)
                 // Must box due to https://github.com/rust-lang/rust/issues/100013
                 .boxed()
-                .await?
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?
                 .into_ok()
-                .map_err(|mut errs| JsonRpcError::from(errs.next().unwrap()))?
+                .map_err(|mut errs| RequestError::JsonRpc {
+                    method,
+                    source: JsonRpcError::from(errs.next().unwrap()),
+                })?
                 .map(|tx_hex: String| {
-                    bitcoin::consensus::encode::deserialize_hex(&tx_hex).map(
-                        |tx: Transaction| {
-                            let txid = tx.compute_txid();
-                            (tx, in_mempool[&txid])
-                        },
-                    )
+                    let tx: Transaction =
+                        bitcoin::consensus::encode::deserialize_hex(&tx_hex)
+                            .map_err(|e| RequestError::DeserializeResponse {
+                                method,
+                                source: e,
+                            })?;
+                    let txid = tx.compute_txid();
+                    Ok((tx, in_mempool[&txid]))
                 })
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<_, RequestError>>()?;
             Ok(BatchedResponseItem::BatchTx(txs))
         }
         BatchedRequestItem::Single(RequestItem::Block(block_hash)) => {
-            let block =
-                rpc_client.get_block(block_hash, U8Witness::<2>).await?;
+            let block = rpc_client
+                .get_block(block_hash, U8Witness::<2>)
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
             let resp = ResponseItem::Block(Box::new(block));
             Ok(BatchedResponseItem::Single(resp))
         }
@@ -305,7 +341,8 @@ where
             // from mempool as soon as possible
             let _: bool = rpc_client
                 .prioritize_transaction(txid, NEGATIVE_MAX_SATS)
-                .await?;
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
             let resp = ResponseItem::RejectTx;
             Ok(BatchedResponseItem::Single(resp))
         }
@@ -316,9 +353,12 @@ where
                     GetRawTransactionVerbose::<false>,
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
             let tx: Transaction =
-                bitcoin::consensus::encode::deserialize_hex(&tx_hex)?;
+                bitcoin::consensus::encode::deserialize_hex(&tx_hex).map_err(
+                    |e| RequestError::DeserializeResponse { method, source: e },
+                )?;
             let resp = ResponseItem::Tx(Box::new(tx), in_mempool);
             Ok(BatchedResponseItem::Single(resp))
         }
