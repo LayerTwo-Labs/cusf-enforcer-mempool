@@ -9,7 +9,7 @@ use tokio::time::Duration;
 use tracing_subscriber::{filter as tracing_filter, layer::SubscriberExt};
 
 use cusf_enforcer_mempool::{
-    cusf_enforcer::DefaultEnforcer,
+    cusf_enforcer::{Cancellable, DefaultEnforcer},
     mempool::{self, MempoolSync},
     server,
 };
@@ -92,33 +92,34 @@ async fn main() -> anyhow::Result<()> {
             })?
     };
     // We're not actually going to send anything on the shutdown signal.
-    let (_, shutdown_rx) = futures::channel::oneshot::channel::<()>();
+    let shutdown_signal = futures::future::pending();
 
     let mut enforcer = DefaultEnforcer;
     let (sequence_stream, mempool, tx_cache) = {
-        let shutdown_signal = async move {
-            let _ = shutdown_rx.await;
-        };
-        mempool::init_sync_mempool(
+        match mempool::init_sync_mempool(
             &mut enforcer,
             network,
             &rpc_client,
             &cli.node_zmq_addr_sequence,
-            shutdown_signal,
+            shutdown_signal.clone(),
         )
         .await?
+        {
+            Cancellable::Completed(res) => res,
+            Cancellable::Cancelled => {
+                tracing::info!("Initial mempool sync cancelled");
+                return Ok(());
+            }
+        }
     };
     tracing::info!("Initial mempool sync complete");
-    let mempool = MempoolSync::new(
+    let (mempool, mempool_task) = MempoolSync::new(
         enforcer,
         mempool,
         tx_cache,
         rpc_client.clone(),
         sequence_stream,
-        |err| async {
-            let err = anyhow::Error::from(err);
-            tracing::error!("{err:#}")
-        },
+        shutdown_signal,
     );
     let server = server::Server::new(
         mining_reward_address.script_pubkey(),
@@ -131,6 +132,11 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let rpc_server_handle =
         spawn_rpc_server(server, cli.serve_rpc_addr).await?;
-    let () = rpc_server_handle.stopped().await;
-    Ok(())
+    tokio::select! {
+        _ = rpc_server_handle.stopped() => Ok(()),
+        mempool_task_res = mempool_task => match mempool_task_res {
+            Ok(Cancellable::Cancelled) => Ok(()),
+            Err(err) => Err(anyhow::Error::from(err)),
+        }
+    }
 }

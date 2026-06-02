@@ -13,6 +13,13 @@ use futures::{FutureExt as _, TryFutureExt as _, TryStreamExt as _};
 use thiserror::Error;
 use tracing::instrument;
 
+/// Indicates task cancellation or successful completion with a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cancellable<T> {
+    Completed(T),
+    Cancelled,
+}
+
 #[derive(Clone, Debug)]
 pub enum ConnectBlockAction {
     Accept { remove_mempool_txs: HashSet<Txid> },
@@ -48,7 +55,7 @@ pub trait CusfEnforcer {
         &mut self,
         shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> impl Future<Output = Result<(), Self::SyncError>> + Send;
+    ) -> impl Future<Output = Result<Cancellable<()>, Self::SyncError>> + Send;
 
     type ConnectBlockError: std::error::Error + Send + Sync + 'static;
 
@@ -132,7 +139,7 @@ pub async fn initial_sync<'a, Enforcer, MainClient, Signal>(
     zmq_addr_sequence: &str,
     shutdown_signal: Signal,
 ) -> Result<
-    (BlockHash, crate::zmq::SequenceStream<'a>),
+    Cancellable<(BlockHash, crate::zmq::SequenceStream<'a>)>,
     InitialSyncError<Enforcer>,
 >
 where
@@ -159,10 +166,14 @@ where
             block_height = block_header.height,
             "syncing enforcer to tip"
         );
-        let () = enforcer
+        match enforcer
             .sync_to_tip(shutdown_signal.clone(), block_hash)
             .map_err(InitialSyncError::CusfEnforcer)
-            .await?;
+            .await?
+        {
+            Cancellable::Cancelled => return Ok(Cancellable::Cancelled),
+            Cancellable::Completed(()) => (),
+        }
         let best_block_hash = main_client.getbestblockhash().await?;
         if block_hash == best_block_hash {
             tracing::debug!(
@@ -170,7 +181,7 @@ where
                 block_height = block_header.height,
                 "enforcer synced to tip!"
             );
-            return Ok((block_hash, sequence_stream));
+            return Ok(Cancellable::Completed((block_hash, sequence_stream)));
         }
 
         // We're NOT synced to the tip. This means that between we started the sync
@@ -255,7 +266,7 @@ pub async fn task<Enforcer, MainClient, Signal>(
     main_client: &MainClient,
     zmq_addr_sequence: &str,
     shutdown_signal: Signal,
-) -> Result<(), TaskError<Enforcer>>
+) -> Result<Cancellable<std::convert::Infallible>, TaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
     MainClient: bitcoin_jsonrpsee::client::MainClient + Sync,
@@ -265,13 +276,19 @@ where
     use bitcoin_jsonrpsee::client::{GetBlockClient as _, U8Witness};
 
     let shutdown_signal = shutdown_signal.shared();
-    let (_best_block_hash, mut sequence_stream) = initial_sync(
+    let mut sequence_stream = match initial_sync(
         enforcer,
         main_client,
         zmq_addr_sequence,
         shutdown_signal.clone(),
     )
-    .await?;
+    .await?
+    {
+        Cancellable::Cancelled => return Ok(Cancellable::Cancelled),
+        Cancellable::Completed((_best_block_hash, sequence_stream)) => {
+            sequence_stream
+        }
+    };
 
     // Pin the shutdown signal
     futures::pin_mut!(shutdown_signal);
@@ -280,8 +297,8 @@ where
         let Some(sequence_msg) = tokio::select! {
             // borrow the shutdown signal, don't move
             _ = &mut shutdown_signal => {
-                        tracing::info!("shutdown signal received, stopping");
-                        return Ok(());
+                tracing::info!("shutdown signal received, stopping");
+                return Ok(Cancellable::Cancelled);
             }
             sequence_res = sequence_stream.try_next() => sequence_res
         }?
@@ -360,14 +377,18 @@ where
         &mut self,
         shutdown_signal: Signal,
         block_hash: BlockHash,
-    ) -> Result<(), Self::SyncError> {
+    ) -> Result<Cancellable<()>, Self::SyncError> {
         let shutdown_signal = shutdown_signal.shared();
 
-        let () = self
+        match self
             .0
             .sync_to_tip(shutdown_signal.clone(), block_hash)
             .map_err(Either::Left)
-            .await?;
+            .await?
+        {
+            Cancellable::Cancelled => return Ok(Cancellable::Cancelled),
+            Cancellable::Completed(()) => (),
+        };
 
         self.1
             .sync_to_tip(shutdown_signal, block_hash)
@@ -514,8 +535,8 @@ impl CusfEnforcer for DefaultEnforcer {
         &mut self,
         _shutdown_signal: Signal,
         _block_hash: BlockHash,
-    ) -> Result<(), Self::SyncError> {
-        Ok(())
+    ) -> Result<Cancellable<()>, Self::SyncError> {
+        Ok(Cancellable::Completed(()))
     }
 
     type ConnectBlockError = Infallible;
@@ -564,8 +585,7 @@ where
         &mut self,
         shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> Result<(), Self::SyncError> {
-        let shutdown_signal = shutdown_signal.shared();
+    ) -> Result<Cancellable<()>, Self::SyncError> {
         match self {
             Self::Left(left) => {
                 left.sync_to_tip(shutdown_signal, tip)

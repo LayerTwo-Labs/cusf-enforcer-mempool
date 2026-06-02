@@ -22,7 +22,7 @@ use super::{
     RequestItem, RequestQueue, ResponseItem, SeqMessageQueue, batched_request,
 };
 use crate::{
-    cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
+    cusf_enforcer::{self, Cancellable, ConnectBlockAction, CusfEnforcer},
     zmq::{
         BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
         SequenceStreamError, TxHashEvent, TxHashMessage,
@@ -88,9 +88,6 @@ where
     ApplySeqMessageTimeout,
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
-    // TODO - this is not really an error...
-    #[error("Sync was stopped")]
-    Shutdown,
     #[error(transparent)]
     CusfEnforcer(#[from] cusf_enforcer::Error<Enforcer>),
     #[error("Failed to decode block: `{block_hash}`")]
@@ -514,7 +511,7 @@ pub async fn init_sync_mempool<
     zmq_addr_sequence: &str,
     shutdown_signal: Signal, // Would it be better to return a Some/None, indicating sync stoppage?
 ) -> Result<
-    (SequenceStream<'a>, Mempool, HashMap<Txid, Transaction>),
+    Cancellable<(SequenceStream<'a>, Mempool, HashMap<Txid, Transaction>)>,
     SyncMempoolError<Enforcer>,
 >
 where
@@ -522,13 +519,17 @@ where
     RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
 {
     let shutdown_signal = shutdown_signal.shared();
-    let (best_block_hash, sequence_stream) = cusf_enforcer::initial_sync(
+    let (best_block_hash, sequence_stream) = match cusf_enforcer::initial_sync(
         enforcer,
         rpc_client,
         zmq_addr_sequence,
         shutdown_signal.clone(),
     )
-    .await?;
+    .await?
+    {
+        Cancellable::Cancelled => return Ok(Cancellable::Cancelled),
+        Cancellable::Completed(res) => res,
+    };
     let RawMempoolWithSequence {
         txids,
         mempool_sequence,
@@ -614,7 +615,7 @@ where
                 return Err(SyncMempoolError::ApplySeqMessageTimeout);
             }
             CombinedStreamItem::Shutdown => {
-                return Err(SyncMempoolError::Shutdown);
+                return Ok(Cancellable::Cancelled);
             }
         }
     }
@@ -626,5 +627,5 @@ where
     } = sync_state;
     let () = post_sync.apply(&mut mempool)?;
     let sequence_stream = combined_stream.sequence_msgs.into_inner();
-    Ok((sequence_stream, mempool, tx_cache))
+    Ok(Cancellable::Completed((sequence_stream, mempool, tx_cache)))
 }

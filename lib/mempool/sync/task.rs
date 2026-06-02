@@ -14,7 +14,7 @@ use futures::{
 use hashlink::LinkedHashSet;
 use imbl::HashSet;
 use thiserror::Error;
-use tokio::{spawn, sync::RwLock, task::JoinHandle};
+use tokio::sync::RwLock;
 use tracing::{Instrument as _, instrument};
 
 use super::{
@@ -24,7 +24,7 @@ use super::{
     batched_request,
 };
 use crate::{
-    cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
+    cusf_enforcer::{self, Cancellable, ConnectBlockAction, CusfEnforcer},
     mempool::{
         MempoolInsertError, MempoolRemoveError, MempoolUpdateError,
         sync::RequestItem,
@@ -613,15 +613,20 @@ where
     Ok(())
 }
 
-async fn task<Enforcer, RpcClient>(
+pub type MempoolSyncTaskResult<Enforcer> =
+    Result<Cancellable<std::convert::Infallible>, SyncTaskError<Enforcer>>;
+
+async fn task<Enforcer, RpcClient, Signal>(
+    shutdown_signal: Signal,
     inner: Arc<RwLock<MempoolSyncInner<Enforcer>>>,
     tx_cache: HashMap<Txid, Transaction>,
     rpc_client: RpcClient,
     sequence_stream: SequenceStream<'static>,
-) -> Result<(), SyncTaskError<Enforcer>>
+) -> MempoolSyncTaskResult<Enforcer>
 where
     Enforcer: CusfEnforcer,
     RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
+    Signal: Future<Output = ()> + Send + Unpin,
 {
     // Filter mempool with enforcer
     let rejected_txs: LinkedHashSet<Txid> = {
@@ -718,7 +723,7 @@ where
         sequence_stream,
         response_stream,
         apply_seq_msg_timeout(&sync_state.seq_message_queue),
-        futures::future::pending(),
+        shutdown_signal,
     );
     loop {
         let msg = combined_stream
@@ -765,50 +770,51 @@ where
             }
             CombinedStreamItem::Shutdown => {
                 tracing::info!(parent: &span, "shutdown signal received, aborting");
-                // This isn't really an error though...
-                return Err(SyncTaskError::Shutdown);
+                return Ok(Cancellable::Cancelled);
             }
         };
     }
 }
 
+/// Cheap to clone handle to a mempool with an associated sync task
+#[derive(Clone)]
+#[repr(transparent)]
 pub struct MempoolSync<Enforcer> {
     inner: std::sync::Weak<RwLock<MempoolSyncInner<Enforcer>>>,
-    task: JoinHandle<()>,
 }
 
 impl<Enforcer> MempoolSync<Enforcer>
 where
     Enforcer: CusfEnforcer + Send + Sync + 'static,
 {
-    pub fn new<RpcClient, ErrHandler, ErrHandlerFut>(
+    pub fn new<RpcClient, ShutdownSignal>(
         enforcer: Enforcer,
         mempool: Mempool,
         tx_cache: HashMap<Txid, Transaction>,
         rpc_client: RpcClient,
         sequence_stream: SequenceStream<'static>,
-        err_handler: ErrHandler,
-    ) -> Self
+        shutdown_signal: ShutdownSignal,
+    ) -> (
+        Self,
+        impl Future<Output = MempoolSyncTaskResult<Enforcer>> + Send + 'static,
+    )
     where
         RpcClient:
             bitcoin_jsonrpsee::client::MainClient + Send + Sync + 'static,
-        ErrHandler:
-            FnOnce(SyncTaskError<Enforcer>) -> ErrHandlerFut + Send + 'static,
-        ErrHandlerFut: Future<Output = ()> + Send,
+        ShutdownSignal: Future<Output = ()> + Send + Unpin + 'static,
     {
         let inner = MempoolSyncInner { enforcer, mempool };
         let inner = Arc::new(RwLock::new(inner));
         let inner_weak = Arc::downgrade(&inner);
-        let task = spawn(async {
-            match task(inner, tx_cache, rpc_client, sequence_stream).await {
-                Ok(_) => {}
-                Err(err) => err_handler(err).await,
-            }
-        });
-        Self {
-            inner: inner_weak,
-            task,
-        }
+        let task = task(
+            shutdown_signal,
+            inner,
+            tx_cache,
+            rpc_client,
+            sequence_stream,
+        );
+        let mempool_sync = Self { inner: inner_weak };
+        (mempool_sync, task)
     }
 
     /// Apply a function over the mempool and enforcer.
@@ -821,11 +827,5 @@ where
         let inner_read = inner.read().await;
         let res = f(&inner_read.mempool, &inner_read.enforcer).await;
         Some(res)
-    }
-}
-
-impl<Enforcer> Drop for MempoolSync<Enforcer> {
-    fn drop(&mut self) {
-        self.task.abort()
     }
 }
