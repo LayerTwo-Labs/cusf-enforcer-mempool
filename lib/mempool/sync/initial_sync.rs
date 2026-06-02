@@ -20,6 +20,7 @@ use super::{
     super::{Mempool, MempoolInsertError, MempoolRemoveError},
     BatchedResponseItem, CombinedStream, CombinedStreamItem, RequestError,
     RequestItem, RequestQueue, ResponseItem, SeqMessageQueue, batched_request,
+    task::{ApplySeqMessageTimeoutError, apply_seq_msg_timeout},
 };
 use crate::{
     cusf_enforcer::{self, ConnectBlockAction, CusfEnforcer},
@@ -84,8 +85,8 @@ pub enum SyncMempoolError<Enforcer>
 where
     Enforcer: CusfEnforcer,
 {
-    #[error("Timeout while waiting to apply sequence message")]
-    ApplySeqMessageTimeout,
+    #[error(transparent)]
+    ApplySeqMessageTimeout(#[from] ApplySeqMessageTimeoutError),
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
     // TODO - this is not really an error...
@@ -104,13 +105,13 @@ where
     FirstMempoolSequence(u64),
     #[error(transparent)]
     InitialSyncEnforcer(#[from] cusf_enforcer::InitialSyncError<Enforcer>),
-    #[error("RPC error")]
-    JsonRpc(#[from] JsonRpcError),
+    #[error("RPC error while fetching the raw mempool")]
+    GetRawMempool(#[source] JsonRpcError),
     #[error(transparent)]
     MempoolInsert(#[from] MempoolInsertError),
     #[error(transparent)]
     MempoolRemove(#[from] MempoolRemoveError),
-    #[error("Request error")]
+    #[error(transparent)]
     Request(#[from] RequestError),
     #[error("Sequence stream error")]
     SequenceStream(#[from] SequenceStreamError),
@@ -534,7 +535,8 @@ where
         mempool_sequence,
     } = rpc_client
         .get_raw_mempool(BoolWitness::<false>, BoolWitness::<true>)
-        .await?;
+        .await
+        .map_err(SyncMempoolError::GetRawMempool)?;
     let mut sync_state = {
         let request_queue = RequestQueue::default();
         request_queue.push_back(RequestItem::Block(best_block_hash));
@@ -569,22 +571,6 @@ where
         .then(|request| batched_request(rpc_client, request))
         .boxed();
 
-    let apply_seq_msg_timeout = |seq_msg_queue: &SeqMessageQueue| {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-        let sleep_until = seq_msg_queue
-            .front()
-            .as_ref()
-            .map(|front| front.reached_head_time + TIMEOUT);
-        async move {
-            if let Some(sleep_until) = sleep_until {
-                tokio::time::sleep_until(sleep_until.into()).await
-            } else {
-                futures::future::pending().await
-            }
-        }
-        .boxed()
-    };
-
     // Pin the shutdown signal
     futures::pin_mut!(shutdown_signal);
 
@@ -611,7 +597,14 @@ where
                     apply_seq_msg_timeout(&sync_state.seq_message_queue).fuse();
             }
             CombinedStreamItem::ApplySeqMessageTimeout => {
-                return Err(SyncMempoolError::ApplySeqMessageTimeout);
+                let err = ApplySeqMessageTimeoutError {
+                    msg: sync_state
+                        .seq_message_queue
+                        .front()
+                        .as_ref()
+                        .map(|head| head.msg),
+                };
+                return Err(err.into());
             }
             CombinedStreamItem::Shutdown => {
                 return Err(SyncMempoolError::Shutdown);

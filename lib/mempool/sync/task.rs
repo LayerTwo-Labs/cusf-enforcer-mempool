@@ -45,15 +45,40 @@ pub struct SyncState {
     tx_cache: HashMap<Txid, Transaction>,
 }
 
+/// Timeout waiting to apply the next sequence message before its dependencies
+/// were available.
+const APPLY_SEQ_MSG_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// Future that fires once the message at the head of `seq_msg_queue` has waited
+/// longer than APPLY_SEQ_MSG_TIMEOUT for its dependencies, or stays pending
+/// forever while the queue is empty.
+pub(super) fn apply_seq_msg_timeout(
+    seq_msg_queue: &SeqMessageQueue,
+) -> BoxFuture<'static, ()> {
+    let sleep_until = seq_msg_queue
+        .front()
+        .as_ref()
+        .map(|front| front.reached_head_time + APPLY_SEQ_MSG_TIMEOUT);
+    async move {
+        if let Some(sleep_until) = sleep_until {
+            tokio::time::sleep_until(sleep_until.into()).await
+        } else {
+            futures::future::pending().await
+        }
+    }
+    .boxed()
+}
+
 #[derive(Debug, Error)]
-#[repr(transparent)]
 pub struct ApplySeqMessageTimeoutError {
-    msg: Option<SequenceMessage>,
+    pub(super) msg: Option<SequenceMessage>,
 }
 
 impl std::fmt::Display for ApplySeqMessageTimeoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let Self { msg } = self;
+        let timeout = APPLY_SEQ_MSG_TIMEOUT;
         match msg {
             Some(SequenceMessage::BlockHash(block_hash_msg)) => {
                 let BlockHashMessage {
@@ -63,7 +88,7 @@ impl std::fmt::Display for ApplySeqMessageTimeoutError {
                 } = block_hash_msg;
                 write!(
                     f,
-                    "Timeout while waiting to apply sequence message (block {} {})",
+                    "Timeout after {timeout:?} while waiting to apply sequence message (block {} {})",
                     block_hash,
                     match event {
                         BlockHashEvent::Connected => "connected",
@@ -80,7 +105,7 @@ impl std::fmt::Display for ApplySeqMessageTimeoutError {
                 } = tx_hash_msg;
                 write!(
                     f,
-                    "Timeout while waiting to apply sequence message (tx {} {})",
+                    "Timeout after {timeout:?} while waiting to apply sequence message (tx {} {})",
                     txid,
                     match event {
                         TxHashEvent::Added => "added",
@@ -89,7 +114,10 @@ impl std::fmt::Display for ApplySeqMessageTimeoutError {
                 )
             }
             None => {
-                write!(f, "Timeout while waiting to apply sequence message")
+                write!(
+                    f,
+                    "Timeout after {timeout:?} while waiting to apply sequence message"
+                )
             }
         }
     }
@@ -126,7 +154,7 @@ where
     MempoolRemove(#[from] MempoolRemoveError),
     #[error(transparent)]
     MempoolUpdate(#[from] MempoolUpdateError),
-    #[error("Request error")]
+    #[error(transparent)]
     Request(#[from] RequestError),
     #[error("Sequence stream error")]
     SequenceStream(#[from] SequenceStreamError),
@@ -698,22 +726,6 @@ where
         .then(|request| batched_request(&rpc_client, request))
         .boxed();
 
-    let apply_seq_msg_timeout = |seq_msg_queue: &SeqMessageQueue| {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-        let sleep_until = seq_msg_queue
-            .front()
-            .as_ref()
-            .map(|front| front.reached_head_time + TIMEOUT);
-        async move {
-            if let Some(sleep_until) = sleep_until {
-                tokio::time::sleep_until(sleep_until.into()).await
-            } else {
-                futures::future::pending().await
-            }
-        }
-        .boxed()
-    };
-
     let mut combined_stream = CombinedStream::new(
         sequence_stream,
         response_stream,
@@ -751,7 +763,8 @@ where
                     apply_seq_msg_timeout(&sync_state.seq_message_queue).fuse();
             }
             CombinedStreamItem::Response(resp) => {
-                handle_resp(&inner, &mut sync_state, resp?)
+                let resp = resp.map_err(SyncTaskError::Request)?;
+                handle_resp(&inner, &mut sync_state, resp)
                     .instrument(span)
                     .await?;
                 combined_stream.apply_seq_msg_timeout =
@@ -759,7 +772,11 @@ where
             }
             CombinedStreamItem::ApplySeqMessageTimeout => {
                 let err = ApplySeqMessageTimeoutError {
-                    msg: sync_state.seq_message_queue.pop_front(),
+                    msg: sync_state
+                        .seq_message_queue
+                        .front()
+                        .as_ref()
+                        .map(|head| head.msg),
                 };
                 return Err(err.into());
             }
