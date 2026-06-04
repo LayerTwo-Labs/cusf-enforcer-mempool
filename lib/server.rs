@@ -730,7 +730,14 @@ where
                     .get_mining_info()
                     .await
                     .map_err(internal_error)?;
-                let target = mining_info.next.target;
+                let target = mining_info
+                    .next
+                    .ok_or_else(|| {
+                        internal_error(anyhow::anyhow!(
+                            "getmininginfo response missing next target"
+                        ))
+                    })?
+                    .target;
                 self.known_targets.write().insert(prev_blockhash, target);
                 target
             }
