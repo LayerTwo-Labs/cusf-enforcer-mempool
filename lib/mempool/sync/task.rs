@@ -191,12 +191,30 @@ where
         if block.hash == inner.unfiltered_mempool.tip {
             // Ignore, block has already been applied
             return Ok(());
-        } else {
-            return Err(SyncTaskError::UnexpectedTipUnfilteredMempool {
-                tip: inner.unfiltered_mempool.tip,
-                expected: prev_blockhash,
-            });
         }
+        // A subscriber that joins while bitcoind is still flushing its ZMQ
+        // notification queue receives connect events for blocks that the
+        // initial-sync tip snapshot already covers.
+        if block.confirmations > 0
+            && let Some(tip_block) = inner
+                .mempool
+                .chain
+                .blocks
+                .get(&inner.unfiltered_mempool.tip)
+            && block.height < tip_block.height
+        {
+            tracing::debug!(
+                block_hash = %block.hash,
+                block_height = block.height,
+                tip = %inner.unfiltered_mempool.tip,
+                "Ignoring stale block connect below current tip"
+            );
+            return Ok(());
+        }
+        return Err(SyncTaskError::UnexpectedTipUnfilteredMempool {
+            tip: inner.unfiltered_mempool.tip,
+            expected: prev_blockhash,
+        });
     }
     for tx_info in &block.tx {
         inner.unfiltered_mempool.txs.remove(&tx_info.txid);
