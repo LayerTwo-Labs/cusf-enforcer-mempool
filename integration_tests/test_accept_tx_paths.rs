@@ -42,6 +42,9 @@ pub async fn test_accept_tx_paths(
         if calls.contains(&pre_sync_tx) && calls.contains(&post_sync_tx) {
             return Ok(());
         }
+        let () = setup
+            .task_errors
+            .ensure_empty("accept_tx for pre- and post-sync txs")?;
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "expected accept_tx for both {pre_sync_tx} (pre-sync) and \

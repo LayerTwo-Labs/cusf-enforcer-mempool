@@ -28,6 +28,9 @@ pub async fn test_rbf_removed_for_absent_tx(
     // before we bump the fee).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !setup.enforcer.accept_tx_calls().contains(&tx_rejected) {
+        let () = setup
+            .task_errors
+            .ensure_empty(&format!("accept_tx({tx_rejected})"))?;
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "sync task never asked enforcer about {tx_rejected}"
