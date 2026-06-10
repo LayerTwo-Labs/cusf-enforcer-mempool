@@ -94,6 +94,17 @@ impl TaskErrors {
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
     }
+
+    /// Bail with the surfaced errors if the sync task has reported any.
+    pub fn ensure_empty(&self, waiting_for: &str) -> anyhow::Result<()> {
+        let errors = self.snapshot();
+        anyhow::ensure!(
+            errors.is_empty(),
+            "MempoolSync task surfaced errors while waiting for \
+             `{waiting_for}`: {errors:?}"
+        );
+        Ok(())
+    }
 }
 
 /// Bitcoind spawned with a funded regtest wallet and 110 priming blocks.
@@ -197,7 +208,9 @@ where
         enforcer,
         mempool_synced,
         move |err: SyncTaskError<E>| async move {
-            let msg = format!("{err:#}");
+            // Wrap in `anyhow::Error` so `:#` renders the source chain;
+            // plain thiserror `Display` drops it (e.g. bare "RPC error").
+            let msg = format!("{:#}", anyhow::Error::new(err));
             tracing::error!(err = %msg, "MempoolSync task error");
             errors_for_handler.inner.lock().push(msg);
         },
@@ -332,12 +345,7 @@ where
         if predicate(&last) {
             return Ok(());
         }
-        if !task_errors.is_empty() {
-            anyhow::bail!(
-                "MempoolSync task surfaced errors while waiting for `{label}`: {:?}",
-                task_errors.snapshot()
-            );
-        }
+        let () = task_errors.ensure_empty(label)?;
         sleep(Duration::from_millis(75)).await;
     }
     anyhow::bail!(
@@ -364,12 +372,7 @@ where
         if current == Some(expected) {
             return Ok(());
         }
-        if !task_errors.is_empty() {
-            anyhow::bail!(
-                "MempoolSync task surfaced errors while waiting for tip {expected}: {:?}",
-                task_errors.snapshot()
-            );
-        }
+        let () = task_errors.ensure_empty(&format!("tip {expected}"))?;
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for local tip = {expected} after \
