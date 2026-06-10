@@ -88,6 +88,7 @@ fn make_trial<F, Fut>(
     name: &str,
     bin_paths: BinPaths,
     collector: TestFailureCollector,
+    rt_handle: tokio::runtime::Handle,
     f: F,
 ) -> Trial
 where
@@ -100,11 +101,7 @@ where
         let test_name = name.clone();
         let span_name = span_name.clone();
         let outcome = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio rt");
-            rt.block_on(async move {
+            rt_handle.block_on(async move {
                 let span = tracing::info_span!("test", name = %span_name);
                 let _entered = span.enter();
                 let dirs = Directories::new(&test_name)?;
@@ -140,8 +137,12 @@ where
     })
 }
 
+// MUST be run from within a tokio runtime
 fn run() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
+
+    let rt_handle = tokio::runtime::Handle::current();
+
     set_tracing_subscriber(tracing::Level::DEBUG)?;
 
     let bin_paths = BinPaths::new();
@@ -196,6 +197,7 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
             name,
             bin_paths.clone(),
             collector.clone(),
+            rt_handle.clone(),
             move |bp, dirs| async move {
                 let setup = TestSetup::new(&bp, dirs).await?;
                 f(setup).await
@@ -204,7 +206,13 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
     }
     for (name, f) in bare_tests {
         let f = *f;
-        trials.push(make_trial(name, bin_paths.clone(), collector.clone(), f));
+        trials.push(make_trial(
+            name,
+            bin_paths.clone(),
+            collector.clone(),
+            rt_handle.clone(),
+            f,
+        ));
     }
 
     let exit_code = libtest_mimic::run(&cli.test_args, trials).exit_code();
@@ -212,7 +220,8 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
     Ok(exit_code)
 }
 
-fn main() -> std::process::ExitCode {
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
     match run() {
         Ok(code) => code,
         Err(err) => {
