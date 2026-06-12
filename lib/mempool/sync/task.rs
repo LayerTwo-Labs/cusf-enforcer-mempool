@@ -146,6 +146,7 @@ pub struct SyncState {
 
 /// Sync state, mutably borrowed while applying an action from the queue
 struct SyncStateBorrowedMut<'a> {
+    blocks_needed: &'a mut LinkedHashSet<BlockHash>,
     /// Txs rejected by the CUSF enforcer
     rejected_txs: &'a mut HashSet<Txid>,
     request_queue: &'a RequestQueue,
@@ -268,25 +269,46 @@ where
     Ok(())
 }
 
+/// Returns `false` without applying the disconnect if the parent block must
+/// first be fetched into `chain.blocks`. The caller should retry once the
+/// parent block response has been handled.
 async fn handle_disconnected_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
+    blocks_needed: &mut LinkedHashSet<BlockHash>,
+    request_queue: &RequestQueue,
     block: &bitcoin_jsonrpsee::client::Block<true>,
-) -> Result<(), SyncTaskError<BorrowedEnforcer>>
+) -> Result<bool, SyncTaskError<BorrowedEnforcer>>
 where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
 {
     let prev_blockhash =
         block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
-    if inner.unfiltered_mempool.tip == block.hash {
-        inner.unfiltered_mempool.tip = prev_blockhash;
-    } else {
+    if inner.unfiltered_mempool.tip != block.hash {
         return Err(SyncTaskError::DisconnectTipMismatch {
             disconnected_tip: block.hash,
             unfiltered_mempool_tip: inner.unfiltered_mempool.tip,
         });
-    };
+    }
     if inner.mempool.chain.tip == block.hash {
+        // Rolling the tip back requires the parent block to be present in
+        // `chain.blocks` because `Mempool::tip` indexes into it. The parent is
+        // absent if it predates the initial sync, which fetches only the
+        // sync-time tip itself.
+        if block.previousblockhash.is_some()
+            && !inner.mempool.chain.blocks.contains_key(&prev_blockhash)
+        {
+            if !blocks_needed.contains(&prev_blockhash) {
+                tracing::debug!(
+                    block_hash = %block.hash,
+                    %prev_blockhash,
+                    "Requesting parent block before disconnect"
+                );
+                blocks_needed.replace(prev_blockhash);
+                request_queue.push_front(RequestItem::Block(prev_blockhash));
+            }
+            return Ok(false);
+        }
         let DisconnectBlockAction { remove_mempool_txs } = inner
             .enforcer
             .borrow_mut()
@@ -298,7 +320,8 @@ where
         }
         inner.mempool.chain.tip = prev_blockhash;
     }
-    Ok(())
+    inner.unfiltered_mempool.tip = prev_blockhash;
+    Ok(true)
 }
 
 fn handle_block_hash_msg<Enforcer>(
@@ -465,6 +488,7 @@ where
         ))) if *block_hash == resp_block.hash => {
             {
                 let sync_state = SyncStateBorrowedMut {
+                    blocks_needed: &mut sync_state.blocks_needed,
                     rejected_txs: &mut sync_state.rejected_txs,
                     request_queue: &sync_state.request_queue,
                     tx_cache: &mut sync_state.tx_cache,
@@ -484,8 +508,16 @@ where
         ))) if *block_hash == resp_block.hash
             && inner.mempool.chain.tip == resp_block.hash =>
         {
-            let () = handle_disconnected_block(inner, &resp_block).await?;
-            sync_state.action_queue.pop_front();
+            if handle_disconnected_block(
+                inner,
+                &mut sync_state.blocks_needed,
+                &sync_state.request_queue,
+                &resp_block,
+            )
+            .await?
+            {
+                sync_state.action_queue.pop_front();
+            }
         }
         Some(_) | None => (),
     }
@@ -750,10 +782,14 @@ where
             else {
                 return Ok(ApplySyncActionResult::Pending);
             };
-            let () = handle_disconnected_block(inner, &block).await?;
-            Ok(ApplySyncActionResult::Success {
-                push_txs_action_queue_front: Vec::new(),
-            })
+            let applied = handle_disconnected_block(
+                inner,
+                sync_state.blocks_needed,
+                sync_state.request_queue,
+                &block,
+            )
+            .await?;
+            Ok(ApplySyncActionResult::from(applied))
         }
         SequenceMessage::TxHash(TxHashMessage {
             txid,
@@ -812,6 +848,7 @@ where
     let res = match next_sync_action.action {
         SyncAction::InsertTx(txid) => {
             let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
                 rejected_txs: &mut sync_state.rejected_txs,
                 request_queue: &sync_state.request_queue,
                 tx_cache: &mut sync_state.tx_cache,
@@ -822,6 +859,7 @@ where
         }
         SyncAction::SequenceMessage(seq_msg) => {
             let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
                 rejected_txs: &mut sync_state.rejected_txs,
                 request_queue: &sync_state.request_queue,
                 tx_cache: &mut sync_state.tx_cache,
