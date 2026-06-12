@@ -3,7 +3,7 @@ build *args='':
 
 # Run linter
 clippy:
-    cargo clippy --all-targets -- --deny warnings
+    cargo clippy --all-targets --all-features --fix --allow-dirty --allow-staged -- --deny warnings
 
 # Format code
 fmt:
