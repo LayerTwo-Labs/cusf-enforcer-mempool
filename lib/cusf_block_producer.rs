@@ -61,6 +61,17 @@ where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
     pub txs: Vec<(Transaction, bitcoin::Amount)>,
 }
 
+/// Result of validating a block proposal via
+/// [`CusfBlockProducer::validate_block_proposal`]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposalValidity {
+    Valid,
+    /// The proposal is invalid due to the specified tx.
+    /// The tx (and its descendants) will be excluded from the proposal,
+    /// before validating again.
+    InvalidTx(Txid),
+}
+
 pub trait CusfBlockProducer: CusfEnforcer {
     type InitialBlockTemplateError: std::error::Error + Send + Sync + 'static;
 
@@ -74,6 +85,28 @@ pub trait CusfBlockProducer: CusfEnforcer {
             InitialBlockTemplate<COINBASE_TXN>,
             Self::InitialBlockTemplateError,
         >,
+    > + Send
+    where
+        typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn;
+
+    type ValidateBlockProposalError: std::error::Error + Send + Sync + 'static;
+
+    /// Validate a block proposal, before computing the template suffix.
+    /// `template.prefix_txs` includes the proposed mempool txs.
+    ///
+    /// A tx can be valid in isolation, yet invalid in the context of a
+    /// specific block (e.g. a tx whose validity depends on state that an
+    /// earlier tx in the proposal modifies). Identifying such a tx via
+    /// [`ProposalValidity::InvalidTx`] excludes it (and its descendants)
+    /// from the proposal, after which validation runs again, rather than
+    /// failing block production entirely.
+    fn validate_block_proposal<const COINBASE_TXN: bool>(
+        &self,
+        parent_block_hash: &BlockHash,
+        coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+        template: &InitialBlockTemplate<COINBASE_TXN>,
+    ) -> impl Future<
+        Output = Result<ProposalValidity, Self::ValidateBlockProposalError>,
     > + Send
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn;
@@ -133,6 +166,41 @@ where
             )
             .await
             .map_err(Either::Right)
+    }
+
+    type ValidateBlockProposalError =
+        Either<C0::ValidateBlockProposalError, C1::ValidateBlockProposalError>;
+
+    async fn validate_block_proposal<const COINBASE_TXN: bool>(
+        &self,
+        parent_block_hash: &BlockHash,
+        coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+        template: &InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<ProposalValidity, Self::ValidateBlockProposalError>
+    where
+        typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+    {
+        match self
+            .0
+            .validate_block_proposal(
+                parent_block_hash,
+                coinbase_txn_wit,
+                template,
+            )
+            .await
+            .map_err(Either::Left)?
+        {
+            ProposalValidity::Valid => self
+                .1
+                .validate_block_proposal(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
+                .await
+                .map_err(Either::Right),
+            invalid @ ProposalValidity::InvalidTx(_) => Ok(invalid),
+        }
     }
 
     type SuffixTxsError = Either<C0::SuffixTxsError, C1::SuffixTxsError>;
@@ -214,6 +282,20 @@ impl CusfBlockProducer for cusf_enforcer::DefaultEnforcer {
         Ok(template)
     }
 
+    type ValidateBlockProposalError = Infallible;
+
+    async fn validate_block_proposal<const COINBASE_TXN: bool>(
+        &self,
+        _parent_block_hash: &BlockHash,
+        _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+        _template: &InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<ProposalValidity, Self::ValidateBlockProposalError>
+    where
+        typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+    {
+        Ok(ProposalValidity::Valid)
+    }
+
     type SuffixTxsError = Infallible;
 
     async fn block_template_suffix<const COINBASE_TXN: bool>(
@@ -260,6 +342,38 @@ where
                 .map_err(Either::Left),
             Self::Right(right) => right
                 .initial_block_template(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
+                .await
+                .map_err(Either::Right),
+        }
+    }
+
+    type ValidateBlockProposalError =
+        Either<C0::ValidateBlockProposalError, C1::ValidateBlockProposalError>;
+
+    async fn validate_block_proposal<const COINBASE_TXN: bool>(
+        &self,
+        parent_block_hash: &BlockHash,
+        coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+        template: &InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<ProposalValidity, Self::ValidateBlockProposalError>
+    where
+        typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+    {
+        match self {
+            Self::Left(left) => left
+                .validate_block_proposal(
+                    parent_block_hash,
+                    coinbase_txn_wit,
+                    template,
+                )
+                .await
+                .map_err(Either::Left),
+            Self::Right(right) => right
+                .validate_block_proposal(
                     parent_block_hash,
                     coinbase_txn_wit,
                     template,

@@ -1,3 +1,4 @@
+pub mod mock_block_producer;
 pub mod mock_enforcer;
 pub mod setup;
 pub mod test_accept_tx_paths;
@@ -6,4 +7,5 @@ pub mod test_double_insert_after_reorg;
 pub mod test_enforcer_rejection_during_reorg;
 pub mod test_rbf_removed_for_absent_tx;
 pub mod test_reorg_re_inserts_tx;
+pub mod test_validate_block_proposal;
 pub mod util;
