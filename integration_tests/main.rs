@@ -6,6 +6,7 @@ use cusf_enforcer_mempool_integration_tests::{
     test_accept_tx_paths, test_block_connect_smoke,
     test_double_insert_after_reorg, test_enforcer_rejection_during_reorg,
     test_rbf_removed_for_absent_tx, test_reorg_re_inserts_tx,
+    test_validate_block_proposal,
     util::{BinPaths, TestFailure, TestFailureCollector},
 };
 use libtest_mimic::{Arguments, Trial};
@@ -184,6 +185,13 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         ("double_insert_after_reorg", |bp, dirs| {
             Box::pin(
                 test_double_insert_after_reorg::test_double_insert_after_reorg(
+                    bp, dirs,
+                ),
+            )
+        }),
+        ("validate_block_proposal", |bp, dirs| {
+            Box::pin(
+                test_validate_block_proposal::test_validate_block_proposal(
                     bp, dirs,
                 ),
             )

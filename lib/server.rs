@@ -330,12 +330,18 @@ where
     FinalizeCoinbaseTx(#[from] FinalizeCoinbaseTxError),
     #[error(transparent)]
     InitialBlockTemplate(BP::InitialBlockTemplateError),
+    #[error(
+        "Invalid tx `{txid}` in block proposal cannot be excluded from the proposal"
+    )]
+    InvalidProposalTx { txid: Txid },
     #[error(transparent)]
     MempoolInsert(#[from] crate::mempool::MempoolInsertError),
     #[error(transparent)]
     MempoolRemove(#[from] crate::mempool::MempoolRemoveError),
     #[error(transparent)]
     SuffixTxs(BP::SuffixTxsError),
+    #[error(transparent)]
+    ValidateBlockProposal(BP::ValidateBlockProposalError),
 }
 
 // select block txs, and coinbase txouts if coinbasetxn is set
@@ -472,45 +478,85 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         .sum();
     let initial_block_template_weight =
         coinbase_txouts_weight + prefix_txs_weight;
-    let mempool_txs = mempool.propose_txs(Some(
-        mempool::MAX_USABLE_BLOCK_WEIGHT - initial_block_template_weight,
-    ))?;
-    {
-        let proposed_txids: String = {
-            use std::fmt::Write;
-            // Above this number of txs, truncate txids to save space in logs
-            const SHOW_FULL_TXIDS_MAX_TXS: usize = 10;
-            let mut proposed_txids = "[".to_owned();
-            let n_txs = mempool_txs.len();
-            for (idx, tx) in mempool_txs.iter().enumerate() {
-                if idx < SHOW_FULL_TXIDS_MAX_TXS {
-                    write!(&mut proposed_txids, "{}", tx.txid).unwrap();
-                } else {
-                    let txid_bytes = tx.txid.as_byte_array();
-                    for byte in txid_bytes.iter().rev().take(4) {
-                        write!(&mut proposed_txids, "{byte:02x}").unwrap();
+    let weight_limit =
+        mempool::MAX_USABLE_BLOCK_WEIGHT - initial_block_template_weight;
+    // Propose txs, and validate the proposal with the block producer.
+    // A tx can be valid in isolation, yet invalid in the context of the
+    // specific proposal. Exclude any tx that the block producer identifies
+    // as invalid (along with its descendants), and propose again, so that
+    // one such tx cannot wedge block production.
+    let mempool_txs = loop {
+        let mempool_txs = mempool.propose_txs(Some(weight_limit))?;
+        {
+            let proposed_txids: String = {
+                use std::fmt::Write;
+                // Above this number of txs, truncate txids to save space in logs
+                const SHOW_FULL_TXIDS_MAX_TXS: usize = 10;
+                let mut proposed_txids = "[".to_owned();
+                let n_txs = mempool_txs.len();
+                for (idx, tx) in mempool_txs.iter().enumerate() {
+                    if idx < SHOW_FULL_TXIDS_MAX_TXS {
+                        write!(&mut proposed_txids, "{}", tx.txid).unwrap();
+                    } else {
+                        let txid_bytes = tx.txid.as_byte_array();
+                        for byte in txid_bytes.iter().rev().take(4) {
+                            write!(&mut proposed_txids, "{byte:02x}").unwrap();
+                        }
+                        write!(&mut proposed_txids, "...").unwrap();
+                        for byte in txid_bytes[..4].iter().rev() {
+                            write!(&mut proposed_txids, "{byte:02x}").unwrap();
+                        }
                     }
-                    write!(&mut proposed_txids, "...").unwrap();
-                    for byte in txid_bytes[..4].iter().rev() {
-                        write!(&mut proposed_txids, "{byte:02x}").unwrap();
+                    if idx + 1 < n_txs {
+                        write!(&mut proposed_txids, ", ").unwrap();
                     }
                 }
-                if idx + 1 < n_txs {
-                    write!(&mut proposed_txids, ", ").unwrap();
-                }
-            }
-            write!(&mut proposed_txids, "]").unwrap();
-            proposed_txids
+                write!(&mut proposed_txids, "]").unwrap();
+                proposed_txids
+            };
+            tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
+        }
+        let candidate_template = {
+            let mut candidate = initial_block_template.clone();
+            candidate.prefix_txs.extend(mempool_txs.iter().map(|tx| {
+                let fee = tx.fee.unsigned_abs();
+                let tx = bitcoin::consensus::deserialize(&tx.data).unwrap();
+                (tx, fee)
+            }));
+            candidate
         };
-        tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
-    }
-    initial_block_template
-        .prefix_txs
-        .extend(mempool_txs.iter().map(|tx| {
-            let fee = tx.fee.unsigned_abs();
-            let tx = bitcoin::consensus::deserialize(&tx.data).unwrap();
-            (tx, fee)
-        }));
+        tracing::debug!("Validating block proposal");
+        match block_producer
+            .validate_block_proposal(
+                parent_block_hash,
+                typewit::MakeTypeWitness::MAKE,
+                &candidate_template,
+            )
+            .await
+            .map_err(BuildBlockError::ValidateBlockProposal)?
+        {
+            cusf_block_producer::ProposalValidity::Valid => {
+                initial_block_template = candidate_template;
+                break mempool_txs;
+            }
+            cusf_block_producer::ProposalValidity::InvalidTx(txid) => {
+                // The block producer's own prefix txs cannot be excluded
+                let excluded = if prefix_txids.contains(&txid) {
+                    Default::default()
+                } else {
+                    mempool.remove_with_descendants(&txid)?
+                };
+                if excluded.is_empty() {
+                    return Err(BuildBlockError::InvalidProposalTx { txid });
+                }
+                tracing::warn!(
+                    %txid,
+                    n_excluded = excluded.len(),
+                    "Excluding invalid tx (and descendants) from block proposal"
+                );
+            }
+        }
+    };
     tracing::debug!("Adding block template suffix");
     let template_suffix = block_producer
         .block_template_suffix(

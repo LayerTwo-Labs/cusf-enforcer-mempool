@@ -761,7 +761,7 @@ impl Mempool {
 
     /// Remove a tx from mempool, and all descendants.
     /// Returns the removed tx (if it was present) and any descendants.
-    fn remove_with_descendants(
+    pub(crate) fn remove_with_descendants(
         &mut self,
         txid: &Txid,
     ) -> Result<LinkedHashMap<Txid, Transaction>, MempoolRemoveError> {
