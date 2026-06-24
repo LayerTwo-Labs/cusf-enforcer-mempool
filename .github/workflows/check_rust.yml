@@ -101,7 +101,7 @@ jobs:
       # Keyed on the script (which pins the version) and OS.
       - name: Cache integration-test deps
         id: cache-deps
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .integration-deps
           key: integration-deps-${{ runner.os }}-${{ hashFiles('scripts/setup_integration_tests.sh') }}
