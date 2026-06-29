@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use bitcoin::{Transaction, Txid};
-use lending_iterator::prelude::*;
+use lender::{FallibleLender, FallibleLending};
 
-use super::{MempoolTxs, MissingAncestorError, TxInfo};
+use crate::mempool::{MempoolTxs, MissingAncestorError, TxInfo};
 
 type AncestorsItem<'a> = (Txid, &'a Transaction, &'a TxInfo);
 
@@ -54,17 +54,24 @@ impl Ancestors<'_> {
     }
 }
 
-#[gat]
-impl<'mempool_txs> LendingIterator for Ancestors<'mempool_txs> {
-    type Item<'next>
-    where
-        Self: 'next,
-    = Result<AncestorsItem<'next>, MissingAncestorError>;
+impl<'lend, 'mempool_txs> FallibleLending<'lend> for Ancestors<'mempool_txs> {
+    type Lend = AncestorsItem<'lend>;
+}
 
-    fn next<'next>(
-        self: &'next mut Ancestors<'mempool_txs>,
-    ) -> Option<Result<AncestorsItem<'next>, MissingAncestorError>> {
-        Self::next(self).transpose()
+impl<'mempool_txs> FallibleLender for Ancestors<'mempool_txs> {
+    type Error = MissingAncestorError;
+
+    fn __check_covariance<'long: 'short, 'short>(
+        proof: lender::CovariantProof<<Self as FallibleLending<'long>>::Lend>,
+    ) -> lender::CovariantProof<<Self as FallibleLending<'short>>::Lend> {
+        proof
+    }
+
+    fn next(
+        &mut self,
+    ) -> Result<Option<lender::prelude::FallibleLend<'_, Self>>, Self::Error>
+    {
+        Ancestors::next(self)
     }
 }
 

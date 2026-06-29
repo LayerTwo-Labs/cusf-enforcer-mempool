@@ -5,7 +5,7 @@ use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{OrdMap, OrdSet, ordmap};
 use indexmap::IndexSet;
-use lending_iterator::LendingIterator as _;
+use lender::FallibleLender as _;
 use thiserror::Error;
 
 pub mod iter;
@@ -616,25 +616,26 @@ impl Mempool {
             %txid,
             "Inserted tx into mempool with {ndeps} deps and {nspenders} spenders"
         );
-        self.txs.ancestors_mut(txid).try_for_each(|ancestor_info| {
-            let (ancestor_tx, ancestor_info) = ancestor_info?;
-            ancestor_vsize += ancestor_tx.vsize() as u64;
-            ancestor_modified_weight = saturating_add_weight(
-                ancestor_modified_weight,
-                ancestor_info.modified_weight,
-            );
-            ancestor_fees += ancestor_info.fees.modified;
-            ancestor_info.descendant_vsize += vsize;
-            ancestor_info.descendant_modified_weight = saturating_add_weight(
-                ancestor_info.descendant_modified_weight,
-                modified_weight,
-            );
-            ancestor_info.fees.descendant += modified_fee;
-            Result::<_, MempoolInsertError>::Ok(())
-        })?;
-        self.txs.descendants_mut(txid).skip(1).try_for_each(
-            |descendant_info| {
-                let (descendant_tx, descendant_info) = descendant_info?;
+        self.txs.ancestors_mut(txid).for_each(
+            |(ancestor_tx, ancestor_info)| {
+                ancestor_vsize += ancestor_tx.vsize() as u64;
+                ancestor_modified_weight = saturating_add_weight(
+                    ancestor_modified_weight,
+                    ancestor_info.modified_weight,
+                );
+                ancestor_fees += ancestor_info.fees.modified;
+                ancestor_info.descendant_vsize += vsize;
+                ancestor_info.descendant_modified_weight =
+                    saturating_add_weight(
+                        ancestor_info.descendant_modified_weight,
+                        modified_weight,
+                    );
+                ancestor_info.fees.descendant += modified_fee;
+                Ok(())
+            },
+        )?;
+        self.txs.descendants_mut(txid).skip(1).for_each(
+            |(descendant_tx, descendant_info)| {
                 descendant_vsize += descendant_tx.vsize() as u64;
                 descendant_modified_weight = saturating_add_weight(
                     descendant_modified_weight,
@@ -652,7 +653,7 @@ impl Mempool {
                     .conflicts_with
                     .clone()
                     .union(conflicts_with.clone());
-                Result::<_, MempoolInsertError>::Ok(())
+                Ok(())
             },
         )?;
         for conflict_txid in conflicts_with {
@@ -661,11 +662,10 @@ impl Mempool {
             if !self.txs.0.contains_key(&conflict_txid) {
                 continue;
             }
-            self.txs.descendants_mut(conflict_txid).try_for_each(
-                |descendant_info| {
-                    let (_descendant_tx, descendant_info) = descendant_info?;
+            self.txs.descendants_mut(conflict_txid).for_each(
+                |(_descendant_tx, descendant_info)| {
                     descendant_info.conflicts_with.insert(txid);
-                    Result::<_, MempoolInsertError>::Ok(())
+                    Ok(())
                 },
             )?;
         }
@@ -702,50 +702,54 @@ impl Mempool {
         }
         let mut descendants = self.txs.descendants_mut(*txid);
         // Skip first element
-        let _: Option<_> = descendants.next().transpose()?;
-        let () = descendants.try_for_each(|desc| {
-            let (desc_tx, desc_info) = desc?;
-            let ancestor_fee_rate = FeeRate {
-                fee: desc_info.fees.ancestor,
-                vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
-            };
-            let desc_txid = desc_tx.compute_txid();
-            if !self
-                .by_ancestor_fee_rate
-                .remove(ancestor_fee_rate, desc_txid)
-            {
-                let err = MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
-                return Err(err.into());
-            };
-            desc_info.ancestor_modified_weight = saturating_sub_weight(
-                desc_info.ancestor_modified_weight,
-                modified_weight,
-            );
-            desc_info.ancestor_vsize -= vsize;
-            desc_info.fees.ancestor -= fees.modified;
-            let ancestor_fee_rate = FeeRate {
-                fee: desc_info.fees.ancestor,
-                vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
-            };
-            self.by_ancestor_fee_rate
-                .insert(ancestor_fee_rate, desc_txid);
-            // FIXME: remove
-            tracing::trace!("removing {txid} as a dep of {desc_txid}");
-            desc_info.depends.remove(txid);
-            Result::<_, MempoolRemoveError>::Ok(())
-        })?;
+        let _: Option<_> = descendants.next()?;
+        let () = descendants
+            .map_err(MempoolRemoveError::MissingDescendant)
+            .for_each(|(desc_tx, desc_info)| {
+                let ancestor_fee_rate = FeeRate {
+                    fee: desc_info.fees.ancestor,
+                    vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
+                };
+                let desc_txid = desc_tx.compute_txid();
+                if !self
+                    .by_ancestor_fee_rate
+                    .remove(ancestor_fee_rate, desc_txid)
+                {
+                    let err =
+                        MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
+                    return Err(err.into());
+                };
+                desc_info.ancestor_modified_weight = saturating_sub_weight(
+                    desc_info.ancestor_modified_weight,
+                    modified_weight,
+                );
+                desc_info.ancestor_vsize -= vsize;
+                desc_info.fees.ancestor -= fees.modified;
+                let ancestor_fee_rate = FeeRate {
+                    fee: desc_info.fees.ancestor,
+                    vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
+                };
+                self.by_ancestor_fee_rate
+                    .insert(ancestor_fee_rate, desc_txid);
+                // FIXME: remove
+                tracing::trace!("removing {txid} as a dep of {desc_txid}");
+                desc_info.depends.remove(txid);
+                Result::<_, MempoolRemoveError>::Ok(())
+            })?;
         // Update all ancestors
-        let () = self.txs.ancestors_mut(*txid).try_for_each(|anc| {
-            let (_anc_tx, anc_info) = anc?;
-            anc_info.descendant_modified_weight = saturating_sub_weight(
-                anc_info.descendant_modified_weight,
-                modified_weight,
-            );
-            anc_info.descendant_vsize -= vsize;
-            anc_info.fees.descendant -= fees.modified;
-            anc_info.spent_by.remove(txid);
-            Result::<_, MempoolRemoveError>::Ok(())
-        })?;
+        let () =
+            self.txs
+                .ancestors_mut(*txid)
+                .for_each(|(_anc_tx, anc_info)| {
+                    anc_info.descendant_modified_weight = saturating_sub_weight(
+                        anc_info.descendant_modified_weight,
+                        modified_weight,
+                    );
+                    anc_info.descendant_vsize -= vsize;
+                    anc_info.fees.descendant -= fees.modified;
+                    anc_info.spent_by.remove(txid);
+                    Ok(())
+                })?;
         let ancestor_fee_rate = FeeRate {
             fee: fees.ancestor,
             vsize: ancestor_modified_weight.to_vbytes_ceil(),
@@ -826,13 +830,12 @@ impl Mempool {
             let () = self
                 .txs
                 .descendants_mut(txid)
-                .try_for_each(|item| {
-                    let (tx, _info) = item?;
+                .for_each(|(tx, _info)| {
                     let descendant_txid = tx.compute_txid();
                     descendants.push(descendant_txid);
-                    Result::<_, MempoolRemoveError>::Ok(())
+                    Ok(())
                 })
-                .map_err(either::Either::Left)?;
+                .map_err(|err| either::Either::Left(err.into()))?;
             'descs: for descendant_txid in descendants {
                 let Some((tx, _info)) = self.txs.0.get(&descendant_txid) else {
                     continue 'descs;
@@ -937,7 +940,7 @@ impl Mempool {
             tracing::trace!(%txid, "Computing deps for tx");
             let mut depends = Vec::new();
             let mut ancestors = self.txs.ancestors(txid);
-            while let Some((anc_txid, _, _)) = ancestors.next().transpose()? {
+            while let Some((anc_txid, _, _)) = ancestors.next()? {
                 let anc_idx = txs.get_index_of(&anc_txid).ok_or(
                     MissingAncestorError {
                         tx: txid,

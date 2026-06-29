@@ -1,9 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 
 use bitcoin::{Transaction, Txid};
-use lending_iterator::prelude::*;
+use lender::{FallibleLender, FallibleLending};
 
-use super::{MempoolTxs, MissingAncestorError, MissingDescendantError, TxInfo};
+use crate::mempool::{
+    MempoolTxs, MissingAncestorError, MissingDescendantError, TxInfo,
+};
 
 type AncestorsItem<'a> = (&'a Transaction, &'a mut TxInfo);
 
@@ -61,17 +63,26 @@ impl AncestorsMut<'_> {
     }
 }
 
-#[gat]
-impl<'mempool_txs> LendingIterator for AncestorsMut<'mempool_txs> {
-    type Item<'next>
-    where
-        Self: 'next,
-    = Result<AncestorsItem<'next>, MissingAncestorError>;
+impl<'lend, 'mempool_txs> FallibleLending<'lend>
+    for AncestorsMut<'mempool_txs>
+{
+    type Lend = AncestorsItem<'lend>;
+}
 
-    fn next<'next>(
-        self: &'next mut AncestorsMut<'mempool_txs>,
-    ) -> Option<Result<AncestorsItem<'next>, MissingAncestorError>> {
-        Self::next(self).transpose()
+impl<'mempool_txs> FallibleLender for AncestorsMut<'mempool_txs> {
+    type Error = MissingAncestorError;
+
+    fn __check_covariance<'long: 'short, 'short>(
+        proof: lender::CovariantProof<<Self as FallibleLending<'long>>::Lend>,
+    ) -> lender::CovariantProof<<Self as FallibleLending<'short>>::Lend> {
+        proof
+    }
+
+    fn next(
+        &mut self,
+    ) -> Result<Option<lender::prelude::FallibleLend<'_, Self>>, Self::Error>
+    {
+        AncestorsMut::next(self)
     }
 }
 
@@ -110,17 +121,26 @@ impl DescendantsMut<'_> {
     }
 }
 
-#[gat]
-impl<'mempool_txs> LendingIterator for DescendantsMut<'mempool_txs> {
-    type Item<'next>
-    where
-        Self: 'next,
-    = Result<DescendantsItem<'next>, MissingDescendantError>;
+impl<'lend, 'mempool_txs> FallibleLending<'lend>
+    for DescendantsMut<'mempool_txs>
+{
+    type Lend = DescendantsItem<'lend>;
+}
 
-    fn next<'next>(
-        self: &'next mut DescendantsMut<'mempool_txs>,
-    ) -> Option<Result<DescendantsItem<'next>, MissingDescendantError>> {
-        Self::next(self).transpose()
+impl<'mempool_txs> FallibleLender for DescendantsMut<'mempool_txs> {
+    type Error = MissingDescendantError;
+
+    fn __check_covariance<'long: 'short, 'short>(
+        proof: lender::CovariantProof<<Self as FallibleLending<'long>>::Lend>,
+    ) -> lender::CovariantProof<<Self as FallibleLending<'short>>::Lend> {
+        proof
+    }
+
+    fn next(
+        &mut self,
+    ) -> Result<Option<lender::prelude::FallibleLend<'_, Self>>, Self::Error>
+    {
+        DescendantsMut::next(self)
     }
 }
 

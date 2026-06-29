@@ -99,8 +99,8 @@ allow = [
     "ISC",
     "MIT",
     "MITNFA",
-    "OpenSSL",
     "Unicode-3.0",
+    "Unlicense",
 ]
 # The confidence threshold for detecting a license from license text.
 # The higher the value, the more closely the license text must be to the
@@ -115,9 +115,8 @@ exceptions = [
     { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs", version = "0.26.11" },
     { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs", version = "1.0.0" },
     { allow = ["MPL-2.0"], name = "bitmaps", version = "3.2.1" },
-    { allow = ["MPL-2.0"], name = "imbl", version = "3.0.0" },
-    { allow = ["MPL-2.0"], name = "imbl-sized-chunks", version = "0.1.2" },
-    { allow = ["MPL-2.0"], name = "webpki-roots", version = "0.26.7" },
+    { allow = ["MPL-2.0"], name = "imbl", version = "7.0.0" },
+    { allow = ["MPL-2.0"], name = "imbl-sized-chunks", version = "0.1.3" },
     { allow = ["Zlib"], crate = "foldhash" },
     { allow = ["Zlib"], crate = "typewit" },
     { allow = ["Zlib"], crate = "typewit_proc_macros" },
@@ -225,7 +224,6 @@ skip = [
 skip-tree = [
     #"ansi_term@0.11.0", # will be skipped along with _all_ of its direct and transitive dependencies
     #{ crate = "ansi_term@0.11.0", depth = 20 },
-    { crate = "hashbrown@0.14.5" },
     { crate = "thiserror@1" },
     { crate = "windows-sys@0.52.0" },
 ]

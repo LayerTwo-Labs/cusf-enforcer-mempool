@@ -19,7 +19,7 @@ hashlink = { workspace = true }
 imbl = { workspace = true }
 indexmap = { workspace = true }
 jsonrpsee = { workspace = true, features = ["client", "macros", "server"] }
-lending-iterator = { workspace = true }
+lender = { workspace = true }
 nonempty = { workspace = true }
 parking_lot = { workspace = true }
 polonius-the-crab = { workspace = true }
