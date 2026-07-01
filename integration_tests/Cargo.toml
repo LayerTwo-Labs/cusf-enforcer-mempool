@@ -27,7 +27,7 @@ libtest-mimic = "0.8.1"
 reserve-port = "2.2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-temp-dir = "0.1.13"
+temp-dir = "0.2.0"
 
 [lints]
 workspace = true
