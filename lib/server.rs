@@ -472,9 +472,38 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         .sum();
     let initial_block_template_weight =
         coinbase_txouts_weight + prefix_txs_weight;
-    let mempool_txs = mempool.propose_txs(Some(
-        mempool::MAX_USABLE_BLOCK_WEIGHT - initial_block_template_weight,
-    ))?;
+    // The block template suffix (e.g. M6 withdrawal txns) is appended after the
+    // proposed mempool txs, so its weight must be reserved before selecting
+    // mempool txs. Otherwise the proposed txs can consume the entire remaining
+    // weight budget and the appended suffix pushes the block over the limit.
+    tracing::debug!("Adding block template suffix");
+    let template_suffix = block_producer
+        .block_template_suffix(
+            parent_block_hash,
+            typewit::MakeTypeWitness::MAKE,
+            &initial_block_template,
+        )
+        .await
+        .map_err(BuildBlockError::SuffixTxs)?;
+    let suffix_coinbase_txouts_weight = match typewit::MakeTypeWitness::MAKE {
+        typewit::const_marker::BoolWit::True(wit) => {
+            let wit = wit.map(cusf_block_producer::CoinbaseTxouts);
+            wit.in_ref()
+                .to_right(&template_suffix.coinbase_txouts)
+                .iter()
+                .map(|tx_out| tx_out.weight())
+                .sum()
+        }
+        typewit::const_marker::BoolWit::False(_) => Weight::ZERO,
+    };
+    let suffix_txs_weight =
+        template_suffix.txs.iter().map(|(tx, _)| tx.weight()).sum();
+    let suffix_weight = suffix_coinbase_txouts_weight + suffix_txs_weight;
+    let mempool_txs = mempool.propose_txs(Some(Weight::from_wu(
+        mempool::MAX_USABLE_BLOCK_WEIGHT.to_wu().saturating_sub(
+            initial_block_template_weight.to_wu() + suffix_weight.to_wu(),
+        ),
+    )))?;
     {
         let proposed_txids: String = {
             use std::fmt::Write;
@@ -504,22 +533,6 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         };
         tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
     }
-    initial_block_template
-        .prefix_txs
-        .extend(mempool_txs.iter().map(|tx| {
-            let fee = tx.fee.unsigned_abs();
-            let tx = bitcoin::consensus::deserialize(&tx.data).unwrap();
-            (tx, fee)
-        }));
-    tracing::debug!("Adding block template suffix");
-    let template_suffix = block_producer
-        .block_template_suffix(
-            parent_block_hash,
-            typewit::MakeTypeWitness::MAKE,
-            &initial_block_template,
-        )
-        .await
-        .map_err(BuildBlockError::SuffixTxs)?;
     let mut res_coinbase_txouts = initial_block_template.coinbase_txouts;
     match typewit::MakeTypeWitness::MAKE {
         typewit::const_marker::BoolWit::True(wit) => {

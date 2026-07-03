@@ -80,7 +80,10 @@ pub trait CusfBlockProducer: CusfEnforcer {
 
     type SuffixTxsError: std::error::Error + Send + Sync + 'static;
 
-    /// Add outputs / txs to a block template, after filling with proposed txs
+    /// Suffix outputs / txs, appended after the proposed txs in the assembled
+    /// block. Generated before the proposed txs are selected so that the
+    /// suffix weight can be reserved in the block weight budget; `template`
+    /// therefore only contains the prefix txs, not the proposed mempool txs.
     fn block_template_suffix<const COINBASE_TXN: bool>(
         &self,
         parent_block_hash: &BlockHash,
