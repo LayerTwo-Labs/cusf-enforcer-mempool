@@ -100,7 +100,6 @@ async fn main() -> anyhow::Result<()> {
         let shutdown_signal = shutdown_rx.map(|_: Result<_, _>| ());
         mempool::init_sync_mempool(
             &mut enforcer,
-            network,
             rpc_client.clone(),
             &cli.node_zmq_addr_sequence,
             shutdown_signal.fuse(),

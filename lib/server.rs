@@ -565,7 +565,6 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
 }
 
 struct MempoolQueryOutput {
-    target: Option<bitcoin::Target>,
     prev_blockhash: BlockHash,
     tip_block_mediantime: u32,
     tip_block_height: u32,
@@ -607,7 +606,6 @@ where
         (None, block_txs, None)
     };
     Ok(MempoolQueryOutput {
-        target: mempool.next_target(),
         prev_blockhash: tip_block.hash,
         tip_block_mediantime: tip_block.mediantime,
         tip_block_height: tip_block.height,
@@ -704,7 +702,6 @@ where
                 internal_error(err)
             })?;
         let MempoolQueryOutput {
-            target,
             prev_blockhash,
             tip_block_mediantime,
             tip_block_height,
@@ -722,9 +719,11 @@ where
                 self.known_targets.read().get(&prev_blockhash).copied();
             if let Some(target) = known_target {
                 target
-            } else if let Some(target) = target {
-                target
             } else {
+                // We used to calculate the next block's target here. This didn't
+                // work with signets with custom block times. Instead we always
+                // read directly from Core. This only happens 1 time per chain tip,
+                // so the performance impact is negligible.
                 let mining_info = self
                     .rpc_client
                     .get_mining_info()

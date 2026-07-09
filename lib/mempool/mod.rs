@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bitcoin::{BlockHash, Network, Target, Transaction, Txid, Weight};
+use bitcoin::{BlockHash, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{OrdMap, OrdSet, ordmap};
@@ -482,7 +482,6 @@ fn saturating_sub_weight(lhs: Weight, rhs: Weight) -> Weight {
 pub struct Mempool {
     by_ancestor_fee_rate: ByAncestorFeeRate,
     chain: Chain,
-    network: Network,
     /// Map of txs (which may not be in the mempool) to their direct child txs,
     /// which MUST be in the mempool
     tx_childs: TxChilds,
@@ -490,7 +489,7 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    fn new(network: Network, prev_blockhash: BlockHash) -> Self {
+    fn new(prev_blockhash: BlockHash) -> Self {
         let chain = Chain {
             tip: prev_blockhash,
             blocks: imbl::HashMap::new(),
@@ -498,7 +497,6 @@ impl Mempool {
         Self {
             by_ancestor_fee_rate: ByAncestorFeeRate::default(),
             chain,
-            network,
             tx_childs: TxChilds::default(),
             txs: MempoolTxs::default(),
         }
@@ -506,34 +504,6 @@ impl Mempool {
 
     pub fn tip(&self) -> &bitcoin_jsonrpsee::client::Block<true> {
         &self.chain.blocks[&self.chain.tip]
-    }
-
-    /// Next target, if known
-    pub fn next_target(&self) -> Option<Target> {
-        let tip = self.tip();
-        let next_height = tip.height + 1;
-        let network_params = self.network.params();
-        if !network_params.no_pow_retargeting
-            && next_height % network_params.miner_confirmation_window == 0
-        {
-            if let Some(first_block_in_period) = self
-                .chain
-                .iter()
-                .nth(network_params.miner_confirmation_window as usize - 1)
-            {
-                let spacing = tip.time - first_block_in_period.time;
-                let res = bitcoin::CompactTarget::from_next_work_required(
-                    tip.compact_target,
-                    spacing as u64,
-                    network_params,
-                );
-                Some(res.into())
-            } else {
-                None
-            }
-        } else {
-            Some(tip.compact_target.into())
-        }
     }
 
     /// Insert a tx into the mempool,
@@ -979,7 +949,7 @@ impl Mempool {
 mod tests {
     use super::*;
     use bitcoin::{
-        Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
+        Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
         absolute::LockTime, hashes::Hash as _, transaction::Version,
     };
 
@@ -1006,7 +976,7 @@ mod tests {
     }
 
     fn test_mempool() -> Mempool {
-        Mempool::new(Network::Regtest, BlockHash::all_zeros())
+        Mempool::new(BlockHash::all_zeros())
     }
 
     /// Reproduces the prod crash: inserting a tx whose `conflicts_with`
