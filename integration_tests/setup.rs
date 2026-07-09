@@ -4,7 +4,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use bitcoin::{Address, BlockHash, Network, Txid};
+use bitcoin::{Address, BlockHash, Txid};
 use cusf_enforcer_mempool::{
     cusf_enforcer::CusfEnforcer,
     mempool::{self, MempoolSync, SyncTaskError},
@@ -194,7 +194,6 @@ where
 {
     let mempool_synced = mempool::init_sync_mempool(
         &mut enforcer,
-        Network::Regtest,
         node.rpc_client.clone(),
         &node.bitcoind.zmq_addr(),
         std::future::pending::<()>().fuse(),

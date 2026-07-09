@@ -1105,7 +1105,6 @@ pub async fn init_sync_mempool<
     ShutdownSignal,
 >(
     mut enforcer: Enforcer,
-    network: bitcoin::Network,
     rpc_client: RpcClient,
     zmq_addr_sequence: &str,
     // Would it be better to return a Some/None, indicating sync stoppage?
@@ -1137,7 +1136,7 @@ where
     let inner = MempoolSyncInner {
         abandoned_pool: AbandonedPool::default(),
         enforcer,
-        mempool: Mempool::new(network, best_block_hash),
+        mempool: Mempool::new(best_block_hash),
         unfiltered_mempool: UnfilteredMempool {
             tip: best_block_hash,
             txs: HashSet::new(),
