@@ -47,7 +47,9 @@ where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
     pub coinbase_txouts: <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
     /// Prefix txs, with absolute fee
     pub prefix_txs: Vec<(Transaction, bitcoin::Amount)>,
-    /// prefix txs do not need to be included here
+    /// Suffix txs, with absolute fee
+    pub suffix_txs: Vec<(Transaction, bitcoin::Amount)>,
+    /// prefix/suffix txs do not need to be included here
     pub exclude_mempool_txs: HashSet<Txid>,
 }
 
@@ -170,7 +172,7 @@ where
             }
             typewit::const_marker::BoolWit::False(_) => (),
         }
-        template.prefix_txs.extend(suffix_left.txs.iter().cloned());
+        template.suffix_txs.extend(suffix_left.txs.iter().cloned());
         let suffix_right = self
             .1
             .block_template_suffix(
