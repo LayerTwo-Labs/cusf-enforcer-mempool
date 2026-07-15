@@ -169,6 +169,33 @@ where
     )
 }
 
+#[repr(transparent)]
+struct DisplayList<'a, T>(&'a T);
+
+impl<'a, T> std::fmt::Display for DisplayList<'a, T>
+where
+    &'a T: IntoIterator,
+    <&'a T as IntoIterator>::Item: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[repr(transparent)]
+        struct DebugDisplay<T>(T);
+
+        impl<T> std::fmt::Debug for DebugDisplay<T>
+        where
+            T: std::fmt::Display,
+        {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Display::fmt(&self.0, f)
+            }
+        }
+
+        f.debug_list()
+            .entries(self.0.into_iter().map(DebugDisplay))
+            .finish()
+    }
+}
+
 /// Compute the block reward for the specified height
 fn get_block_reward(height: u32, fees: Amount, network: Network) -> Amount {
     let subsidy_sats = 50 * Amount::ONE_BTC.to_sat();
@@ -336,6 +363,8 @@ where
     MempoolRemove(#[from] crate::mempool::MempoolRemoveError),
     #[error(transparent)]
     SuffixTxs(BP::SuffixTxsError),
+    #[error("weight overflow")]
+    WeightOverflow,
 }
 
 // select block txs, and coinbase txouts if coinbasetxn is set
@@ -368,16 +397,16 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         .iter()
         .map(|(tx, _fee)| tx.compute_txid())
         .collect();
+    let suffix_txids: hashlink::LinkedHashSet<Txid> = initial_block_template
+        .suffix_txs
+        .iter()
+        .map(|(tx, _fee)| tx.compute_txid())
+        .collect();
     {
-        let prefix_txids: String = format!(
-            "[{}]",
-            prefix_txids
-                .iter()
-                .map(|txid| txid.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+        tracing::debug!(
+            prefix_txids = %DisplayList(&prefix_txids),
+            suffix_txids = %DisplayList(&suffix_txids),
         );
-        tracing::debug!(%prefix_txids);
     }
     let mut mempool = mempool.clone();
     tracing::debug!("Inserting prefix txs into cloned mempool");
@@ -407,7 +436,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             })
             .collect()
     };
-    // Remove prefix txs
+    // Remove prefix/excluded/suffix txs
     {
         tracing::debug!("Removing prefix txs");
         let _removed_txs = mempool
@@ -418,24 +447,20 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             .map_err(|err| match err {
                 either::Either::Left(err) => err,
             })?;
-        {
-            let excluded_txids: String = format!(
-                "[{}]",
-                initial_block_template
-                    .exclude_mempool_txs
-                    .iter()
-                    .map(|txid| txid.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            tracing::debug!(%excluded_txids, "Removing excluded txs");
-        }
+        tracing::debug!("Removing prefix txs");
+        tracing::debug!(
+            excluded_txids = %DisplayList(
+                &initial_block_template.exclude_mempool_txs
+            ),
+            "Removing excluded/suffix txs"
+        );
         let _removed_txs = mempool
             .try_filter(true, |tx, _| {
                 let txid = tx.compute_txid();
-                Result::<_, Infallible>::Ok(
-                    !initial_block_template.exclude_mempool_txs.contains(&txid),
-                )
+                let excluded =
+                    initial_block_template.exclude_mempool_txs.contains(&txid)
+                        || suffix_txids.contains(&txid);
+                Result::<_, Infallible>::Ok(!excluded)
             })
             .map_err(|err| match err {
                 either::Either::Left(err) => err,
@@ -443,16 +468,20 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     }
     tracing::debug!("Proposing txs for inclusion in block");
     let coinbase_txouts_weight = {
-        let txouts_weight = match typewit::MakeTypeWitness::MAKE {
+        let mut txouts_weight = Weight::ZERO;
+        match typewit::MakeTypeWitness::MAKE {
             typewit::const_marker::BoolWit::True(wit) => {
                 let wit = wit.map(cusf_block_producer::CoinbaseTxouts);
-                wit.in_ref()
+                for tx_out in wit
+                    .in_ref()
                     .to_right(&initial_block_template.coinbase_txouts)
-                    .iter()
-                    .map(|tx_out| tx_out.weight())
-                    .sum()
+                {
+                    txouts_weight = txouts_weight
+                        .checked_add(tx_out.weight())
+                        .ok_or(BuildBlockError::WeightOverflow)?;
+                }
             }
-            typewit::const_marker::BoolWit::False(_) => Weight::ZERO,
+            typewit::const_marker::BoolWit::False(_) => (),
         };
         const COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT: Weight = {
             let weight_wu = Weight::from_non_witness_data_size(Amount::SIZE as u64).to_wu()
@@ -461,20 +490,39 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             Weight::from_wu(weight_wu)
         };
         Weight::from_wu(
-            txouts_weight.to_wu()
-                + COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT.to_wu(),
+            txouts_weight
+                .to_wu()
+                .checked_add(COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT.to_wu())
+                .ok_or(BuildBlockError::WeightOverflow)?,
         )
     };
-    let prefix_txs_weight = initial_block_template
-        .prefix_txs
-        .iter()
-        .map(|(tx, _)| tx.weight())
-        .sum();
-    let initial_block_template_weight =
-        coinbase_txouts_weight + prefix_txs_weight;
-    let mempool_txs = mempool.propose_txs(Some(
-        mempool::MAX_USABLE_BLOCK_WEIGHT - initial_block_template_weight,
-    ))?;
+    let prefix_txs_weight = {
+        let mut weight = Weight::ZERO;
+        for (tx, _) in &initial_block_template.prefix_txs {
+            weight = weight
+                .checked_add(tx.weight())
+                .ok_or(BuildBlockError::WeightOverflow)?;
+        }
+        weight
+    };
+    let suffix_txs_weight = {
+        let mut weight = Weight::ZERO;
+        for (tx, _) in &initial_block_template.suffix_txs {
+            weight = weight
+                .checked_add(tx.weight())
+                .ok_or(BuildBlockError::WeightOverflow)?;
+        }
+        weight
+    };
+    let initial_block_template_weight = coinbase_txouts_weight
+        .checked_add(prefix_txs_weight)
+        .and_then(|weight| weight.checked_add(suffix_txs_weight))
+        .ok_or(BuildBlockError::WeightOverflow)?;
+    let mempool_txs = mempool.propose_txs(Some(Weight::from_wu(
+        mempool::MAX_USABLE_BLOCK_WEIGHT
+            .to_wu()
+            .saturating_sub(initial_block_template_weight.to_wu()),
+    )))?;
     {
         let proposed_txids: String = {
             use std::fmt::Write;
@@ -531,6 +579,17 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         typewit::const_marker::BoolWit::False(_) => (),
     }
     res_txs.extend(mempool_txs);
+    res_txs.extend(initial_block_template.suffix_txs.iter().map(
+        |(tx, fee)| BlockTemplateTransaction {
+            data: bitcoin::consensus::serialize(tx),
+            txid: tx.compute_txid(),
+            hash: tx.compute_wtxid(),
+            depends: Vec::new(),
+            fee: (*fee).try_into().unwrap(),
+            sigops: None,
+            weight: tx.weight().to_wu(),
+        },
+    ));
     res_txs.extend(template_suffix.txs.iter().map(|(tx, fee)| {
         BlockTemplateTransaction {
             data: bitcoin::consensus::serialize(tx),
