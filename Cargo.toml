@@ -15,7 +15,7 @@ async-trait = "0.1.81"
 bitcoin = "0.32.100"
 chrono = "0.4.44"
 clap = "4.6.1"
-educe = "0.6.0"
+educe = { version = "0.6.0", default-features = false }
 either = "1.16.0"
 futures = "0.3.32"
 hashlink = "0.12.0"

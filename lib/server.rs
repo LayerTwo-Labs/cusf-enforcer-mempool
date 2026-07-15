@@ -17,7 +17,10 @@ use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorCode};
 use thiserror::Error;
 
 use crate::{
-    cusf_block_producer::{self, CusfBlockProducer, InitialBlockTemplate},
+    cusf_block_producer::{
+        self, CusfBlockProducer, FilledBlockTemplate, InitialBlockTemplate,
+        initial_block_template::SuffixTxsItem,
+    },
     mempool::{self, Mempool, MempoolSync},
 };
 
@@ -354,6 +357,8 @@ where
     BP: CusfBlockProducer,
 {
     #[error(transparent)]
+    FinalizeBlockTemplate(BP::FinalizeBlockTemplateError),
+    #[error(transparent)]
     FinalizeCoinbaseTx(#[from] FinalizeCoinbaseTxError),
     #[error(transparent)]
     InitialBlockTemplate(BP::InitialBlockTemplateError),
@@ -361,8 +366,6 @@ where
     MempoolInsert(#[from] crate::mempool::MempoolInsertError),
     #[error(transparent)]
     MempoolRemove(#[from] crate::mempool::MempoolRemoveError),
-    #[error(transparent)]
-    SuffixTxs(BP::SuffixTxsError),
     #[error("weight overflow")]
     WeightOverflow,
 }
@@ -384,11 +387,11 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     let mut initial_block_template =
         InitialBlockTemplate::<COINBASE_TXN>::default();
     tracing::debug!("Generating initial block template");
-    initial_block_template = block_producer
+    let () = block_producer
         .initial_block_template(
             parent_block_hash,
             typewit::MakeTypeWitness::MAKE,
-            initial_block_template,
+            &mut initial_block_template,
         )
         .await
         .map_err(BuildBlockError::InitialBlockTemplate)?;
@@ -400,7 +403,10 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     let suffix_txids: hashlink::LinkedHashSet<Txid> = initial_block_template
         .suffix_txs
         .iter()
-        .map(|(tx, _fee)| tx.compute_txid())
+        .filter_map(|suffix_tx| match suffix_tx {
+            SuffixTxsItem::Tx((tx, _)) => Some(tx.compute_txid()),
+            SuffixTxsItem::Reserved { .. } => None,
+        })
         .collect();
     {
         tracing::debug!(
@@ -507,9 +513,9 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     };
     let suffix_txs_weight = {
         let mut weight = Weight::ZERO;
-        for (tx, _) in &initial_block_template.suffix_txs {
+        for suffix_tx in &initial_block_template.suffix_txs {
             weight = weight
-                .checked_add(tx.weight())
+                .checked_add(suffix_tx.weight())
                 .ok_or(BuildBlockError::WeightOverflow)?;
         }
         weight
@@ -552,7 +558,9 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         };
         tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
     }
-    initial_block_template
+    let mut filled_block_template: FilledBlockTemplate<COINBASE_TXN> =
+        initial_block_template.into();
+    filled_block_template
         .prefix_txs
         .extend(mempool_txs.iter().map(|tx| {
             let fee = tx.fee.unsigned_abs();
@@ -560,26 +568,16 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             (tx, fee)
         }));
     tracing::debug!("Adding block template suffix");
-    let template_suffix = block_producer
-        .block_template_suffix(
+    let () = block_producer
+        .finalize_block_template(
             parent_block_hash,
             typewit::MakeTypeWitness::MAKE,
-            &initial_block_template,
+            &mut filled_block_template,
         )
         .await
-        .map_err(BuildBlockError::SuffixTxs)?;
-    let mut res_coinbase_txouts = initial_block_template.coinbase_txouts;
-    match typewit::MakeTypeWitness::MAKE {
-        typewit::const_marker::BoolWit::True(wit) => {
-            let wit = wit.map(cusf_block_producer::CoinbaseTxouts);
-            wit.in_mut()
-                .to_right(&mut res_coinbase_txouts)
-                .extend(wit.to_right(template_suffix.coinbase_txouts));
-        }
-        typewit::const_marker::BoolWit::False(_) => (),
-    }
+        .map_err(BuildBlockError::FinalizeBlockTemplate)?;
     res_txs.extend(mempool_txs);
-    res_txs.extend(initial_block_template.suffix_txs.iter().map(
+    res_txs.extend(filled_block_template.suffix_txs().iter().map(
         |(tx, fee)| BlockTemplateTransaction {
             data: bitcoin::consensus::serialize(tx),
             txid: tx.compute_txid(),
@@ -590,17 +588,6 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             weight: tx.weight().to_wu(),
         },
     ));
-    res_txs.extend(template_suffix.txs.iter().map(|(tx, fee)| {
-        BlockTemplateTransaction {
-            data: bitcoin::consensus::serialize(tx),
-            txid: tx.compute_txid(),
-            hash: tx.compute_wtxid(),
-            depends: Vec::new(),
-            fee: (*fee).try_into().unwrap(),
-            sigops: None,
-            weight: tx.weight().to_wu(),
-        }
-    }));
     // Fill depends
     {
         let mut tx_indexes = std::collections::HashMap::new();
@@ -620,7 +607,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             tx.depends.dedup();
         }
     }
-    Ok((res_coinbase_txouts, res_txs))
+    Ok((filled_block_template.coinbase_txouts, res_txs))
 }
 
 struct MempoolQueryOutput {

@@ -1,8 +1,6 @@
-use std::{
-    collections::HashSet, convert::Infallible, fmt::Debug, future::Future,
-};
+use std::{convert::Infallible, fmt::Debug, future::Future};
 
-use bitcoin::{BlockHash, Transaction, TxOut, Txid};
+use bitcoin::{BlockHash, TxOut};
 use either::Either;
 
 use crate::cusf_enforcer::{self, CusfEnforcer};
@@ -40,27 +38,128 @@ where
     type Output = <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts;
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct InitialBlockTemplate<const COINBASE_TXN: bool>
-where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
+pub mod initial_block_template {
+    use std::collections::HashSet;
+
+    use bitcoin::{Transaction, Txid};
+
+    use crate::cusf_block_producer::CoinbaseTxn;
+
+    pub type TxsItem = (Transaction, bitcoin::Amount);
+
+    #[derive(Clone, Debug)]
+    pub enum SuffixTxsItem {
+        /// Transaction is already generated
+        Tx(TxsItem),
+        /// Reserved, tx will be generated after mempool txs are selected
+        Reserved { weight: bitcoin::Weight },
+    }
+
+    impl SuffixTxsItem {
+        pub fn weight(&self) -> bitcoin::Weight {
+            match self {
+                Self::Tx((tx, _)) => tx.weight(),
+                Self::Reserved { weight } => *weight,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct Template<const COINBASE_TXN: bool>
+    where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
+    {
+        pub coinbase_txouts: <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
+        /// Prefix txs, with absolute fee
+        pub prefix_txs: Vec<TxsItem>,
+        /// Suffix txs
+        pub suffix_txs: Vec<SuffixTxsItem>,
+        /// prefix/suffix txs do not need to be included here
+        pub exclude_mempool_txs: HashSet<Txid>,
+    }
+}
+pub use initial_block_template::Template as InitialBlockTemplate;
+
+pub struct FilledBlockTemplateMut<'a, const COINBASE_TXN: bool>
+    where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
 {
-    pub coinbase_txouts: <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
+    pub coinbase_txouts: &'a mut <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
     /// Prefix txs, with absolute fee
-    pub prefix_txs: Vec<(Transaction, bitcoin::Amount)>,
-    /// Suffix txs, with absolute fee
-    pub suffix_txs: Vec<(Transaction, bitcoin::Amount)>,
-    /// prefix/suffix txs do not need to be included here
-    pub exclude_mempool_txs: HashSet<Txid>,
+    pub prefix_txs: &'a Vec<initial_block_template::TxsItem>,
+    /// Suffix txs
+    pub suffix_txs: &'a mut Vec<initial_block_template::TxsItem>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct BlockTemplateSuffix<const COINBASE_TXN: bool>
+#[derive(educe::Educe)]
+#[educe(Clone, Debug, Default)]
+pub struct FilledBlockTemplate<const COINBASE_TXN: bool>
 where typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn
 {
-    /// Suffix coinbase txouts
-    pub coinbase_txouts: <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
-    /// Suffix txs, with absolute fee
-    pub txs: Vec<(Transaction, bitcoin::Amount)>,
+    pub(crate) coinbase_txouts: <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts,
+    /// Prefix txs, with absolute fee
+    pub(crate) prefix_txs: Vec<initial_block_template::TxsItem>,
+    /// Suffix txs
+    pub(crate) suffix_txs: Vec<initial_block_template::TxsItem>,
+}
+
+impl<const COINBASE_TXN: bool> FilledBlockTemplate<COINBASE_TXN>
+where
+    typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+{
+    pub fn as_mut(&mut self) -> FilledBlockTemplateMut<'_, COINBASE_TXN> {
+        let Self {
+            coinbase_txouts,
+            prefix_txs,
+            suffix_txs,
+        } = self;
+        FilledBlockTemplateMut {
+            coinbase_txouts,
+            prefix_txs,
+            suffix_txs,
+        }
+    }
+
+    pub fn coinbase_txouts(&mut self) -> &mut <typewit::const_marker::Bool<COINBASE_TXN> as CoinbaseTxn>::CoinbaseTxouts{
+        &mut self.coinbase_txouts
+    }
+
+    /// Prefix txs, with absolute fee
+    pub fn prefix_txs(&self) -> &Vec<initial_block_template::TxsItem> {
+        &self.prefix_txs
+    }
+
+    /// Suffix txs
+    pub fn suffix_txs(&mut self) -> &mut Vec<initial_block_template::TxsItem> {
+        &mut self.suffix_txs
+    }
+}
+
+impl<const COINBASE_TXN: bool> From<InitialBlockTemplate<COINBASE_TXN>>
+    for FilledBlockTemplate<COINBASE_TXN>
+where
+    typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+{
+    fn from(template: InitialBlockTemplate<COINBASE_TXN>) -> Self {
+        let InitialBlockTemplate {
+            coinbase_txouts,
+            prefix_txs,
+            suffix_txs,
+            exclude_mempool_txs: _,
+        } = template;
+        let suffix_txs = suffix_txs
+            .into_iter()
+            .filter_map(|suffix_txs_item| match suffix_txs_item {
+                initial_block_template::SuffixTxsItem::Tx(tx_item) => {
+                    Some(tx_item)
+                }
+                initial_block_template::SuffixTxsItem::Reserved { .. } => None,
+            })
+            .collect();
+        Self {
+            coinbase_txouts,
+            prefix_txs,
+            suffix_txs,
+        }
+    }
 }
 
 pub trait CusfBlockProducer: CusfEnforcer {
@@ -70,30 +169,21 @@ pub trait CusfBlockProducer: CusfEnforcer {
         &self,
         parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        template: InitialBlockTemplate<COINBASE_TXN>,
-    ) -> impl Future<
-        Output = Result<
-            InitialBlockTemplate<COINBASE_TXN>,
-            Self::InitialBlockTemplateError,
-        >,
-    > + Send
+        template: &mut InitialBlockTemplate<COINBASE_TXN>,
+    ) -> impl Future<Output = Result<(), Self::InitialBlockTemplateError>> + Send
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn;
 
-    type SuffixTxsError: std::error::Error + Send + Sync + 'static;
+    type FinalizeBlockTemplateError: std::error::Error + Send + Sync + 'static;
 
-    /// Add outputs / txs to a block template, after filling with proposed txs
-    fn block_template_suffix<const COINBASE_TXN: bool>(
+    /// Finalize coinbase outputs / suffix txs for a block template, after
+    /// filling with proposed txs
+    fn finalize_block_template<const COINBASE_TXN: bool>(
         &self,
         parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> impl Future<
-        Output = Result<
-            BlockTemplateSuffix<COINBASE_TXN>,
-            Self::SuffixTxsError,
-        >,
-    > + Send
+        template: &mut FilledBlockTemplate<COINBASE_TXN>,
+    ) -> impl Future<Output = Result<(), Self::FinalizeBlockTemplateError>> + Send
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn;
 }
@@ -110,16 +200,12 @@ where
         &self,
         parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        mut template: InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<
-        InitialBlockTemplate<COINBASE_TXN>,
-        Self::InitialBlockTemplateError,
-    >
+        template: &mut InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::InitialBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        template = self
-            .0
+        self.0
             .initial_block_template(
                 parent_block_hash,
                 coinbase_txn_wit,
@@ -137,64 +223,37 @@ where
             .map_err(Either::Right)
     }
 
-    type SuffixTxsError = Either<C0::SuffixTxsError, C1::SuffixTxsError>;
+    type FinalizeBlockTemplateError =
+        Either<C0::FinalizeBlockTemplateError, C1::FinalizeBlockTemplateError>;
 
-    async fn block_template_suffix<const COINBASE_TXN: bool>(
+    async fn finalize_block_template<const COINBASE_TXN: bool>(
         &self,
         parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
+        template: &mut FilledBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::FinalizeBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        let suffix_left = self
+        let () = self
             .0
-            .block_template_suffix(
+            .finalize_block_template(
                 parent_block_hash,
                 coinbase_txn_wit,
                 template,
             )
             .await
             .map_err(Either::Left)?;
-        let mut template = template.clone();
-        match coinbase_txn_wit {
-            typewit::const_marker::BoolWit::True(wit) => {
-                let wit = wit.map(CoinbaseTxouts);
-                let coinbase_txouts: &mut Vec<_> =
-                    wit.in_mut().to_right(&mut template.coinbase_txouts);
-                coinbase_txouts.extend(
-                    wit.in_ref()
-                        .to_right(&suffix_left.coinbase_txouts)
-                        .iter()
-                        .cloned(),
-                );
-            }
-            typewit::const_marker::BoolWit::False(_) => (),
-        }
-        template.suffix_txs.extend(suffix_left.txs.iter().cloned());
-        let suffix_right = self
+        let () = self
             .1
-            .block_template_suffix(
+            .finalize_block_template(
                 parent_block_hash,
                 coinbase_txn_wit,
-                &template,
+                template,
             )
             .await
             .map_err(Either::Right)?;
-        let mut res = suffix_left;
-        match coinbase_txn_wit {
-            typewit::const_marker::BoolWit::True(wit) => {
-                let wit = wit.map(CoinbaseTxouts);
-                let coinbase_txouts: &mut Vec<_> =
-                    wit.in_mut().to_right(&mut res.coinbase_txouts);
-                coinbase_txouts
-                    .extend(wit.to_right(suffix_right.coinbase_txouts));
-            }
-            typewit::const_marker::BoolWit::False(_) => (),
-        }
-        res.txs.extend(suffix_right.txs);
-        Ok(res)
+        Ok(())
     }
 }
 
@@ -205,29 +264,26 @@ impl CusfBlockProducer for cusf_enforcer::DefaultEnforcer {
         &self,
         _parent_block_hash: &BlockHash,
         _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        template: InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<
-        InitialBlockTemplate<COINBASE_TXN>,
-        Self::InitialBlockTemplateError,
-    >
+        _template: &mut InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::InitialBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        Ok(template)
+        Ok(())
     }
 
-    type SuffixTxsError = Infallible;
+    type FinalizeBlockTemplateError = Infallible;
 
-    async fn block_template_suffix<const COINBASE_TXN: bool>(
+    async fn finalize_block_template<const COINBASE_TXN: bool>(
         &self,
         _parent_block_hash: &BlockHash,
         _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        _template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
+        _template: &mut FilledBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::FinalizeBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
-        Ok(BlockTemplateSuffix::default())
+        Ok(())
     }
 }
 
@@ -243,11 +299,8 @@ where
         &self,
         parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        template: InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<
-        InitialBlockTemplate<COINBASE_TXN>,
-        Self::InitialBlockTemplateError,
-    >
+        template: &mut InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::InitialBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
@@ -271,20 +324,21 @@ where
         }
     }
 
-    type SuffixTxsError = Either<C0::SuffixTxsError, C1::SuffixTxsError>;
+    type FinalizeBlockTemplateError =
+        Either<C0::FinalizeBlockTemplateError, C1::FinalizeBlockTemplateError>;
 
-    async fn block_template_suffix<const COINBASE_TXN: bool>(
+    async fn finalize_block_template<const COINBASE_TXN: bool>(
         &self,
         parent_block_hash: &BlockHash,
         coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
-        template: &InitialBlockTemplate<COINBASE_TXN>,
-    ) -> Result<BlockTemplateSuffix<COINBASE_TXN>, Self::SuffixTxsError>
+        template: &mut FilledBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::FinalizeBlockTemplateError>
     where
         typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
     {
         match self {
             Self::Left(left) => left
-                .block_template_suffix(
+                .finalize_block_template(
                     parent_block_hash,
                     coinbase_txn_wit,
                     template,
@@ -292,7 +346,7 @@ where
                 .await
                 .map_err(Either::Left),
             Self::Right(right) => right
-                .block_template_suffix(
+                .finalize_block_template(
                     parent_block_hash,
                     coinbase_txn_wit,
                     template,
