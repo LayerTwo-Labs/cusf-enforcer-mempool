@@ -775,7 +775,12 @@ where
                     .get_mining_info()
                     .await
                     .map_err(internal_error)?;
-                let target = mining_info.next.target;
+                let target = mining_info
+                    .next
+                    .map(|next| next.target)
+                    .unwrap_or_else(|| {
+                        bitcoin::Target::from_be_bytes(self.sample_block_template.target)
+                    });
                 self.known_targets.write().insert(prev_blockhash, target);
                 target
             }
