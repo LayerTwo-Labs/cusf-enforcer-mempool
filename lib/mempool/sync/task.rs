@@ -1024,7 +1024,7 @@ where
 
         let span = tracing::debug_span!(
             "handle_stream_msg",
-            sequence_id = ulid::Ulid::new().to_string(), // ULIDs are clickable, short and sorts naturally by time
+            sequence_id = ulid::Ulid::generate().to_string(), // ULIDs are clickable, short and sorts naturally by time
         );
 
         tracing::debug!(parent: &span, "Handling {msg_kind} stream message");
