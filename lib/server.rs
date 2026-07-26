@@ -1,4 +1,9 @@
-use std::{collections::HashMap, convert::Infallible, time::Duration};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bitcoin::{
@@ -99,6 +104,23 @@ pub enum CreateServerError {
     SampleBlockTemplate,
 }
 
+/// How long a BIP22 long-poll `getblocktemplate` request may be held open
+/// waiting for a tip change before a fresh template is returned anyway. The
+/// timeout return refreshes `curtime` and the tx set, so it doubles as the
+/// client's periodic-refresh cadence. If a client's request timeout is shorter
+/// than this they simply abort before we respond and never benefits from long
+/// polling.
+const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A `longpollid` is the tip hash the template was built on followed by
+/// a monotonic sequence number. The suffix makes the id unique per
+/// template-build event, as BIP22 requires. Without it, a
+/// timeout return would reuse the previous id for a different (refreshed)
+/// template. Clients treat the whole string as opaque, per the BIP.
+fn parse_long_poll_tip(long_poll_id: &str) -> Option<BlockHash> {
+    long_poll_id.get(..64)?.parse().ok()
+}
+
 pub struct Server<Enforcer, RpcClient> {
     coinbase_spk: ScriptBuf,
     mempool: MempoolSync<Enforcer>,
@@ -109,6 +131,10 @@ pub struct Server<Enforcer, RpcClient> {
     sample_block_template: BlockTemplate,
     /// Map of block hashes to known targets for the next block
     known_targets: parking_lot::RwLock<HashMap<BlockHash, bitcoin::Target>>,
+    /// Tip observer used to park long-poll requests until the tip changes.
+    tip_rx: tokio::sync::watch::Receiver<BlockHash>,
+    /// Uniquifying suffix for `longpollid`s, see [`parse_long_poll_tip`].
+    long_poll_seq: AtomicU64,
 }
 
 impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
@@ -137,6 +163,7 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
                     cached_template_lifetime,
                 ))
             });
+        let tip_rx = mempool.subscribe_tip();
         Ok(Self {
             coinbase_spk,
             mempool,
@@ -146,6 +173,8 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
             cached_block_templates,
             sample_block_template,
             known_targets: parking_lot::RwLock::new(HashMap::new()),
+            tip_rx,
+            long_poll_seq: AtomicU64::new(0),
         })
     }
 }
@@ -678,6 +707,27 @@ where
     ) -> RpcResult<BlockTemplate> {
         const NONCE_RANGE: [u8; 8] = [0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
 
+        // BIP22 long polling: when the request carries the longpollid of the
+        // tip we are currently on, park it until the tip changes, then fall
+        // through and serve a template for the new tip. A stale or
+        // unparseable longpollid returns immediately. The timeout return
+        // serves a refreshed template (new curtime / tx set) for the same
+        // tip. `wait_for` checks the current value before waiting, so a tip
+        // change between parsing and parking is not missed.
+        if let Some(long_poll_id) = &request.long_poll_id
+            && let Some(long_poll_tip) = parse_long_poll_tip(long_poll_id)
+        {
+            let mut tip_rx = self.tip_rx.clone();
+            let _wait_result: Result<
+                Result<_, _>,
+                tokio::time::error::Elapsed,
+            > = tokio::time::timeout(
+                LONG_POLL_TIMEOUT,
+                tip_rx.wait_for(|tip| *tip != long_poll_tip),
+            )
+            .await;
+        }
+
         let now = Utc::now();
         let BlockTemplate {
             version,
@@ -825,7 +875,10 @@ where
             transactions: block_txs,
             coinbase_aux: coinbase_aux.clone(),
             coinbase_txn_or_value,
-            long_poll_id: None,
+            long_poll_id: Some(format!(
+                "{prev_blockhash}{:016x}",
+                self.long_poll_seq.fetch_add(1, Ordering::Relaxed)
+            )),
             target: target.to_be_bytes(),
             mintime,
             mutable: mutable.clone(),

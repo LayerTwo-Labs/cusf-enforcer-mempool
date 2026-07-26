@@ -27,7 +27,7 @@ use futures::{
 };
 use hashlink::LinkedHashSet;
 use thiserror::Error;
-use tokio::sync::RwLock as TokioRwLock;
+use tokio::sync::{RwLock as TokioRwLock, watch};
 use tracing::Instrument;
 
 use crate::{
@@ -124,6 +124,10 @@ struct MempoolSyncInner<Enforcer> {
     abandoned_pool: AbandonedPool,
     enforcer: Enforcer,
     mempool: Mempool,
+    /// Publishes `mempool.chain.tip` whenever it changes, so observers (e.g.
+    /// the GBT server's BIP22 long polling) can wait on tip changes without
+    /// polling. Receivers come from [`MempoolSync::subscribe_tip`].
+    tip_watch: watch::Sender<BlockHash>,
     unfiltered_mempool: UnfilteredMempool,
 }
 
@@ -259,6 +263,7 @@ where
                 inner.mempool.remove_with_descendants(&txid)?;
             }
             inner.mempool.chain.tip = block.hash;
+            let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
         }
         ConnectBlockAction::Reject => {
             sync_state
@@ -319,6 +324,7 @@ where
             inner.mempool.remove_with_descendants(&txid)?;
         }
         inner.mempool.chain.tip = prev_blockhash;
+        let _prev: BlockHash = inner.tip_watch.send_replace(prev_blockhash);
     }
     inner.unfiltered_mempool.tip = prev_blockhash;
     Ok(true)
@@ -1133,10 +1139,12 @@ where
     } = rpc_client
         .get_raw_mempool(BoolWitness::<false>, BoolWitness::<true>)
         .await?;
+    let (tip_watch, _) = watch::channel(best_block_hash);
     let inner = MempoolSyncInner {
         abandoned_pool: AbandonedPool::default(),
         enforcer,
         mempool: Mempool::new(best_block_hash),
+        tip_watch,
         unfiltered_mempool: UnfilteredMempool {
             tip: best_block_hash,
             txs: HashSet::new(),
@@ -1197,6 +1205,7 @@ where
                 abandoned_pool,
                 enforcer: _,
                 mempool,
+                tip_watch,
                 unfiltered_mempool,
             } = inner.into_inner();
             MempoolSyncing {
@@ -1204,6 +1213,7 @@ where
                     abandoned_pool,
                     enforcer: (),
                     mempool,
+                    tip_watch,
                     unfiltered_mempool,
                 },
                 sync_state,
@@ -1221,6 +1231,14 @@ where
 pub struct MempoolSync<Enforcer> {
     inner: std::sync::Weak<TokioRwLock<MempoolSyncInner<Enforcer>>>,
     _task: tokio_util::task::AbortOnDropHandle<()>,
+    /// Observes `mempool.chain.tip`, see [`Self::subscribe_tip`].
+    tip_rx: watch::Receiver<BlockHash>,
+}
+
+impl<Enforcer> MempoolSync<Enforcer> {
+    pub fn subscribe_tip(&self) -> watch::Receiver<BlockHash> {
+        self.tip_rx.clone()
+    }
 }
 
 impl<Enforcer> MempoolSync<Enforcer>
@@ -1243,24 +1261,27 @@ where
             mut combined_stream,
             _marker,
         } = mempool_synced;
-        let (inner, mut sync_state) = {
+        let (inner, tip_rx, mut sync_state) = {
             let MempoolSyncing {
                 inner:
                     MempoolSyncInner {
                         abandoned_pool,
                         enforcer: (),
                         mempool,
+                        tip_watch,
                         unfiltered_mempool,
                     },
                 sync_state,
             } = inner;
+            let tip_rx = tip_watch.subscribe();
             let inner = MempoolSyncInner {
                 abandoned_pool,
                 enforcer,
                 mempool,
+                tip_watch,
                 unfiltered_mempool,
             };
-            (inner, sync_state)
+            (inner, tip_rx, sync_state)
         };
         let inner = Arc::new(TokioRwLock::new(inner));
         let inner_weak = Arc::downgrade(&inner);
@@ -1279,6 +1300,7 @@ where
         Self {
             inner: inner_weak,
             _task: tokio_util::task::AbortOnDropHandle::new(task),
+            tip_rx,
         }
     }
 
