@@ -7,10 +7,14 @@ use cusf_enforcer_mempool_integration_tests::{
     test_disconnect_through_sync_tip, test_double_insert_after_reorg,
     test_enforcer_rejection_during_reorg, test_rbf_removed_for_absent_tx,
     test_reorg_re_inserts_tx,
-    util::{BinPaths, TestFailure, TestFailureCollector},
+    util::{
+        BinPaths, TestFailure, TestFailureCollector, display_timing_summary,
+        record_test_timing,
+    },
 };
 use libtest_mimic::{Arguments, Trial};
 use tokio_util::task::AbortOnDropHandle;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
     filter as tracing_filter, layer::SubscriberExt, util::SubscriberInitExt,
 };
@@ -19,6 +23,11 @@ const PER_TEST_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Parser)]
 struct Cli {
+    /// Stream test-harness logs at this level while tests run: off, error,
+    /// warn, info, debug, or trace. Off by default; the progress lines, the
+    /// pass/fail summary, and per-failure log dumps are always shown.
+    #[arg(long, default_value = "off", value_name = "LEVEL")]
+    log_level: LevelFilter,
     #[command(flatten)]
     test_args: Arguments,
 }
@@ -52,12 +61,19 @@ fn targets_directive_str<'a>(
         .join(",")
 }
 
-fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
+// Configure logger. `log_level` gates streaming of harness log events: `off`
+// (the default) streams nothing — the progress lines, results, and per-failure
+// dumps are printed directly, not via tracing — and any other level streams
+// the harness crates at that level (deps one level lower).
+fn set_tracing_subscriber(log_level: LevelFilter) -> anyhow::Result<()> {
+    let Some(level) = log_level.into_level() else {
+        return Ok(());
+    };
     let targets_filter = {
         let defaults = targets_directive_str([
-            ("", saturating_pred_level(log_level)),
-            ("cusf_enforcer_mempool", log_level),
-            ("cusf_enforcer_mempool_integration_tests", log_level),
+            ("", saturating_pred_level(level)),
+            ("cusf_enforcer_mempool", level),
+            ("cusf_enforcer_mempool_integration_tests", level),
         ]);
         let directives =
             match std::env::var(tracing_filter::EnvFilter::DEFAULT_ENV) {
@@ -100,7 +116,9 @@ where
     let span_name = name.clone();
     Trial::test(name.clone(), move || {
         let test_name = name.clone();
+        let timing_name = name.clone();
         let span_name = span_name.clone();
+        let started = std::time::Instant::now();
         let outcome = std::thread::spawn(move || {
             rt_handle.block_on(async move {
                 let span = tracing::info_span!("test", name = %span_name);
@@ -132,10 +150,44 @@ where
                 result
             })
         })
-        .join()
-        .map_err(|_| libtest_mimic::Failed::from("test thread panicked"))?;
-        outcome.map_err(|e| libtest_mimic::Failed::from(format!("{e:#}")))
+        .join();
+        let result = match outcome {
+            Ok(res) => {
+                res.map_err(|e| libtest_mimic::Failed::from(format!("{e:#}")))
+            }
+            Err(_) => Err(libtest_mimic::Failed::from("test thread panicked")),
+        };
+        record_test_timing(timing_name, started.elapsed(), result.is_ok());
+        result
     })
+}
+
+/// Whether `trial` would run under `args`, mirroring libtest_mimic's
+/// name-based filtering (substring match, or exact with `--exact`, minus any
+/// `--skip` patterns). Lets us detect an empty filter result before running.
+fn filter_matches(args: &Arguments, trial: &Trial) -> bool {
+    let name = trial.name();
+    if let Some(filter) = &args.filter {
+        let hit = if args.exact {
+            name == filter
+        } else {
+            name.contains(filter)
+        };
+        if !hit {
+            return false;
+        }
+    }
+    for skip in &args.skip {
+        let hit = if args.exact {
+            name == skip
+        } else {
+            name.contains(skip)
+        };
+        if hit {
+            return false;
+        }
+    }
+    true
 }
 
 // MUST be run from within a tokio runtime
@@ -144,7 +196,7 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
 
     let rt_handle = tokio::runtime::Handle::current();
 
-    set_tracing_subscriber(tracing::Level::DEBUG)?;
+    set_tracing_subscriber(cli.log_level)?;
 
     let bin_paths = BinPaths::new();
     bin_paths.bitcoind().map_err(|err| {
@@ -223,7 +275,26 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         ));
     }
 
+    // Bail *before* running if a filter was provided but matches nothing —
+    // otherwise libtest prints its "running 0 tests" banner and an "ok"
+    // result line before we get a chance to error out.
+    if cli.test_args.filter.is_some()
+        && !trials
+            .iter()
+            .any(|trial| filter_matches(&cli.test_args, trial))
+    {
+        anyhow::bail!(
+            "no integration test matched the provided filter `{}`",
+            cli.test_args.filter.as_deref().unwrap_or("")
+        );
+    }
+
+    let started = std::time::Instant::now();
     let exit_code = libtest_mimic::run(&cli.test_args, trials).exit_code();
+    let wall = started.elapsed();
+
+    // Per-test timing, then any failures at the end
+    display_timing_summary(wall);
     collector.display_all_failures();
     Ok(exit_code)
 }
