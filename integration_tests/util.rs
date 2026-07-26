@@ -182,7 +182,10 @@ impl Bitcoind {
 
 /// Poll `getblockchaininfo` until bitcoind serves a successful response.
 pub async fn wait_for_bitcoind_ready(rpc: &RpcClient) -> anyhow::Result<()> {
-    const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+    // When the whole suite runs at once, many bitcoind processes cold-start
+    // together. Apply a generous limit here that doesn't crash long running
+    // tests, but catches stuck ones.
+    const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
     const POLL_INTERVAL: Duration = Duration::from_millis(200);
     let deadline = tokio::time::Instant::now() + TOTAL_TIMEOUT;
     loop {
@@ -368,6 +371,48 @@ impl TestFailureCollector {
             }
         }
         eprintln!("\n{}", "=".repeat(80));
+    }
+}
+
+/// `(test name, wall-clock duration, passed)`, recorded as each test
+/// finishes.
+type TestTiming = (String, Duration, bool);
+
+static TEST_TIMINGS: std::sync::LazyLock<Mutex<Vec<TestTiming>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub fn record_test_timing(name: String, duration: Duration, passed: bool) {
+    TEST_TIMINGS.lock().push((name, duration, passed));
+}
+
+#[expect(clippy::print_stderr)]
+pub fn display_timing_summary(wall: Duration) {
+    const SHOW_SLOWEST: usize = 3;
+    let mut timings = TEST_TIMINGS.lock().clone();
+    if timings.is_empty() {
+        return;
+    }
+
+    timings.sort_by_key(|(_, dur, _)| std::cmp::Reverse(*dur));
+    let total: Duration = timings.iter().map(|(_, dur, _)| *dur).sum();
+    let wall_secs = wall.as_secs_f64();
+    let parallelism = if wall_secs > 0.0 {
+        total.as_secs_f64() / wall_secs
+    } else {
+        0.0
+    };
+    let n = timings.len();
+    eprintln!(
+        "\n{n} test{} in {wall_secs:.1}s wall · {:.1}s total test-time · \
+         {parallelism:.1}× parallel",
+        if n == 1 { "" } else { "s" },
+        total.as_secs_f64(),
+    );
+    if n > 1 {
+        eprintln!("slowest:");
+        for (name, dur, _) in timings.iter().take(SHOW_SLOWEST) {
+            eprintln!("  {:>6.1}s  {name}", dur.as_secs_f64());
+        }
     }
 }
 
