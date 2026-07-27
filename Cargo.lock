@@ -221,7 +221,7 @@ dependencies = [
 [[package]]
 name = "bitcoin-jsonrpsee"
 version = "0.1.1"
-source = "git+https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git?rev=e5e4d8eeef6141bc2d8364da3850117efd5f5e4e#e5e4d8eeef6141bc2d8364da3850117efd5f5e4e"
+source = "git+https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git?rev=cb6c0dbd21a069b5481eedb0268832df28a5aaf1#cb6c0dbd21a069b5481eedb0268832df28a5aaf1"
 dependencies = [
  "base64 0.23.0",
  "bitcoin",
