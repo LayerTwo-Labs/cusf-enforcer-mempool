@@ -674,7 +674,7 @@ where
     Ok(fee_delta)
 }
 
-// returns `true` if the tx was added to the mempool or abandoned pool
+// returns `true` if the tx was added to the mempool, abandoned pool, or already exists in the unfiltered mempool
 // successfully, was already marked unavailable, or was rejected.
 // returns `false` if the tx or the tx's parent txs are required.
 fn try_add_tx_from_caches<Enforcer, BorrowedEnforcer>(
@@ -686,14 +686,6 @@ where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
 {
-    // The initial-sync RPC mempool snapshot and the live ZMQ `sequence`
-    // stream are reconciled together, so the same txid can be queued for
-    // insertion via both paths (e.g. the snapshot `InsertTx` and a buffered
-    // `Added` sequence message). If the txid has already been processed —
-    // whether successfully inserted into the mempool, rejected, or marked
-    // unavailable — it will be present in the unfiltered mempool. Treat it
-    // as a successfully-applied no-op to avoid
-    // `MempoolInsertError::TxAlreadyExists` aborting the entire sync task.
     if inner.unfiltered_mempool.txs.contains(&txid) {
         return Ok(true);
     }
@@ -1410,8 +1402,8 @@ where
 #[cfg(test)]
 mod tests {
     use bitcoin::{
-        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction,
-        TxIn, TxOut, Txid, Witness, absolute::LockTime, hashes::Hash as _,
+        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxOut, Txid, Witness, absolute::LockTime, hashes::Hash as _,
         transaction::Version,
     };
     use hashlink::LinkedHashSet;
@@ -1448,12 +1440,9 @@ mod tests {
     /// During initial sync the RPC mempool snapshot and the live ZMQ
     /// `sequence` stream are reconciled together, so the same txid can be
     /// queued for insertion twice (e.g. once as the snapshot `InsertTx` and
-    /// once as a buffered `Added` sequence message). The second application
-    /// must be a no-op success rather than aborting the entire sync task with
-    /// `MempoolInsertError::TxAlreadyExists`.
+    /// once as a buffered `Added` sequence message).
     ///
-    /// Test originally written by torkelrogstad in PR #61; adapted to verify
-    /// the unfiltered mempool invariant (filtered ⊆ unfiltered).
+    /// Verifies the unfiltered mempool invariant (filtered ⊆ unfiltered).
     #[test]
     fn add_tx_from_caches_is_idempotent() {
         let genesis = BlockHash::all_zeros();
