@@ -2,3 +2,4 @@
 .envrc
 shell.nix
 integrationtests.env
+.integration-deps
