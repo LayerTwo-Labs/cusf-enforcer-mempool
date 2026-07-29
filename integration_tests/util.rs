@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
@@ -305,6 +306,46 @@ pub async fn mempool_txids(rpc: &RpcClient) -> anyhow::Result<Vec<Txid>> {
         rpc.request("getrawmempool", rpc_params![]).await?;
     txids
         .into_iter()
+        .map(|s| s.parse::<Txid>().map_err(anyhow::Error::from))
+        .collect()
+}
+
+/// `getmempoolentry <txid>` — the tx's `fees.modified`, in satoshis.
+///
+/// This is the base fee plus any `prioritisetransaction` delta, i.e. the fee
+/// that block-template construction actually ranks on. Errors if the tx is
+/// not in bitcoind's mempool.
+pub async fn modified_fee_sat(
+    rpc: &RpcClient,
+    txid: Txid,
+) -> anyhow::Result<i64> {
+    let entry: serde_json::Value = rpc
+        .request("getmempoolentry", rpc_params![txid.to_string()])
+        .await?;
+    let modified_btc = entry
+        .pointer("/fees/modified")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            anyhow!(
+                "getmempoolentry {txid}: missing `fees.modified`: {entry:?}"
+            )
+        })?;
+    Ok((modified_btc * 100_000_000.0).round() as i64)
+}
+
+/// `getprioritisedtransactions` — txids bitcoind currently holds a
+/// `prioritisetransaction` delta for.
+///
+/// Deltas are recorded in `mapDeltas` even for txids absent from the mempool,
+/// and outlive confirmation, so this is the only way to observe that a tx was
+/// deprioritized when it is not (or no longer) a mempool entry.
+pub async fn prioritised_txids(
+    rpc: &RpcClient,
+) -> anyhow::Result<HashSet<Txid>> {
+    let res: serde_json::Map<String, serde_json::Value> = rpc
+        .request("getprioritisedtransactions", rpc_params![])
+        .await?;
+    res.keys()
         .map(|s| s.parse::<Txid>().map_err(anyhow::Error::from))
         .collect()
 }

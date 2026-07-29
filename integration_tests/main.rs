@@ -4,6 +4,7 @@ use clap::Parser;
 use cusf_enforcer_mempool_integration_tests::{
     setup::{Directories, TestSetup},
     test_accept_tx_paths, test_block_connect_smoke,
+    test_connect_block_deprioritizes_removed_txs,
     test_disconnect_through_sync_tip, test_double_insert_after_reorg,
     test_enforcer_rejection_during_reorg, test_gbt_long_poll,
     test_rbf_removed_for_absent_tx, test_reorg_re_inserts_tx,
@@ -212,6 +213,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
     let setup_tests: &[(&str, SetupFn)] = &[
         ("block_connect_smoke", |s| {
             Box::pin(test_block_connect_smoke::test_block_connect_smoke(s))
+        }),
+        ("connect_block_deprioritizes_removed_txs", |s| {
+            Box::pin(
+                test_connect_block_deprioritizes_removed_txs::test_connect_block_deprioritizes_removed_txs(s),
+            )
         }),
         ("reorg_re_inserts_tx", |s| {
             Box::pin(test_reorg_re_inserts_tx::test_reorg_re_inserts_tx(s))
