@@ -31,6 +31,7 @@ struct MockEnforcerInner {
     reject_blocks: HashSet<BlockHash>,
     reject_all_blocks: bool,
     remove_on_connect: HashMap<BlockHash, HashSet<Txid>>,
+    always_remove_on_connect: HashSet<Txid>,
     remove_on_disconnect: HashMap<BlockHash, HashSet<Txid>>,
     always_remove_on_disconnect: HashSet<Txid>,
     log: Vec<MockCall>,
@@ -56,6 +57,14 @@ impl MockEnforcer {
 
     pub fn set_reject_all_blocks(&self, reject_all: bool) {
         self.inner.lock().reject_all_blocks = reject_all;
+    }
+
+    /// Return `txids` in `remove_mempool_txs` for *every* connected block.
+    /// Keyed on nothing rather than on a block hash because a test can only
+    /// learn a block's hash after mining it, by which point the sync task may
+    /// already have connected it.
+    pub fn set_always_remove_on_connect(&self, txids: HashSet<Txid>) {
+        self.inner.lock().always_remove_on_connect = txids;
     }
 
     pub fn set_always_remove_on_disconnect(&self, txids: HashSet<Txid>) {
@@ -118,10 +127,12 @@ impl CusfEnforcer for MockEnforcer {
             {
                 return Ok(ConnectBlockAction::Reject);
             }
-            let remove_mempool_txs = inner
+            let mut remove_mempool_txs = inner
                 .remove_on_connect
                 .remove(&block_hash)
                 .unwrap_or_default();
+            remove_mempool_txs
+                .extend(inner.always_remove_on_connect.iter().copied());
             Ok(ConnectBlockAction::Accept { remove_mempool_txs })
         }
     }
