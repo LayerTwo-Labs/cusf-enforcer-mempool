@@ -8,7 +8,7 @@ version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 bitcoin = { workspace = true }
 bitcoin-jsonrpsee = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
