@@ -164,13 +164,29 @@ impl RegtestNode {
         // 110 (not 101) so the wallet keeps several mature coinbases — a
         // reorg that strips the latest coinbase otherwise hits "Insufficient
         // funds" in tests that bump-fee or send another tx.
-        bitcoin_jsonrpsee::MainClient::generate_to_address(
-            &rpc_client,
-            110,
-            &mining_address.clone().into_unchecked(),
-        )
-        .await
-        .context("generatetoaddress 110")?;
+        //
+        // Mined in chunks so that no single RPC request can outlive the
+        // client's request timeout when parallel suite runs slow mining down.
+        const SETUP_BLOCKS: u32 = 110;
+        const CHUNK: u32 = 10;
+        let mut remaining = SETUP_BLOCKS;
+        while remaining > 0 {
+            let count = remaining.min(CHUNK);
+            bitcoin_jsonrpsee::MainClient::generate_to_address(
+                &rpc_client,
+                count,
+                &mining_address.clone().into_unchecked(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "generatetoaddress {count} \
+                     ({} of {SETUP_BLOCKS} mined)",
+                    SETUP_BLOCKS - remaining
+                )
+            })?;
+            remaining -= count;
+        }
 
         Ok(Self {
             bitcoind,

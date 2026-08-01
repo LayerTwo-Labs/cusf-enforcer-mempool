@@ -39,7 +39,20 @@ pub async fn test_double_insert_after_reorg(
     let tip_with_tx = setup.node.rpc_client.getbestblockhash().await?;
     setup.node.rpc_client.invalidate_block(tip_with_tx).await?;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    // Wait for the positive signal first: the tx re-appearing locally proves
+    // the disconnect was processed (and fails fast on task errors). The
+    // double-insert error, if any, fires while handling the same disconnect,
+    // so a short grace window after that is enough to catch it — this used
+    // to be a fixed 15s wait that dominated the suite's wall time.
+    setup
+        .wait_for_local_mempool(
+            Duration::from_secs(5),
+            |t| t.contains(&tx),
+            "tx in local mempool after deferred-reorg recovery",
+        )
+        .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mut errors = Vec::<String>::new();
     while tokio::time::Instant::now() < deadline {
         errors = setup.task_errors.snapshot();
@@ -61,12 +74,5 @@ pub async fn test_double_insert_after_reorg(
         errors.is_empty(),
         "MempoolSync task surfaced unexpected errors: {errors:?}"
     );
-    setup
-        .wait_for_local_mempool(
-            Duration::from_secs(5),
-            |t| t.contains(&tx),
-            "tx in local mempool after deferred-reorg recovery",
-        )
-        .await?;
     Ok(())
 }

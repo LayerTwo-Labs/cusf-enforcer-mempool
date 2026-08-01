@@ -98,6 +98,11 @@ impl Bitcoind {
             "-fallbackfee=0.00001".to_owned(),
             "-acceptnonstdtxn=1".to_owned(),
             "-txindex".to_owned(),
+            // Skip wallet sqlite fsyncs: per-block wallet syncs otherwise
+            // dominate the suite's runtime (~55s -> ~3s wall). Only unsafe
+            // on OS crash/power loss, which never matters for throwaway
+            // regtest datadirs.
+            "-unsafesqlitesync=1".to_owned(),
             "-debug=mempool".to_owned(),
             "-debug=rpc".to_owned(),
             "-debug=zmq".to_owned(),
