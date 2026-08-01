@@ -1,11 +1,15 @@
 //! A block the enforcer rejects is invalidated in bitcoind, which then emits a
-//! disconnect for it. The sync task must not stall on that disconnect.
+//! disconnect for it. The sync task must not stall on that disconnect, and
+//! must afterward accept a *new* block mined on the resulting tip.
 
 use std::time::Duration;
 
 use bitcoin_jsonrpsee::MainClient as _;
 
-use crate::{setup::TestSetup, util::submit_tx};
+use crate::{
+    setup::TestSetup,
+    util::{get_new_address, submit_tx},
+};
 
 /// Comfortably longer than the sync task's `APPLY_SYNC_ACTION_TIMEOUT` (15s),
 /// so a stalled action has time to fail the task and be *observed* failing,
@@ -73,6 +77,29 @@ pub async fn test_rejected_block_disconnect(
     anyhow::ensure!(
         setup.local_mempool_txids().await.contains(&before),
         "the tx returned by the invalidation should still be in the local mempool"
+    );
+
+    // A fresh address, not `setup.node.mining_address` again: reusing it
+    // right after `invalidateblock` at the same height can produce a
+    // byte-identical coinbase (and hence block hash) to the one just
+    // invalidated, which bitcoind then refuses as `duplicate-invalid`
+    // rather than actually connecting a new block.
+    let reconnect_address = get_new_address(&setup.node.rpc_client).await?;
+    let reconnected = setup
+        .node
+        .rpc_client
+        .generate_to_address(1, &reconnect_address.into_unchecked())
+        .await?[0];
+    tracing::info!(%reconnected, "mined a fresh block on the real tip");
+
+    setup
+        .wait_for_local_tip(reconnected, Duration::from_secs(10))
+        .await?;
+
+    anyhow::ensure!(
+        setup.task_errors.is_empty(),
+        "MempoolSync task surfaced errors: {:?}",
+        setup.task_errors.snapshot()
     );
     Ok(())
 }
