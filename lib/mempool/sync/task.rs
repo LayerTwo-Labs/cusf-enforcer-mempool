@@ -220,10 +220,28 @@ where
             );
             return Ok(());
         }
-        return Err(SyncTaskError::UnexpectedTipUnfilteredMempool {
-            tip: inner.unfiltered_mempool.tip,
-            expected: prev_blockhash,
-        });
+        // A disconnect for a rejected block is deliberately ignored,
+        // but that skip also bypasses `handle_disconnected_block`, the
+        // only place that rolls back `unfiltered_mempool.tip` -- leaving
+        // it stuck at the rejected block. If the new block's parent is
+        // our filtered tip, we're in exactly that state: the filtered view
+        // is already correct, so avoid failing
+        if prev_blockhash == inner.mempool.chain.tip {
+            tracing::warn!(
+                block_hash = %block.hash,
+                stale_unfiltered_tip = %inner.unfiltered_mempool.tip,
+                %prev_blockhash,
+                "unfiltered mempool tip was stale (a disconnect for a \
+                 rejected block skipped the tip rollback), resyncing to \
+                 the filtered chain tip",
+            );
+            inner.unfiltered_mempool.tip = prev_blockhash;
+        } else {
+            return Err(SyncTaskError::UnexpectedTipUnfilteredMempool {
+                tip: inner.unfiltered_mempool.tip,
+                expected: prev_blockhash,
+            });
+        }
     }
     for tx_info in &block.tx {
         inner.unfiltered_mempool.txs.remove(&tx_info.txid);
