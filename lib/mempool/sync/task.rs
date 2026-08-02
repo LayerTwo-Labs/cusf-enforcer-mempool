@@ -770,7 +770,7 @@ where
                     match inner.mempool.insert(
                         tx.clone(),
                         fee_delta.to_sat(),
-                        conflicts_with.into(),
+                        conflicts_with.iter().copied().collect(),
                         modified_weight,
                     ) {
                         Ok(_) => (),
@@ -787,6 +787,21 @@ where
                             );
                         }
                         Err(err) => return Err(err.into()),
+                    }
+                    // Deprioritize the losing side of each conflict in Core,
+                    // which cannot see them. After the insert, so both sides
+                    // have ancestor fee rates.
+                    for loser in
+                        conflict_losers(&inner.mempool, txid, &conflicts_with)
+                    {
+                        tracing::debug!(
+                            %txid,
+                            %loser,
+                            "deprioritizing losing side of an enforcer-level conflict",
+                        );
+                        sync_state
+                            .request_queue
+                            .push_front(RequestItem::DeprioritizeTx(loser));
                     }
                     inner.unfiltered_mempool.txs.insert(txid);
                     tracing::trace!(%txid, "added tx to mempool");
@@ -822,6 +837,35 @@ where
             }
         }
     }
+}
+
+/// Which side of each enforcer-level conflict to deprioritize in Bitcoin
+/// Core: the lower ancestor fee rate loses, by the same
+/// [`crate::mempool::FeeRate`] ordering (tie-break included) the template
+/// builder selects by.
+///
+/// Call after inserting `txid`. A conflict already gone from the mempool
+/// needs no action.
+fn conflict_losers(
+    mempool: &Mempool,
+    txid: Txid,
+    conflicts_with: &HashSet<Txid>,
+) -> HashSet<Txid> {
+    let Some(new_fee_rate) = mempool.ancestor_fee_rate(&txid) else {
+        return HashSet::new();
+    };
+    conflicts_with
+        .iter()
+        .filter_map(|conflict_txid| {
+            let conflict_fee_rate = mempool.ancestor_fee_rate(conflict_txid)?;
+            if new_fee_rate.refinement_cmp(&conflict_fee_rate).is_gt() {
+                Some(*conflict_txid)
+            } else {
+                // The incumbent ranks at least as high. The newcomer loses.
+                Some(txid)
+            }
+        })
+        .collect()
 }
 
 async fn try_apply_seq_message<Enforcer, BorrowedEnforcer>(
@@ -1027,7 +1071,9 @@ where
         }
         BatchedResponseItem::BatchRejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectBlock)
-        | BatchedResponseItem::Single(ResponseItem::RejectTx) => {}
+        | BatchedResponseItem::Single(
+            ResponseItem::RejectTx | ResponseItem::DeprioritizeTx,
+        ) => {}
     }
     while try_apply_next_sync_action(inner, sync_state).await? {}
     Ok(())
@@ -1393,5 +1439,217 @@ where
         let inner_read = inner.read().await;
         let res = f(&inner_read.mempool, &inner_read.enforcer).await;
         Some(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{
+        ScriptBuf, Sequence, TxIn, TxOut, Witness, absolute::LockTime,
+        hashes::Hash as _, transaction::Version,
+    };
+
+    use super::*;
+
+    fn make_tx(inputs: &[OutPoint], num_outputs: usize) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|prev| TxIn {
+                    previous_output: *prev,
+                    sequence: Sequence::MAX,
+                    script_sig: ScriptBuf::new(),
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: (0..num_outputs)
+                .map(|i| TxOut {
+                    value: Amount::from_sat(1000 * (i as u64 + 1)),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A distinct confirmed-looking outpoint per `n`: unique txids, no
+    /// unintended in-mempool ancestry.
+    fn outpoint(n: u8) -> OutPoint {
+        OutPoint::new(Txid::from_byte_array([n; 32]), 0)
+    }
+
+    fn insert(
+        mempool: &mut Mempool,
+        tx: Transaction,
+        fee: u64,
+        conflicts_with: &[Txid],
+    ) -> Txid {
+        let txid = tx.compute_txid();
+        let weight = tx.weight();
+        insert_with_weight(mempool, tx, fee, conflicts_with, weight);
+        txid
+    }
+
+    fn insert_with_weight(
+        mempool: &mut Mempool,
+        tx: Transaction,
+        fee: u64,
+        conflicts_with: &[Txid],
+        modified_weight: Weight,
+    ) -> Txid {
+        let txid = tx.compute_txid();
+        mempool
+            .insert(
+                tx,
+                fee,
+                conflicts_with.iter().copied().collect(),
+                modified_weight,
+            )
+            .expect("insert failed");
+        txid
+    }
+
+    fn test_mempool() -> Mempool {
+        Mempool::new(BlockHash::all_zeros())
+    }
+
+    #[test]
+    fn higher_fee_rate_newcomer_buries_incumbent() {
+        let mut mempool = test_mempool();
+        let incumbent =
+            insert(&mut mempool, make_tx(&[outpoint(1)], 1), 1_000, &[]);
+        let newcomer = insert(
+            &mut mempool,
+            make_tx(&[outpoint(2)], 1),
+            10_000,
+            &[incumbent],
+        );
+
+        let losers =
+            conflict_losers(&mempool, newcomer, &HashSet::from([incumbent]));
+        assert_eq!(losers, HashSet::from([incumbent]));
+    }
+
+    #[test]
+    fn lower_fee_rate_newcomer_loses() {
+        let mut mempool = test_mempool();
+        let incumbent =
+            insert(&mut mempool, make_tx(&[outpoint(1)], 1), 10_000, &[]);
+        let newcomer = insert(
+            &mut mempool,
+            make_tx(&[outpoint(2)], 1),
+            1_000,
+            &[incumbent],
+        );
+
+        let losers =
+            conflict_losers(&mempool, newcomer, &HashSet::from([incumbent]));
+        assert_eq!(losers, HashSet::from([newcomer]));
+    }
+
+    /// An exact tie favors the incumbent: first-seen keeps its template slot.
+    #[test]
+    fn exact_tie_favors_incumbent() {
+        let mut mempool = test_mempool();
+        let incumbent =
+            insert(&mut mempool, make_tx(&[outpoint(1)], 1), 5_000, &[]);
+        let newcomer = insert(
+            &mut mempool,
+            make_tx(&[outpoint(2)], 1),
+            5_000,
+            &[incumbent],
+        );
+
+        let losers =
+            conflict_losers(&mempool, newcomer, &HashSet::from([incumbent]));
+        assert_eq!(losers, HashSet::from([newcomer]));
+    }
+
+    /// A newcomer losing to several conflicts is deprioritized once, not once
+    /// per conflict: `prioritisetransaction` deltas accumulate in Core.
+    #[test]
+    fn newcomer_losing_to_many_conflicts_is_returned_once() {
+        let mut mempool = test_mempool();
+        let incumbent_a =
+            insert(&mut mempool, make_tx(&[outpoint(1)], 1), 10_000, &[]);
+        let incumbent_b =
+            insert(&mut mempool, make_tx(&[outpoint(2)], 1), 20_000, &[]);
+        let newcomer = insert(
+            &mut mempool,
+            make_tx(&[outpoint(3)], 1),
+            1_000,
+            &[incumbent_a, incumbent_b],
+        );
+
+        let losers = conflict_losers(
+            &mempool,
+            newcomer,
+            &HashSet::from([incumbent_a, incumbent_b]),
+        );
+        assert_eq!(losers, HashSet::from([newcomer]));
+    }
+
+    /// A conflict already gone from the mempool (e.g. confirmed) needs no
+    /// action.
+    #[test]
+    fn missing_conflict_needs_no_action() {
+        let mut mempool = test_mempool();
+        let absent = Txid::from_byte_array([0x42; 32]);
+        let newcomer =
+            insert(&mut mempool, make_tx(&[outpoint(1)], 1), 1_000, &[absent]);
+
+        let losers =
+            conflict_losers(&mempool, newcomer, &HashSet::from([absent]));
+        assert_eq!(losers, HashSet::new());
+    }
+
+    /// Compare *ancestor* fee rates, like the builder: a newcomer whose own
+    /// fee rate beats the incumbent still loses if a zero-fee unconfirmed
+    /// parent drags its ancestor rate below.
+    #[test]
+    fn ancestor_fee_rate_decides_not_base_fee_rate() {
+        let mut mempool = test_mempool();
+        let incumbent =
+            insert(&mut mempool, make_tx(&[outpoint(1)], 1), 5_000, &[]);
+        let parent_tx = make_tx(&[outpoint(2)], 1);
+        let parent = insert(&mut mempool, parent_tx.clone(), 0, &[]);
+        let newcomer = insert(
+            &mut mempool,
+            make_tx(&[OutPoint::new(parent, 0)], 1),
+            6_000,
+            &[incumbent],
+        );
+
+        let losers =
+            conflict_losers(&mempool, newcomer, &HashSet::from([incumbent]));
+        assert_eq!(losers, HashSet::from([newcomer]));
+    }
+
+    /// Compare enforcer-modified weights, like the builder: with equal fees
+    /// and raw weights, the incumbent whose `weight_tweak` doubled its
+    /// modified weight loses. (Raw weights would tie and flip the outcome.)
+    #[test]
+    fn modified_weight_decides_not_raw_weight() {
+        let mut mempool = test_mempool();
+        let incumbent_tx = make_tx(&[outpoint(1)], 1);
+        let doubled_weight = incumbent_tx.weight() * 2;
+        let incumbent = insert_with_weight(
+            &mut mempool,
+            incumbent_tx,
+            5_000,
+            &[],
+            doubled_weight,
+        );
+        let newcomer = insert(
+            &mut mempool,
+            make_tx(&[outpoint(2)], 1),
+            5_000,
+            &[incumbent],
+        );
+
+        let losers =
+            conflict_losers(&mempool, newcomer, &HashSet::from([incumbent]));
+        assert_eq!(losers, HashSet::from([incumbent]));
     }
 }

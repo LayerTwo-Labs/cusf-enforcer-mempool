@@ -654,6 +654,17 @@ impl Mempool {
         Ok(res)
     }
 
+    /// Ancestor fee rate for `txid`, if present: the same key the
+    /// `by_ancestor_fee_rate` index — and thus the template builder's
+    /// selection order — ranks it by.
+    pub(crate) fn ancestor_fee_rate(&self, txid: &Txid) -> Option<FeeRate> {
+        let (_tx, info) = self.txs.0.get(txid)?;
+        Some(FeeRate {
+            fee: info.fees.ancestor,
+            vsize: info.ancestor_modified_weight.to_vbytes_ceil(),
+        })
+    }
+
     /// Remove a tx from the mempool. Descendants are updated but not removed.
     fn remove(
         &mut self,
