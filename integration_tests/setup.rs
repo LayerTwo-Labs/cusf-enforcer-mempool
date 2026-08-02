@@ -286,6 +286,27 @@ impl TestSetup {
         Ok(txid)
     }
 
+    /// [`Self::submit_and_wait`], but with an explicit fee rate (sat/vB).
+    pub async fn submit_and_wait_with_fee_rate(
+        &self,
+        amount_sat: u64,
+        fee_rate_sat_vb: u64,
+    ) -> anyhow::Result<Txid> {
+        let txid = util::submit_tx_with_fee_rate(
+            &self.node.rpc_client,
+            amount_sat,
+            fee_rate_sat_vb,
+        )
+        .await?;
+        self.wait_for_local_mempool(
+            Duration::from_secs(5),
+            |t| t.contains(&txid),
+            "submitted tx",
+        )
+        .await?;
+        Ok(txid)
+    }
+
     pub async fn local_mempool_txids(&self) -> HashSet<Txid> {
         local_mempool_txids(&self.mempool_sync).await
     }

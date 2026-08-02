@@ -302,6 +302,37 @@ pub async fn submit_tx(
     send_to_address(rpc, &dest, amount_sat).await
 }
 
+/// `sendtoaddress` to a fresh address with an explicit fee rate (sat/vB), so
+/// tests can pin which of two txs ranks higher in fee ordering.
+pub async fn submit_tx_with_fee_rate(
+    rpc: &RpcClient,
+    amount_sat: u64,
+    fee_rate_sat_vb: u64,
+) -> anyhow::Result<Txid> {
+    let dest = get_new_address(rpc).await?;
+    let amount_btc = format!("{:.8}", (amount_sat as f64) / 100_000_000.0);
+    // `conf_target`/`estimate_mode` must stay unset for an explicit fee rate
+    // to be accepted.
+    let txid: String = rpc
+        .request(
+            "sendtoaddress",
+            rpc_params![
+                dest.to_string(),
+                amount_btc,
+                "",                      // comment
+                "",                      // comment_to
+                false,                   // subtractfeefromamount
+                true,                    // replaceable
+                serde_json::Value::Null, // conf_target
+                serde_json::Value::Null, // estimate_mode
+                false,                   // avoid_reuse
+                fee_rate_sat_vb
+            ],
+        )
+        .await?;
+    Ok(txid.parse()?)
+}
+
 /// `getrawmempool` — bitcoind's current mempool as a list of txids.
 pub async fn mempool_txids(rpc: &RpcClient) -> anyhow::Result<Vec<Txid>> {
     // We bypass MainClient::get_raw_mempool because its typed

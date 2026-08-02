@@ -34,6 +34,10 @@ struct MockEnforcerInner {
     always_remove_on_connect: HashSet<Txid>,
     remove_on_disconnect: HashMap<BlockHash, HashSet<Txid>>,
     always_remove_on_disconnect: HashSet<Txid>,
+    /// Conflicts to report for the next tx `accept_tx` sees, then cleared.
+    /// "Next" rather than keyed by txid: a test's txid only exists once the
+    /// tx is submitted, by which point `accept_tx` has already run.
+    conflicts_for_next: Option<HashSet<Txid>>,
     log: Vec<MockCall>,
 }
 
@@ -49,6 +53,13 @@ impl MockEnforcer {
 
     pub fn reject_tx(&self, txid: Txid) {
         self.inner.lock().reject_txids.insert(txid);
+    }
+
+    /// Report `conflicts_with` for the next tx `accept_tx` sees. The tx is
+    /// still accepted -- an enforcer-level conflict is between two
+    /// individually valid txs that cannot share a block.
+    pub fn set_conflicts_for_next(&self, conflicts_with: HashSet<Txid>) {
+        self.inner.lock().conflicts_for_next = Some(conflicts_with);
     }
 
     pub fn set_reject_all(&self, reject_all: bool) {
@@ -175,8 +186,10 @@ impl CusfEnforcer for MockEnforcer {
         if inner.reject_all || inner.reject_txids.contains(&txid) {
             return Ok(TxAcceptAction::Reject);
         }
+        let conflicts_with =
+            inner.conflicts_for_next.take().unwrap_or_default();
         Ok(TxAcceptAction::Accept {
-            conflicts_with: HashSet::new(),
+            conflicts_with,
             weight_tweak: 0,
         })
     }
