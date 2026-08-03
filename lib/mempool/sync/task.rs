@@ -674,7 +674,7 @@ where
     Ok(fee_delta)
 }
 
-// returns `true` if the tx was added to the mempool or abandoned pool
+// returns `true` if the tx was added to the mempool, abandoned pool, or already exists in the unfiltered mempool
 // successfully, was already marked unavailable, or was rejected.
 // returns `false` if the tx or the tx's parent txs are required.
 fn try_add_tx_from_caches<Enforcer, BorrowedEnforcer>(
@@ -686,6 +686,9 @@ where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
 {
+    if inner.unfiltered_mempool.txs.contains(&txid) {
+        return Ok(true);
+    }
     let Some(tx) = sync_state.tx_cache.get(&txid) else {
         if sync_state.unavailable_txs.contains(&txid) {
             inner.unfiltered_mempool.txs.insert(txid);
@@ -1393,5 +1396,138 @@ where
         let inner_read = inner.read().await;
         let res = f(&inner_read.mempool, &inner_read.enforcer).await;
         Some(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{
+        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
+        TxOut, Txid, Witness, absolute::LockTime, hashes::Hash as _,
+        transaction::Version,
+    };
+    use hashlink::LinkedHashSet;
+
+    use super::*;
+    use crate::{cusf_enforcer::DefaultEnforcer, mempool::Mempool};
+
+    fn make_tx(inputs: &[OutPoint], output_values: &[u64]) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|prev| TxIn {
+                    previous_output: *prev,
+                    sequence: Sequence::MAX,
+                    script_sig: ScriptBuf::new(),
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: output_values
+                .iter()
+                .map(|value| TxOut {
+                    value: Amount::from_sat(*value),
+                    script_pubkey: ScriptBuf::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Regression test for the initial-sync crash reported in
+    /// LayerTwo-Labs/bip300301_enforcer#406.
+    ///
+    /// During initial sync the RPC mempool snapshot and the live ZMQ
+    /// `sequence` stream are reconciled together, so the same txid can be
+    /// queued for insertion twice (e.g. once as the snapshot `InsertTx` and
+    /// once as a buffered `Added` sequence message).
+    ///
+    /// Verifies the unfiltered mempool invariant (filtered ⊆ unfiltered).
+    #[test]
+    fn add_tx_from_caches_is_idempotent() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        // A parent tx supplying a spendable output, available only via the tx
+        // cache (it is not itself a mempool tx).
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        // The tx under test, spending the parent's output.
+        let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let txid = tx.compute_txid();
+
+        let mut tx_cache = HashMap::new();
+        tx_cache.insert(parent_txid, parent);
+        tx_cache.insert(txid, tx);
+
+        let mut blocks_needed = LinkedHashSet::new();
+        let mut rejected_blocks = HashSet::new();
+        let mut rejected_txs = HashSet::new();
+        let request_queue = RequestQueue::default();
+        let mut txs_needed = LinkedHashSet::new();
+        let mut unavailable_txs = HashSet::new();
+
+        // First insertion adds the tx to the mempool.
+        {
+            let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut blocks_needed,
+                rejected_blocks: &mut rejected_blocks,
+                rejected_txs: &mut rejected_txs,
+                request_queue: &request_queue,
+                tx_cache: &mut tx_cache,
+                txs_needed: &mut txs_needed,
+                unavailable_txs: &mut unavailable_txs,
+            };
+            let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
+                &mut inner, sync_state, txid,
+            )
+            .expect("first add should succeed");
+            assert!(added, "tx should be added to the mempool");
+        }
+        assert!(
+            inner.mempool.txs.0.contains_key(&txid),
+            "tx should be present in the mempool after the first add"
+        );
+        assert!(
+            inner.unfiltered_mempool.txs.contains(&txid),
+            "tx should be present in the unfiltered mempool after the first add"
+        );
+
+        // Re-applying the same txid must be an idempotent no-op success, not a
+        // fatal `TxAlreadyExists`.
+        {
+            let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut blocks_needed,
+                rejected_blocks: &mut rejected_blocks,
+                rejected_txs: &mut rejected_txs,
+                request_queue: &request_queue,
+                tx_cache: &mut tx_cache,
+                txs_needed: &mut txs_needed,
+                unavailable_txs: &mut unavailable_txs,
+            };
+            let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
+                &mut inner, sync_state, txid,
+            )
+            .expect(
+                "re-adding an already-present tx must not error \
+                 (idempotent reconciliation)",
+            );
+            assert!(added, "re-add should report success");
+        }
+        assert!(
+            inner.unfiltered_mempool.txs.contains(&txid),
+            "tx should still be present in the unfiltered mempool after the second add"
+        );
     }
 }
