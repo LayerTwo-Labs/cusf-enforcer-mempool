@@ -1446,10 +1446,12 @@ mod tests {
     #[test]
     fn add_tx_from_caches_is_idempotent() {
         let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
         let mut inner = MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
+            tip_watch,
             unfiltered_mempool: UnfilteredMempool {
                 tip: genesis,
                 txs: HashSet::new(),
@@ -1470,6 +1472,7 @@ mod tests {
         tx_cache.insert(txid, tx);
 
         let mut blocks_needed = LinkedHashSet::new();
+        let mut rejected_blocks = HashSet::new();
         let mut rejected_txs = HashSet::new();
         let request_queue = RequestQueue::default();
         let mut txs_needed = LinkedHashSet::new();
@@ -1479,6 +1482,7 @@ mod tests {
         {
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut blocks_needed,
+                rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
                 tx_cache: &mut tx_cache,
@@ -1505,6 +1509,7 @@ mod tests {
         {
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut blocks_needed,
+                rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
                 tx_cache: &mut tx_cache,
