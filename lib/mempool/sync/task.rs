@@ -143,6 +143,9 @@ pub struct SyncState {
     rejected_blocks: HashSet<BlockHash>,
     /// Txs rejected by the CUSF enforcer
     rejected_txs: HashSet<Txid>,
+    /// The txs each connected block caused to be rejected, so that
+    /// disconnecting it can undo them.
+    rejected_by_block: HashMap<BlockHash, HashSet<Txid>>,
     request_queue: RequestQueue,
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: HashMap<Txid, Transaction>,
@@ -152,11 +155,14 @@ pub struct SyncState {
 
 /// Sync state, mutably borrowed while applying an action from the queue
 struct SyncStateBorrowedMut<'a> {
+    action_queue: &'a mut SyncActionQueue,
     blocks_needed: &'a mut LinkedHashSet<BlockHash>,
     /// Blocks rejected by the CUSF enforcer
     rejected_blocks: &'a mut HashSet<BlockHash>,
     /// Txs rejected by the CUSF enforcer
     rejected_txs: &'a mut HashSet<Txid>,
+    /// The txs each connected block caused to be rejected
+    rejected_by_block: &'a mut HashMap<BlockHash, HashSet<Txid>>,
     request_queue: &'a RequestQueue,
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: &'a mut HashMap<Txid, Transaction>,
@@ -301,6 +307,11 @@ where
                 );
                 sync_state.rejected_txs.insert(txid);
                 sync_state
+                    .rejected_by_block
+                    .entry(block.hash)
+                    .or_default()
+                    .insert(txid);
+                sync_state
                     .request_queue
                     .push_front(RequestItem::RejectTx(txid));
             }
@@ -322,14 +333,15 @@ where
 /// parent block response has been handled.
 async fn handle_disconnected_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
-    blocks_needed: &mut LinkedHashSet<BlockHash>,
-    request_queue: &RequestQueue,
+    sync_state: &mut SyncStateBorrowedMut<'_>,
     block: &bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<bool, SyncTaskError<BorrowedEnforcer>>
 where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
 {
+    let blocks_needed = &mut sync_state.blocks_needed;
+    let request_queue = sync_state.request_queue;
     let prev_blockhash =
         block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
     if inner.unfiltered_mempool.tip != block.hash {
@@ -365,6 +377,35 @@ where
             .map_err(cusf_enforcer::Error::DisconnectBlock)?;
         for txid in remove_mempool_txs {
             inner.mempool.remove_with_descendants(&txid)?;
+        }
+        // Undo the rejections this block caused
+        if let Some(unrejected) =
+            sync_state.rejected_by_block.remove(&block.hash)
+        {
+            for txid in unrejected {
+                tracing::trace!(
+                    %txid,
+                    block_hash = %block.hash,
+                    "unrejecting tx, its block was disconnected",
+                );
+                sync_state.rejected_txs.remove(&txid);
+                sync_state
+                    .request_queue
+                    .push_front(RequestItem::UnrejectTx(txid));
+
+                if inner.unfiltered_mempool.txs.remove(&txid) {
+                    sync_state.txs_needed.replace(txid);
+                    sync_state
+                        .request_queue
+                        .push_back(RequestItem::Tx(txid, true));
+
+                    // Fetching only caches the tx. This is what returns it to
+                    // the mempool.
+                    sync_state
+                        .action_queue
+                        .push_back(SyncAction::InsertTx(txid));
+                }
+            }
         }
         inner.mempool.chain.tip = prev_blockhash;
         let _prev: BlockHash = inner.tip_watch.send_replace(prev_blockhash);
@@ -537,9 +578,11 @@ where
         ))) if *block_hash == resp_block.hash => {
             {
                 let sync_state = SyncStateBorrowedMut {
+                    action_queue: &mut sync_state.action_queue,
                     blocks_needed: &mut sync_state.blocks_needed,
                     rejected_blocks: &mut sync_state.rejected_blocks,
                     rejected_txs: &mut sync_state.rejected_txs,
+                    rejected_by_block: &mut sync_state.rejected_by_block,
                     request_queue: &sync_state.request_queue,
                     tx_cache: &mut sync_state.tx_cache,
                     txs_needed: &mut sync_state.txs_needed,
@@ -558,10 +601,20 @@ where
         ))) if *block_hash == resp_block.hash
             && inner.mempool.chain.tip == resp_block.hash =>
         {
+            let mut sync_state_borrowed = SyncStateBorrowedMut {
+                action_queue: &mut sync_state.action_queue,
+                blocks_needed: &mut sync_state.blocks_needed,
+                rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_txs: &mut sync_state.rejected_txs,
+                rejected_by_block: &mut sync_state.rejected_by_block,
+                request_queue: &sync_state.request_queue,
+                tx_cache: &mut sync_state.tx_cache,
+                txs_needed: &mut sync_state.txs_needed,
+                unavailable_txs: &mut sync_state.unavailable_txs,
+            };
             if handle_disconnected_block(
                 inner,
-                &mut sync_state.blocks_needed,
-                &sync_state.request_queue,
+                &mut sync_state_borrowed,
                 &resp_block,
             )
             .await?
@@ -829,7 +882,7 @@ where
 
 async fn try_apply_seq_message<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
-    sync_state: SyncStateBorrowedMut<'_>,
+    mut sync_state: SyncStateBorrowedMut<'_>,
     seq_msg: &SequenceMessage,
 ) -> Result<ApplySyncActionResult, SyncTaskError<BorrowedEnforcer>>
 where
@@ -867,13 +920,9 @@ where
             else {
                 return Ok(ApplySyncActionResult::Pending);
             };
-            let applied = handle_disconnected_block(
-                inner,
-                sync_state.blocks_needed,
-                sync_state.request_queue,
-                &block,
-            )
-            .await?;
+            let applied =
+                handle_disconnected_block(inner, &mut sync_state, &block)
+                    .await?;
             Ok(ApplySyncActionResult::from(applied))
         }
         SequenceMessage::TxHash(TxHashMessage {
@@ -933,9 +982,11 @@ where
     let res = match next_sync_action.action {
         SyncAction::InsertTx(txid) => {
             let sync_state = SyncStateBorrowedMut {
+                action_queue: &mut sync_state.action_queue,
                 blocks_needed: &mut sync_state.blocks_needed,
                 rejected_blocks: &mut sync_state.rejected_blocks,
                 rejected_txs: &mut sync_state.rejected_txs,
+                rejected_by_block: &mut sync_state.rejected_by_block,
                 request_queue: &sync_state.request_queue,
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
@@ -945,9 +996,11 @@ where
         }
         SyncAction::SequenceMessage(seq_msg) => {
             let sync_state = SyncStateBorrowedMut {
+                action_queue: &mut sync_state.action_queue,
                 blocks_needed: &mut sync_state.blocks_needed,
                 rejected_blocks: &mut sync_state.rejected_blocks,
                 rejected_txs: &mut sync_state.rejected_txs,
+                rejected_by_block: &mut sync_state.rejected_by_block,
                 request_queue: &sync_state.request_queue,
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
@@ -1030,7 +1083,9 @@ where
         }
         BatchedResponseItem::BatchRejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectBlock)
-        | BatchedResponseItem::Single(ResponseItem::RejectTx) => {}
+        | BatchedResponseItem::Single(
+            ResponseItem::RejectTx | ResponseItem::UnrejectTx,
+        ) => {}
     }
     while try_apply_next_sync_action(inner, sync_state).await? {}
     Ok(())
@@ -1247,6 +1302,7 @@ where
             first_mempool_sequence: Some(mempool_sequence + 1),
             rejected_blocks: HashSet::new(),
             rejected_txs: HashSet::new(),
+            rejected_by_block: HashMap::new(),
             request_queue,
             tx_cache: HashMap::new(),
             txs_needed: LinkedHashSet::from_iter(txids),
@@ -1471,9 +1527,11 @@ mod tests {
         tx_cache.insert(parent_txid, parent);
         tx_cache.insert(txid, tx);
 
+        let mut action_queue = SyncActionQueue::default();
         let mut blocks_needed = LinkedHashSet::new();
         let mut rejected_blocks = HashSet::new();
         let mut rejected_txs = HashSet::new();
+        let mut rejected_by_block = HashMap::new();
         let request_queue = RequestQueue::default();
         let mut txs_needed = LinkedHashSet::new();
         let mut unavailable_txs = HashSet::new();
@@ -1481,9 +1539,11 @@ mod tests {
         // First insertion adds the tx to the mempool.
         {
             let sync_state = SyncStateBorrowedMut {
+                action_queue: &mut action_queue,
                 blocks_needed: &mut blocks_needed,
                 rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
+                rejected_by_block: &mut rejected_by_block,
                 request_queue: &request_queue,
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
@@ -1508,9 +1568,11 @@ mod tests {
         // fatal `TxAlreadyExists`.
         {
             let sync_state = SyncStateBorrowedMut {
+                action_queue: &mut action_queue,
                 blocks_needed: &mut blocks_needed,
                 rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
+                rejected_by_block: &mut rejected_by_block,
                 request_queue: &request_queue,
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,

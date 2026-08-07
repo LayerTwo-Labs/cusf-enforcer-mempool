@@ -45,6 +45,8 @@ enum RequestItem {
     RejectBlock(BlockHash),
     /// Reject a tx
     RejectTx(Txid),
+    /// Undo a [`Self::RejectTx`], for a tx a disconnect made valid again.
+    UnrejectTx(Txid),
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     Tx(Txid, bool),
@@ -64,9 +66,10 @@ impl BatchedRequestItem {
     /// The bitcoind RPC method this request is dispatched as.
     fn rpc_method(&self) -> &'static str {
         match self {
-            Self::BatchRejectTx(_) | Self::Single(RequestItem::RejectTx(_)) => {
-                "prioritisetransaction"
-            }
+            Self::BatchRejectTx(_)
+            | Self::Single(
+                RequestItem::RejectTx(_) | RequestItem::UnrejectTx(_),
+            ) => "prioritisetransaction",
             Self::Single(RequestItem::RejectBlock(_)) => "invalidateblock",
             Self::BatchTx(_) | Self::Single(RequestItem::Tx(..)) => {
                 "getrawtransaction"
@@ -124,7 +127,9 @@ impl Stream for RequestQueue {
         *self.inner.waker.lock() = Some(cx.waker().clone());
         match queue_lock.pop_front() {
             Some(
-                request @ (RequestItem::Block(_) | RequestItem::RejectBlock(_)),
+                request @ (RequestItem::Block(_)
+                | RequestItem::RejectBlock(_)
+                | RequestItem::UnrejectTx(_)),
             ) => Poll::Ready(Some(BatchedRequestItem::Single(request))),
             Some(RequestItem::RejectTx(txid)) => {
                 let mut txids = NonEmpty::new(txid);
@@ -360,6 +365,7 @@ enum ResponseItem {
     Block(Box<bitcoin_jsonrpsee::client::Block<true>>),
     RejectBlock,
     RejectTx,
+    UnrejectTx,
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     Tx(Box<Transaction>, bool),
@@ -482,6 +488,17 @@ where
                 .await
                 .map_err(|e| RequestError::JsonRpc { method, source: e })?;
             let resp = ResponseItem::RejectTx;
+            Ok(BatchedResponseItem::Single(resp))
+        }
+        BatchedRequestItem::Single(RequestItem::UnrejectTx(txid)) => {
+            // `prioritisetransaction` accumulates, so the exact opposite of
+            // the delta applied when the tx was rejected returns it to its
+            // own fee.
+            let _: bool = rpc_client
+                .prioritize_transaction(txid, -NEGATIVE_MAX_SATS)
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+            let resp = ResponseItem::UnrejectTx;
             Ok(BatchedResponseItem::Single(resp))
         }
         BatchedRequestItem::Single(RequestItem::Tx(txid, in_mempool)) => {
