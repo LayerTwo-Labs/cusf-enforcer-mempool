@@ -4,6 +4,7 @@ pub mod test_accept_tx_paths;
 pub mod test_block_connect_smoke;
 pub mod test_connect_block_deprioritizes_removed_txs;
 pub mod test_disconnect_through_sync_tip;
+pub mod test_disconnect_unrejects_removed_txs;
 pub mod test_double_insert_after_reorg;
 pub mod test_enforcer_rejection_during_reorg;
 pub mod test_gbt_long_poll;
