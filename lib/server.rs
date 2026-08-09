@@ -404,6 +404,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     block_producer: &BP,
     mempool: &crate::mempool::Mempool,
     parent_block_hash: &BlockHash,
+    coinbase_spk: &ScriptBuf,
 )
     -> Result<
             (<typewit::const_marker::Bool<COINBASE_TXN> as cusf_block_producer::CoinbaseTxn>::CoinbaseTxouts,
@@ -524,11 +525,18 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
                 + Weight::from_non_witness_data_size(39).to_wu();
             Weight::from_wu(weight_wu)
         };
+        // The block reward payout txout is appended to the coinbase txouts in
+        // `finalize_coinbase_tx`, and its spk has no fixed size, so its weight
+        // must be reserved here.
+        let payout_txout_weight = TxOut {
+            value: Amount::MAX_MONEY,
+            script_pubkey: coinbase_spk.clone(),
+        }
+        .weight();
         Weight::from_wu(
-            txouts_weight
-                .to_wu()
-                .checked_add(COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT.to_wu())
-                .ok_or(BuildBlockError::WeightOverflow)?,
+            txouts_weight.to_wu()
+                + COINBASE_WITNESS_COMMITMENT_TXOUT_WEIGHT.to_wu()
+                + payout_txout_weight.to_wu(),
         )
     };
     let prefix_txs_weight = {
@@ -662,8 +670,13 @@ where
     let tip_block = mempool.tip();
     let (coinbase_txn, block_txs, default_witness_commitment) = if coinbasetxn {
         tracing::debug!("Filling block txs");
-        let (coinbase_txouts, block_txs) =
-            block_txs::<true, _>(enforcer, mempool, &tip_block.hash).await?;
+        let (coinbase_txouts, block_txs) = block_txs::<true, _>(
+            enforcer,
+            mempool,
+            &tip_block.hash,
+            &coinbase_spk,
+        )
+        .await?;
         tracing::debug!("Finalizing coinbase txn");
         let (coinbase_tx, witness_commitment_spk) = finalize_coinbase_tx(
             coinbase_spk,
@@ -676,8 +689,13 @@ where
             witness_commitment_spk.map(|spk| spk.to_bytes());
         (Some(coinbase_tx), block_txs, default_witness_commitment)
     } else {
-        let ((), block_txs) =
-            block_txs::<false, _>(enforcer, mempool, &tip_block.hash).await?;
+        let ((), block_txs) = block_txs::<false, _>(
+            enforcer,
+            mempool,
+            &tip_block.hash,
+            &coinbase_spk,
+        )
+        .await?;
         (None, block_txs, None)
     };
     Ok(MempoolQueryOutput {
@@ -911,5 +929,52 @@ where
                 jsonrpsee::core::ClientError::Call(err) => err,
                 err => internal_error(err),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block consists of the header, the txs array length, the coinbase tx,
+    /// and the txs selected within `MAX_USABLE_BLOCK_WEIGHT`, so the weight
+    /// reserved for the coinbase tx (in `MAX_USABLE_BLOCK_WEIGHT`) and for its
+    /// txouts (`coinbase_txouts_weight` in `block_txs`) must cover the
+    /// coinbase tx that is actually generated, for any payout spk.
+    #[test]
+    fn coinbase_weight_is_reserved() {
+        // Only the spk length affects the coinbase weight.
+        // P2WPKH, P2SH, P2PKH, and P2TR/P2WSH payout spk lengths
+        for spk_len in [22, 23, 25, 34] {
+            let coinbase_spk = ScriptBuf::from_bytes(vec![0u8; spk_len]);
+            let (coinbase_tx, _witness_commitment_spk) = finalize_coinbase_tx(
+                coinbase_spk,
+                800_000,
+                Network::Bitcoin,
+                Vec::new(),
+                &[],
+            )
+            .unwrap();
+            // Weight of the coinbase txouts, which `block_txs` charges
+            // against `MAX_USABLE_BLOCK_WEIGHT`
+            let coinbase_txouts_weight: Weight = coinbase_tx
+                .output
+                .iter()
+                .map(|tx_out| tx_out.weight())
+                .sum();
+            let header_weight = Weight::from_non_witness_data_size(
+                bitcoin::block::Header::SIZE as u64,
+            );
+            // 3 bytes for encoding txs array length
+            let txs_len_weight = Weight::from_non_witness_data_size(3);
+            let block_weight = header_weight
+                + txs_len_weight
+                + coinbase_tx.weight()
+                + (mempool::MAX_USABLE_BLOCK_WEIGHT - coinbase_txouts_weight);
+            assert!(
+                block_weight <= Weight::MAX_BLOCK,
+                "weight `{block_weight}` exceeds limit for {spk_len}-byte spk"
+            );
+        }
     }
 }
