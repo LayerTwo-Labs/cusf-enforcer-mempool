@@ -176,6 +176,16 @@ impl<Enforcer> MempoolSyncingBorrowed<'_, Enforcer> {
     }
 }
 
+/// Cached txs are only needed in order to compute fees for their child txs,
+/// so drop any cached tx that is not spent by a mempool tx.
+/// Dropped txs are requested again if they are needed later.
+fn prune_tx_cache(
+    mempool: &Mempool,
+    tx_cache: &mut HashMap<Txid, Transaction>,
+) {
+    tx_cache.retain(|txid, _tx| mempool.tx_childs.0.contains_key(txid));
+}
+
 // TODO: move txs_needed / request_queue handling out
 async fn connect_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
@@ -258,6 +268,7 @@ where
             for txid in remove_mempool_txs {
                 inner.mempool.remove_with_descendants(&txid)?;
             }
+            let () = prune_tx_cache(&inner.mempool, sync_state.tx_cache);
             inner.mempool.chain.tip = block.hash;
         }
         ConnectBlockAction::Reject => {
@@ -1293,5 +1304,66 @@ where
         let inner_read = inner.read().await;
         let res = f(&inner_read.mempool, &inner_read.enforcer).await;
         Some(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{
+        Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
+        absolute::LockTime, hashes::Hash as _, transaction::Version,
+    };
+
+    use super::{
+        BlockHash, HashMap, Mempool, Transaction, Txid, prune_tx_cache,
+    };
+
+    fn make_tx(inputs: &[OutPoint]) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|prev| TxIn {
+                    previous_output: *prev,
+                    sequence: Sequence::MAX,
+                    script_sig: ScriptBuf::new(),
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    /// Confirmed txs must not accumulate in the tx cache, so only txs that
+    /// are spent by a mempool tx are retained.
+    #[test]
+    fn prune_tx_cache_drops_txs_without_mempool_childs() {
+        let mut mempool =
+            Mempool::new(Network::Regtest, BlockHash::all_zeros());
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)]);
+        let child_txid = child.compute_txid();
+        // Confirmed tx that nothing in the mempool spends
+        let confirmed =
+            make_tx(&[OutPoint::new(Txid::from_byte_array([0x42; 32]), 0)]);
+        let confirmed_txid = confirmed.compute_txid();
+        let modified_weight = child.weight();
+        let _res = mempool
+            .insert(child.clone(), 100, imbl::OrdSet::new(), modified_weight)
+            .expect("failed to insert tx into mempool");
+        let mut tx_cache = HashMap::from_iter([
+            (parent_txid, parent),
+            (child_txid, child),
+            (confirmed_txid, confirmed),
+        ]);
+        let () = prune_tx_cache(&mempool, &mut tx_cache);
+        assert!(tx_cache.contains_key(&parent_txid));
+        assert!(!tx_cache.contains_key(&child_txid));
+        assert!(!tx_cache.contains_key(&confirmed_txid));
     }
 }
