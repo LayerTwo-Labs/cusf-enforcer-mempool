@@ -293,6 +293,69 @@ pub async fn submit_tx(
     send_to_address(rpc, &dest, amount_sat).await
 }
 
+/// Spend the wallet output of `txid` that pays `addr`, sending it minus
+/// `fee_sat` to a fresh address — `listunspent` + `createrawtransaction` +
+/// `signrawtransactionwithwallet` + `sendrawtransaction`. `sendtoaddress`
+/// picks its own inputs, so this is the only way to build a tx that provably
+/// spends a given parent. Returns the new txid.
+pub async fn spend_wallet_output(
+    rpc: &RpcClient,
+    txid: Txid,
+    addr: &Address,
+    fee_sat: u64,
+) -> anyhow::Result<Txid> {
+    let utxos: serde_json::Value = rpc
+        .request("listunspent", rpc_params![0, 9_999_999, [addr.to_string()]])
+        .await?;
+    let txid_str = txid.to_string();
+    let utxo = utxos
+        .as_array()
+        .ok_or_else(|| anyhow!("listunspent did not return an array"))?
+        .iter()
+        .find(|utxo| utxo["txid"].as_str() == Some(txid_str.as_str()))
+        .ok_or_else(|| anyhow!("no wallet output of {txid} paying {addr}"))?;
+    let vout = utxo["vout"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("listunspent entry missing `vout`: {utxo}"))?;
+    let amount_btc = utxo["amount"]
+        .as_f64()
+        .ok_or_else(|| anyhow!("listunspent entry missing `amount`: {utxo}"))?;
+    let amount_sat = (amount_btc * 100_000_000.0).round() as u64;
+    let value_sat = amount_sat
+        .checked_sub(fee_sat)
+        .ok_or_else(|| anyhow!("fee {fee_sat} exceeds {txid}:{vout}"))?;
+
+    let dest = get_new_address(rpc).await?;
+    let inputs = serde_json::json!([{ "txid": txid_str, "vout": vout }]);
+    let mut outputs = serde_json::Map::new();
+    outputs.insert(
+        dest.to_string(),
+        format!("{:.8}", (value_sat as f64) / 100_000_000.0).into(),
+    );
+    let raw_hex: String = rpc
+        .request(
+            "createrawtransaction",
+            rpc_params![inputs, serde_json::Value::Object(outputs)],
+        )
+        .await?;
+    #[derive(serde::Deserialize)]
+    struct SignRawTx {
+        complete: bool,
+        hex: String,
+    }
+    let signed: SignRawTx = rpc
+        .request("signrawtransactionwithwallet", rpc_params![raw_hex])
+        .await?;
+    anyhow::ensure!(
+        signed.complete,
+        "signing a spend of {txid}:{vout} did not complete"
+    );
+    let child: String = rpc
+        .request("sendrawtransaction", rpc_params![signed.hex])
+        .await?;
+    Ok(child.parse()?)
+}
+
 /// `getrawmempool` — bitcoind's current mempool as a list of txids.
 pub async fn mempool_txids(rpc: &RpcClient) -> anyhow::Result<Vec<Txid>> {
     // We bypass MainClient::get_raw_mempool because its typed

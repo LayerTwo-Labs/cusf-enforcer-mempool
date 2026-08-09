@@ -4,9 +4,9 @@ use clap::Parser;
 use cusf_enforcer_mempool_integration_tests::{
     setup::{Directories, TestSetup},
     test_accept_tx_paths, test_block_connect_smoke,
-    test_disconnect_through_sync_tip, test_double_insert_after_reorg,
-    test_enforcer_rejection_during_reorg, test_rbf_removed_for_absent_tx,
-    test_reorg_re_inserts_tx,
+    test_child_of_confirmed_rejected_tx, test_disconnect_through_sync_tip,
+    test_double_insert_after_reorg, test_enforcer_rejection_during_reorg,
+    test_rbf_removed_for_absent_tx, test_reorg_re_inserts_tx,
     util::{BinPaths, TestFailure, TestFailureCollector},
 };
 use libtest_mimic::{Arguments, Trial};
@@ -174,6 +174,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
                 test_rbf_removed_for_absent_tx::test_rbf_removed_for_absent_tx(
                     s,
                 ),
+            )
+        }),
+        ("child_of_confirmed_rejected_tx", |s| {
+            Box::pin(
+                test_child_of_confirmed_rejected_tx::test_child_of_confirmed_rejected_tx(s),
             )
         }),
     ];
