@@ -903,7 +903,13 @@ where
             zmq_seq: _,
         }) => {
             if inner.unfiltered_mempool.txs.remove(txid) {
-                inner.mempool.remove(txid)?;
+                // The node never evicts a tx without also evicting its
+                // descendants, so remove descendants here too. Leaving them
+                // behind would strip the removed tx from their `depends`,
+                // making them appear standalone-valid in block templates.
+                // The per-descendant removal messages that follow are then
+                // no-ops for the mempool.
+                inner.mempool.remove_with_descendants(txid)?;
                 inner.abandoned_pool.remove(txid);
                 Ok(ApplySyncActionResult::from(true))
             } else {
@@ -1418,8 +1424,12 @@ mod tests {
     };
 
     use super::{
-        BlockHash, HashMap, Mempool, Transaction, Txid, prune_tx_cache,
+        AbandonedPool, BlockHash, HashMap, HashSet, LinkedHashSet, Mempool,
+        MempoolSyncInner, RequestQueue, SequenceMessage, SyncStateBorrowedMut,
+        Transaction, TxHashEvent, TxHashMessage, Txid, UnfilteredMempool,
+        prune_tx_cache, try_apply_seq_message,
     };
+    use crate::cusf_enforcer::DefaultEnforcer;
 
     fn make_tx(inputs: &[OutPoint]) -> Transaction {
         Transaction {
@@ -1468,5 +1478,71 @@ mod tests {
         assert!(tx_cache.contains_key(&parent_txid));
         assert!(!tx_cache.contains_key(&child_txid));
         assert!(!tx_cache.contains_key(&confirmed_txid));
+    }
+
+    /// A removal notification for a parent must also remove the parent's
+    /// descendants, otherwise the orphaned descendants remain in the mempool
+    /// without their dependency, and are proposed as standalone txs.
+    #[test]
+    fn removed_tx_also_removes_descendants() {
+        let mut mempool =
+            Mempool::new(Network::Regtest, BlockHash::all_zeros());
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)]);
+        let child_txid = child.compute_txid();
+        for tx in [parent, child] {
+            let modified_weight = tx.weight();
+            let _res = mempool
+                .insert(tx, 100, imbl::OrdSet::new(), modified_weight)
+                .expect("failed to insert tx into mempool");
+        }
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: BlockHash::all_zeros(),
+                txs: HashSet::from_iter([parent_txid, child_txid]),
+            },
+        };
+        let mut blocks_needed = LinkedHashSet::new();
+        let mut rejected_txs = HashSet::new();
+        let request_queue = RequestQueue::default();
+        let mut tx_cache = HashMap::new();
+        let mut txs_needed = LinkedHashSet::new();
+        let mut unavailable_txs = HashSet::new();
+        let sync_state = SyncStateBorrowedMut {
+            blocks_needed: &mut blocks_needed,
+            rejected_txs: &mut rejected_txs,
+            request_queue: &request_queue,
+            tx_cache: &mut tx_cache,
+            txs_needed: &mut txs_needed,
+            unavailable_txs: &mut unavailable_txs,
+        };
+        // Apply only the parent's removal; the node's removal message for the
+        // child has not been handled yet.
+        let seq_msg = SequenceMessage::TxHash(TxHashMessage {
+            txid: parent_txid,
+            event: TxHashEvent::Removed,
+            mempool_seq: 0,
+            zmq_seq: 0,
+        });
+        let apply = try_apply_seq_message::<DefaultEnforcer, DefaultEnforcer>(
+            &mut inner, sync_state, &seq_msg,
+        );
+        let _res = futures::executor::block_on(apply)
+            .expect("failed to apply removal");
+        let proposed = inner
+            .mempool
+            .propose_txs(None)
+            .expect("failed to propose txs");
+        let proposed_txids: Vec<Txid> =
+            proposed.iter().map(|tx| tx.txid).collect();
+        assert!(
+            proposed_txids.is_empty(),
+            "descendants of a removed tx must not be proposed, \
+             but found {proposed_txids:?}"
+        );
     }
 }
