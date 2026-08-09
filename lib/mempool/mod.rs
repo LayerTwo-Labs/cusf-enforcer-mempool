@@ -426,6 +426,11 @@ impl TxChilds {
 #[derive(Clone, Debug, Default)]
 struct MempoolTxs(imbl::HashMap<Txid, (Transaction, TxInfo)>);
 
+/// Maximum weight usable for block template txs and coinbase txouts.
+/// This reserves weight for the block header, the txs array length, and the
+/// coinbase tx *without any txouts*, so the weight of the coinbase txouts
+/// (including the block reward payout txout, whose spk has no fixed size)
+/// MUST be accounted for by the caller.
 pub const MAX_USABLE_BLOCK_WEIGHT: Weight = {
     const COINBASE_TXIN_WEIGHT: Weight = {
         let weight_wu = Weight::from_non_witness_data_size(
@@ -436,14 +441,9 @@ pub const MAX_USABLE_BLOCK_WEIGHT: Weight = {
             // SPK
             + 5
         ).to_wu()
-        // witness
-        + Weight::from_witness_data_size(33).to_wu();
-        Weight::from_wu(weight_wu)
-    };
-    const COINBASE_VALUE_TXOUT_WEIGHT: Weight = {
-        let weight_wu = Weight::from_non_witness_data_size(bitcoin::Amount::SIZE as u64).to_wu()
-            // SPK weight
-            + Weight::from_non_witness_data_size(23).to_wu();
+        // witness (stack items length, witness reserved value length, and
+        // witness reserved value)
+        + Weight::from_witness_data_size(1 + 1 + 32).to_wu();
         Weight::from_wu(weight_wu)
     };
     const COINBASE_TX_WEIGHT: Weight = Weight::from_wu(
@@ -451,18 +451,19 @@ pub const MAX_USABLE_BLOCK_WEIGHT: Weight = {
         Weight::from_non_witness_data_size(4).to_wu()
         // locktime
         + Weight::from_non_witness_data_size(4).to_wu()
+        // segwit marker and flag
+        + Weight::from_witness_data_size(2).to_wu()
         // inputs
         + Weight::from_non_witness_data_size(1).to_wu()
         + COINBASE_TXIN_WEIGHT.to_wu()
         // outputs
-        + Weight::from_non_witness_data_size(1).to_wu()
-        + COINBASE_VALUE_TXOUT_WEIGHT.to_wu(),
+        + Weight::from_non_witness_data_size(1).to_wu(),
     );
     let res_wu = Weight::MAX_BLOCK.to_wu() - Weight::from_non_witness_data_size(
             bitcoin::block::Header::SIZE as u64
         ).to_wu()
-            // 2 bytes for encoding txs array length
-            - Weight::from_non_witness_data_size(2).to_wu()
+            // 3 bytes for encoding txs array length
+            - Weight::from_non_witness_data_size(3).to_wu()
             - COINBASE_TX_WEIGHT.to_wu();
     Weight::from_wu(res_wu)
 };
