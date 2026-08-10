@@ -7,6 +7,7 @@ pub mod test_disconnect_through_sync_tip;
 pub mod test_double_insert_after_reorg;
 pub mod test_enforcer_rejection_during_reorg;
 pub mod test_gbt_long_poll;
+pub mod test_mempool_dat_fast_path;
 pub mod test_rbf_removed_for_absent_tx;
 pub mod test_rejected_block_disconnect;
 pub mod test_reorg_re_inserts_tx;

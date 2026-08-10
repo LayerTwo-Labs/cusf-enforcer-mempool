@@ -11,6 +11,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     marker::PhantomData,
+    path::Path,
     sync::Arc,
 };
 
@@ -1185,6 +1186,44 @@ where
     _marker: PhantomData<Enforcer>,
 }
 
+/// Seed the tx cache from Core's `mempool.dat`, best-effort.
+fn seed_tx_cache_from_dat(
+    path: &Path,
+    mempool_txids: &[Txid],
+    tx_cache: &mut HashMap<Txid, Transaction>,
+) {
+    let start = std::time::Instant::now();
+    let mut dat = match crate::mempool::dat::read_mempool_dat(path) {
+        Ok(dat) => dat,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                "could not read mempool dump, syncing entirely over RPC: {err:#}"
+            );
+            return;
+        }
+    };
+    if let Some(at) = dat.truncated_at {
+        tracing::debug!(
+            "mempool dump was only readable up to entry {at} of {}",
+            dat.declared
+        );
+    }
+    for txid in mempool_txids {
+        if let Some(tx) = dat.txs.remove(txid) {
+            tx_cache.insert(*txid, tx);
+        }
+    }
+    tracing::info!(
+        "seeded {} of {} mempool txs from {} in {:?}, {} left for RPC",
+        tx_cache.len(),
+        mempool_txids.len(),
+        path.display(),
+        start.elapsed(),
+        mempool_txids.len() - tx_cache.len(),
+    );
+}
+
 pub async fn init_sync_mempool<
     Enforcer,
     BorrowedEnforcer,
@@ -1194,6 +1233,9 @@ pub async fn init_sync_mempool<
     mut enforcer: Enforcer,
     rpc_client: RpcClient,
     zmq_addr_sequence: &str,
+    // Optional path to the node's `mempool.dat`. When set, it is used as a
+    // fast path for the initial sync.
+    mempool_dat_path: Option<&Path>,
     // Would it be better to return a Some/None, indicating sync stoppage?
     shutdown_signal: ShutdownSignal,
 ) -> Result<
@@ -1235,9 +1277,21 @@ where
     let mut sync_state = {
         let request_queue = RequestQueue::default();
         request_queue.push_back(RequestItem::Block(best_block_hash));
-        for txid in &txids {
-            request_queue.push_back(RequestItem::Tx(*txid, true));
+        let mut tx_cache = HashMap::new();
+        if let Some(path) = mempool_dat_path {
+            seed_tx_cache_from_dat(path, &txids, &mut tx_cache);
         }
+        for txid in &txids {
+            if !tx_cache.contains_key(txid) {
+                request_queue.push_back(RequestItem::Tx(*txid, true));
+            }
+        }
+        let txs_needed = LinkedHashSet::from_iter(
+            txids
+                .iter()
+                .copied()
+                .filter(|txid| !tx_cache.contains_key(txid)),
+        );
         let action_queue = SyncActionQueue::from_iter(
             txids.iter().cloned().map(SyncAction::InsertTx),
         );
@@ -1248,8 +1302,8 @@ where
             rejected_blocks: HashSet::new(),
             rejected_txs: HashSet::new(),
             request_queue,
-            tx_cache: HashMap::new(),
-            txs_needed: LinkedHashSet::from_iter(txids),
+            tx_cache,
+            txs_needed,
             unavailable_txs: HashSet::new(),
         }
     };

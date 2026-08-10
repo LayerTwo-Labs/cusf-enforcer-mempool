@@ -35,7 +35,7 @@ pub async fn test_gbt_long_poll(
 ) -> anyhow::Result<()> {
     let node = RegtestNode::new(&bin_paths, directories).await?;
     let (mempool_sync, task_errors) =
-        start_mempool_sync(&node, DefaultEnforcer).await?;
+        start_mempool_sync(&node, DefaultEnforcer, None).await?;
 
     // Wire the GBT server the same way the demo app does.
     let network_info = node.rpc_client.get_network_info().await?;
