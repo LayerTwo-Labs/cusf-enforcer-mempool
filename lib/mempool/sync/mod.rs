@@ -145,9 +145,12 @@ impl Stream for RequestQueue {
             }
             Some(RequestItem::Tx(txid, in_mempool)) => {
                 let mut txids = NonEmpty::new((txid, in_mempool));
-                while let Some(&RequestItem::Tx(txid, in_mempool)) =
-                    queue_lock.front()
-                {
+                while txids.len() < MAX_TX_REQUESTS_PER_BATCH {
+                    let Some(&RequestItem::Tx(txid, in_mempool)) =
+                        queue_lock.front()
+                    else {
+                        break;
+                    };
                     queue_lock.pop_front();
                     txids.push((txid, in_mempool));
                 }
@@ -248,6 +251,18 @@ impl FromIterator<SyncAction> for SyncActionQueue {
         res
     }
 }
+
+/// Maximum tx requests packed into a single batched JSON-RPC call.
+///
+/// Draining the queue unbounded puts every mempool txid in one request, and
+/// nothing else is served until it returns, including the parent-tx fetches
+/// that `insert_tx` deliberately `push_front`s because the head sync action is
+/// blocked on them.
+///
+/// Measured on a ~77k tx mainnet mempool: unbounded, the initial sync exceeded
+/// [`APPLY_SYNC_ACTION_TIMEOUT`], taking 45–80s when it did survive.
+/// Capped at this value, 9 of 10 runs completed, in 25–30s.
+const MAX_TX_REQUESTS_PER_BATCH: usize = 1_000;
 
 /// Timeout waiting to apply the next sync action before its dependencies
 /// were available.
