@@ -8,10 +8,12 @@ use indexmap::IndexSet;
 use lender::FallibleLender as _;
 use thiserror::Error;
 
+pub mod dat;
 pub mod iter;
 pub mod iter_mut;
 mod sync;
 
+pub use dat::{MempoolDat, ReadMempoolDatError, read_mempool_dat};
 pub use sync::{
     InitialSyncMempoolError, MempoolSync, init_sync_mempool,
     task::SyncTaskError,

@@ -204,6 +204,7 @@ impl RegtestNode {
 pub async fn start_mempool_sync<E>(
     node: &RegtestNode,
     mut enforcer: E,
+    mempool_dat: Option<PathBuf>,
 ) -> anyhow::Result<(MempoolSync<E>, TaskErrors)>
 where
     E: CusfEnforcer + Clone + Send + Sync + 'static,
@@ -212,6 +213,7 @@ where
         &mut enforcer,
         node.rpc_client.clone(),
         &node.bitcoind.zmq_addr(),
+        mempool_dat.as_deref(),
         std::future::pending::<()>().fuse(),
     )
     .await
@@ -261,7 +263,7 @@ impl TestSetup {
     pub async fn start(node: RegtestNode) -> anyhow::Result<Self> {
         let enforcer = MockEnforcer::new();
         let (mempool_sync, task_errors) =
-            start_mempool_sync(&node, enforcer.clone()).await?;
+            start_mempool_sync(&node, enforcer.clone(), None).await?;
         Ok(Self {
             node,
             mempool_sync,

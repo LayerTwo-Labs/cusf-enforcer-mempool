@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::Path};
 
 use bitcoin_jsonrpsee::{
     MainClient as _, jsonrpsee::http_client::HttpClientBuilder,
@@ -97,11 +97,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut enforcer = DefaultEnforcer;
     let mempool_synced = {
+        // This demo app is not assumed to share a filesystem with the node.
+        let mempool_dat_path: Option<&Path> = None;
         let shutdown_signal = shutdown_rx.map(|_: Result<_, _>| ());
         mempool::init_sync_mempool(
             &mut enforcer,
             rpc_client.clone(),
             &cli.node_zmq_addr_sequence,
+            mempool_dat_path,
             shutdown_signal.fuse(),
         )
         .await?

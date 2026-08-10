@@ -7,8 +7,8 @@ use cusf_enforcer_mempool_integration_tests::{
     test_connect_block_deprioritizes_removed_txs,
     test_disconnect_through_sync_tip, test_double_insert_after_reorg,
     test_enforcer_rejection_during_reorg, test_gbt_long_poll,
-    test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
-    test_reorg_re_inserts_tx,
+    test_mempool_dat_fast_path, test_rbf_removed_for_absent_tx,
+    test_rejected_block_disconnect, test_reorg_re_inserts_tx,
     util::{
         BinPaths, TestFailure, TestFailureCollector, display_timing_summary,
         record_test_timing,
@@ -261,6 +261,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
                     bp, dirs,
                 ),
             )
+        }),
+        ("mempool_dat_fast_path", |bp, dirs| {
+            Box::pin(test_mempool_dat_fast_path::test_mempool_dat_fast_path(
+                bp, dirs,
+            ))
         }),
         ("gbt_long_poll", |bp, dirs| {
             Box::pin(test_gbt_long_poll::test_gbt_long_poll(bp, dirs))
