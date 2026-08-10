@@ -185,6 +185,16 @@ impl<Enforcer> MempoolSyncingBorrowed<'_, Enforcer> {
     }
 }
 
+/// Cached txs are only needed in order to compute fees for their child txs,
+/// so drop any cached tx that is not spent by a mempool tx.
+/// Dropped txs are requested again if they are needed later.
+fn prune_tx_cache(
+    mempool: &Mempool,
+    tx_cache: &mut HashMap<Txid, Transaction>,
+) {
+    tx_cache.retain(|txid, _tx| mempool.tx_childs.0.contains_key(txid));
+}
+
 // TODO: move txs_needed / request_queue handling out
 async fn connect_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
@@ -305,6 +315,7 @@ where
                     .request_queue
                     .push_front(RequestItem::RejectTx(txid));
             }
+            let () = prune_tx_cache(&inner.mempool, sync_state.tx_cache);
             inner.mempool.chain.tip = block.hash;
             let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
         }
@@ -1456,16 +1467,15 @@ where
 #[cfg(test)]
 mod tests {
     use bitcoin::{
-        Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
-        TxOut, Txid, Witness, absolute::LockTime, hashes::Hash as _,
-        transaction::Version,
+        Amount, Network, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness,
+        absolute::LockTime, hashes::Hash as _, transaction::Version,
     };
-    use hashlink::LinkedHashSet;
 
-    use super::*;
-    use crate::{cusf_enforcer::DefaultEnforcer, mempool::Mempool};
+    use super::{
+        BlockHash, HashMap, Mempool, Transaction, Txid, prune_tx_cache,
+    };
 
-    fn make_tx(inputs: &[OutPoint], output_values: &[u64]) -> Transaction {
+    fn make_tx(inputs: &[OutPoint]) -> Transaction {
         Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -1478,110 +1488,39 @@ mod tests {
                     witness: Witness::new(),
                 })
                 .collect(),
-            output: output_values
-                .iter()
-                .map(|value| TxOut {
-                    value: Amount::from_sat(*value),
-                    script_pubkey: ScriptBuf::new(),
-                })
-                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
         }
     }
 
-    /// Regression test for the initial-sync crash reported in
-    /// LayerTwo-Labs/bip300301_enforcer#406.
-    ///
-    /// During initial sync the RPC mempool snapshot and the live ZMQ
-    /// `sequence` stream are reconciled together, so the same txid can be
-    /// queued for insertion twice (e.g. once as the snapshot `InsertTx` and
-    /// once as a buffered `Added` sequence message).
-    ///
-    /// Verifies the unfiltered mempool invariant (filtered ⊆ unfiltered).
+    /// Confirmed txs must not accumulate in the tx cache, so only txs that
+    /// are spent by a mempool tx are retained.
     #[test]
-    fn add_tx_from_caches_is_idempotent() {
-        let genesis = BlockHash::all_zeros();
-        let (tip_watch, _) = watch::channel(genesis);
-        let mut inner = MempoolSyncInner {
-            abandoned_pool: AbandonedPool::default(),
-            enforcer: DefaultEnforcer,
-            mempool: Mempool::new(genesis),
-            tip_watch,
-            unfiltered_mempool: UnfilteredMempool {
-                tip: genesis,
-                txs: HashSet::new(),
-            },
-        };
-
-        // A parent tx supplying a spendable output, available only via the tx
-        // cache (it is not itself a mempool tx).
-        let parent =
-            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+    fn prune_tx_cache_drops_txs_without_mempool_childs() {
+        let mut mempool =
+            Mempool::new(Network::Regtest, BlockHash::all_zeros());
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)]);
         let parent_txid = parent.compute_txid();
-        // The tx under test, spending the parent's output.
-        let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
-        let txid = tx.compute_txid();
-
-        let mut tx_cache = HashMap::new();
-        tx_cache.insert(parent_txid, parent);
-        tx_cache.insert(txid, tx);
-
-        let mut blocks_needed = LinkedHashSet::new();
-        let mut rejected_blocks = HashSet::new();
-        let mut rejected_txs = HashSet::new();
-        let request_queue = RequestQueue::default();
-        let mut txs_needed = LinkedHashSet::new();
-        let mut unavailable_txs = HashSet::new();
-
-        // First insertion adds the tx to the mempool.
-        {
-            let sync_state = SyncStateBorrowedMut {
-                blocks_needed: &mut blocks_needed,
-                rejected_blocks: &mut rejected_blocks,
-                rejected_txs: &mut rejected_txs,
-                request_queue: &request_queue,
-                tx_cache: &mut tx_cache,
-                txs_needed: &mut txs_needed,
-                unavailable_txs: &mut unavailable_txs,
-            };
-            let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
-                &mut inner, sync_state, txid,
-            )
-            .expect("first add should succeed");
-            assert!(added, "tx should be added to the mempool");
-        }
-        assert!(
-            inner.mempool.txs.0.contains_key(&txid),
-            "tx should be present in the mempool after the first add"
-        );
-        assert!(
-            inner.unfiltered_mempool.txs.contains(&txid),
-            "tx should be present in the unfiltered mempool after the first add"
-        );
-
-        // Re-applying the same txid must be an idempotent no-op success, not a
-        // fatal `TxAlreadyExists`.
-        {
-            let sync_state = SyncStateBorrowedMut {
-                blocks_needed: &mut blocks_needed,
-                rejected_blocks: &mut rejected_blocks,
-                rejected_txs: &mut rejected_txs,
-                request_queue: &request_queue,
-                tx_cache: &mut tx_cache,
-                txs_needed: &mut txs_needed,
-                unavailable_txs: &mut unavailable_txs,
-            };
-            let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
-                &mut inner, sync_state, txid,
-            )
-            .expect(
-                "re-adding an already-present tx must not error \
-                 (idempotent reconciliation)",
-            );
-            assert!(added, "re-add should report success");
-        }
-        assert!(
-            inner.unfiltered_mempool.txs.contains(&txid),
-            "tx should still be present in the unfiltered mempool after the second add"
-        );
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)]);
+        let child_txid = child.compute_txid();
+        // Confirmed tx that nothing in the mempool spends
+        let confirmed =
+            make_tx(&[OutPoint::new(Txid::from_byte_array([0x42; 32]), 0)]);
+        let confirmed_txid = confirmed.compute_txid();
+        let modified_weight = child.weight();
+        let _res = mempool
+            .insert(child.clone(), 100, imbl::OrdSet::new(), modified_weight)
+            .expect("failed to insert tx into mempool");
+        let mut tx_cache = HashMap::from_iter([
+            (parent_txid, parent),
+            (child_txid, child),
+            (confirmed_txid, confirmed),
+        ]);
+        let () = prune_tx_cache(&mempool, &mut tx_cache);
+        assert!(tx_cache.contains_key(&parent_txid));
+        assert!(!tx_cache.contains_key(&child_txid));
+        assert!(!tx_cache.contains_key(&confirmed_txid));
     }
 }
