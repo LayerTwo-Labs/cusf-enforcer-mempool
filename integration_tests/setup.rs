@@ -203,15 +203,38 @@ impl RegtestNode {
 /// Generic over any `CusfEnforcer + Clone + Send + Sync + 'static`.
 pub async fn start_mempool_sync<E>(
     node: &RegtestNode,
-    mut enforcer: E,
+    enforcer: E,
     mempool_dat: Option<PathBuf>,
 ) -> anyhow::Result<(MempoolSync<E>, TaskErrors)>
 where
     E: CusfEnforcer + Clone + Send + Sync + 'static,
 {
+    start_mempool_sync_with_client(
+        node,
+        enforcer,
+        node.rpc_client.clone(),
+        mempool_dat,
+    )
+    .await
+}
+
+/// As [`start_mempool_sync`], but the sync task drives `rpc_client` instead of
+/// the node's own. Lets a test interpose on the fetch path — see
+/// [`crate::stalling_client::StallingClient`].
+pub async fn start_mempool_sync_with_client<E, RpcClient>(
+    node: &RegtestNode,
+    mut enforcer: E,
+    rpc_client: RpcClient,
+    mempool_dat: Option<PathBuf>,
+) -> anyhow::Result<(MempoolSync<E>, TaskErrors)>
+where
+    E: CusfEnforcer + Clone + Send + Sync + 'static,
+    RpcClient:
+        bitcoin_jsonrpsee::client::MainClient + Send + Sync + Clone + 'static,
+{
     let mempool_synced = mempool::init_sync_mempool(
         &mut enforcer,
-        node.rpc_client.clone(),
+        rpc_client,
         &node.bitcoind.zmq_addr(),
         mempool_dat.as_deref(),
         std::future::pending::<()>().fuse(),
@@ -264,6 +287,36 @@ impl TestSetup {
         let enforcer = MockEnforcer::new();
         let (mempool_sync, task_errors) =
             start_mempool_sync(&node, enforcer.clone(), None).await?;
+        Ok(Self {
+            node,
+            mempool_sync,
+            enforcer,
+            task_errors,
+        })
+    }
+
+    /// As [`TestSetup::start`], but the sync task drives `rpc_client`. The
+    /// node's own client stays available on `setup.node.rpc_client`, so a test
+    /// can keep driving bitcoind while the sync task is held up.
+    pub async fn start_with_client<RpcClient>(
+        node: RegtestNode,
+        rpc_client: RpcClient,
+    ) -> anyhow::Result<Self>
+    where
+        RpcClient: bitcoin_jsonrpsee::client::MainClient
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let enforcer = MockEnforcer::new();
+        let (mempool_sync, task_errors) = start_mempool_sync_with_client(
+            &node,
+            enforcer.clone(),
+            rpc_client,
+            None,
+        )
+        .await?;
         Ok(Self {
             node,
             mempool_sync,

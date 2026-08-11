@@ -1,5 +1,6 @@
 pub mod mock_enforcer;
 pub mod setup;
+pub mod stalling_client;
 pub mod test_accept_tx_paths;
 pub mod test_block_connect_smoke;
 pub mod test_connect_block_deprioritizes_removed_txs;
@@ -11,4 +12,5 @@ pub mod test_mempool_dat_fast_path;
 pub mod test_rbf_removed_for_absent_tx;
 pub mod test_rejected_block_disconnect;
 pub mod test_reorg_re_inserts_tx;
+pub mod test_tx_replaced_during_fetch;
 pub mod util;
