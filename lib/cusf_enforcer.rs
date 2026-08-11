@@ -1,9 +1,5 @@
 use std::{
-    borrow::Borrow,
-    collections::{HashMap, HashSet},
-    convert::Infallible,
-    fmt::Debug,
-    future::Future,
+    collections::HashSet, convert::Infallible, fmt::Debug, future::Future,
 };
 
 use bitcoin::{BlockHash, Transaction, Txid};
@@ -79,14 +75,10 @@ pub trait CusfEnforcer {
 
     /// Accept or reject a transaction, declaring conflicts for reasons other
     /// than shared inputs.
-    /// Inputs to a tx are always available.
-    fn accept_tx<TxRef>(
+    fn accept_tx(
         &mut self,
         tx: &Transaction,
-        tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<TxAcceptAction, Self::AcceptTxError>
-    where
-        TxRef: Borrow<Transaction>;
+    ) -> Result<TxAcceptAction, Self::AcceptTxError>;
 }
 
 /// General purpose error for [`CusfEnforcer`]
@@ -468,36 +460,30 @@ where
 
     type AcceptTxError = Either<C0::AcceptTxError, C1::AcceptTxError>;
 
-    fn accept_tx<TxRef>(
+    fn accept_tx(
         &mut self,
         tx: &Transaction,
-        tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<TxAcceptAction, Self::AcceptTxError>
-    where
-        TxRef: Borrow<Transaction>,
-    {
-        match self.0.accept_tx(tx, tx_inputs).map_err(Either::Left)? {
+    ) -> Result<TxAcceptAction, Self::AcceptTxError> {
+        match self.0.accept_tx(tx).map_err(Either::Left)? {
             TxAcceptAction::Accept {
                 conflicts_with: left_conflicts,
                 weight_tweak: left_weight_tweak,
-            } => {
-                match self.1.accept_tx(tx, tx_inputs).map_err(Either::Right)? {
-                    TxAcceptAction::Accept {
-                        conflicts_with: right_conflicts,
-                        weight_tweak: right_weight_tweak,
-                    } => {
-                        let mut conflicts_with = left_conflicts;
-                        conflicts_with.extend(right_conflicts);
-                        let weight_tweak = left_weight_tweak
-                            .saturating_add(right_weight_tweak);
-                        Ok(TxAcceptAction::Accept {
-                            conflicts_with,
-                            weight_tweak,
-                        })
-                    }
-                    TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
+            } => match self.1.accept_tx(tx).map_err(Either::Right)? {
+                TxAcceptAction::Accept {
+                    conflicts_with: right_conflicts,
+                    weight_tweak: right_weight_tweak,
+                } => {
+                    let mut conflicts_with = left_conflicts;
+                    conflicts_with.extend(right_conflicts);
+                    let weight_tweak =
+                        left_weight_tweak.saturating_add(right_weight_tweak);
+                    Ok(TxAcceptAction::Accept {
+                        conflicts_with,
+                        weight_tweak,
+                    })
                 }
-            }
+                TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
+            },
             TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
         }
     }
@@ -537,14 +523,10 @@ impl CusfEnforcer for DefaultEnforcer {
 
     type AcceptTxError = Infallible;
 
-    fn accept_tx<TxRef>(
+    fn accept_tx(
         &mut self,
         _tx: &Transaction,
-        _tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<TxAcceptAction, Self::AcceptTxError>
-    where
-        TxRef: Borrow<Transaction>,
-    {
+    ) -> Result<TxAcceptAction, Self::AcceptTxError> {
         Ok(TxAcceptAction::Accept {
             conflicts_with: HashSet::new(),
             weight_tweak: 0,
@@ -621,21 +603,13 @@ where
 
     type AcceptTxError = Either<C0::AcceptTxError, C1::AcceptTxError>;
 
-    fn accept_tx<TxRef>(
+    fn accept_tx(
         &mut self,
         tx: &Transaction,
-        tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<TxAcceptAction, Self::AcceptTxError>
-    where
-        TxRef: Borrow<Transaction>,
-    {
+    ) -> Result<TxAcceptAction, Self::AcceptTxError> {
         match self {
-            Self::Left(left) => {
-                left.accept_tx(tx, tx_inputs).map_err(Either::Left)
-            }
-            Self::Right(right) => {
-                right.accept_tx(tx, tx_inputs).map_err(Either::Right)
-            }
+            Self::Left(left) => left.accept_tx(tx).map_err(Either::Left),
+            Self::Right(right) => right.accept_tx(tx).map_err(Either::Right),
         }
     }
 }

@@ -761,7 +761,7 @@ where
             match inner
                 .enforcer
                 .borrow_mut()
-                .accept_tx(tx, &parent_txs)
+                .accept_tx(tx)
                 .map_err(cusf_enforcer::Error::AcceptTx)?
             {
                 cusf_enforcer::TxAcceptAction::Accept {
