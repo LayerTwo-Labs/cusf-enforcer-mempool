@@ -149,6 +149,12 @@ pub struct SyncState {
     tx_cache: HashMap<Txid, Transaction>,
     txs_needed: LinkedHashSet<Txid>,
     unavailable_txs: HashSet<Txid>,
+    /// Fees Core already computed, from `getrawmempool verbose`
+    known_fees: HashMap<Txid, Amount>,
+    /// Txids Core reported in the mempool. Used to tell a parent that is
+    /// itself in the mempool -- which carries dependency semantics and must
+    /// still be resolved -- from a confirmed one, which does not.
+    mempool_txids: HashSet<Txid>,
 }
 
 /// Sync state, mutably borrowed while applying an action from the queue
@@ -163,6 +169,8 @@ struct SyncStateBorrowedMut<'a> {
     tx_cache: &'a mut HashMap<Txid, Transaction>,
     txs_needed: &'a mut LinkedHashSet<Txid>,
     unavailable_txs: &'a mut HashSet<Txid>,
+    known_fees: &'a HashMap<Txid, Amount>,
+    mempool_txids: &'a HashSet<Txid>,
 }
 
 pub struct MempoolSyncing<Enforcer> {
@@ -545,6 +553,8 @@ where
                     tx_cache: &mut sync_state.tx_cache,
                     txs_needed: &mut sync_state.txs_needed,
                     unavailable_txs: &mut sync_state.unavailable_txs,
+                    known_fees: &sync_state.known_fees,
+                    mempool_txids: &sync_state.mempool_txids,
                 };
                 let () = connect_block(inner, sync_state, &resp_block).await?;
             };
@@ -580,6 +590,24 @@ where
     Ok(())
 }
 
+/// Whether an arriving mempool tx's parent still has to be fetched.
+///
+/// A parent is wanted for two things: the value of the output being
+/// spent, and -- when the parent is itself in the mempool -- the dependency
+/// state that decides whether this tx must be rejected or abandoned with it.
+/// Once Core has given us the fee, the first reason is gone, so a confirmed
+/// parent has nothing left to offer and is not requested.
+fn needs_parent_fetch(
+    sync_state: &SyncState,
+    fee_known: bool,
+    input_txid: &Txid,
+) -> bool {
+    if sync_state.tx_cache.contains_key(input_txid) {
+        return false;
+    }
+    !fee_known || sync_state.mempool_txids.contains(input_txid)
+}
+
 fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
     let txid = tx.compute_txid();
     sync_state.txs_needed.remove(&txid);
@@ -599,17 +627,42 @@ enum ParentTxsResult<'a> {
     Unavailable(LinkedHashSet<Txid>),
     /// Abandoned parent txs, sorted by vin
     Abandoned(LinkedHashSet<Txid>),
+    /// The parent txs that were still worth resolving.
+    ///
+    /// NOT necessarily one entry per input. When the node has already given us
+    /// the tx's fee, confirmed parents are never fetched so they are absent here.
+    /// Parents that are themselves in the mempool are always present, because
+    /// they carry dependency state.
     Available(HashMap<Txid, &'a Transaction>),
 }
 
-fn try_get_parent_txs_from_caches<'a>(
+/// Everything consulted when resolving a tx's parents
+#[derive(Clone, Copy)]
+struct ParentCaches<'a> {
     abandoned_pool: &'a AbandonedPool,
     mempool: &'a Mempool,
     rejected_txs: &'a HashSet<Txid>,
     tx_cache: &'a HashMap<Txid, Transaction>,
     unavailable_txs: &'a HashSet<Txid>,
+    mempool_txids: &'a HashSet<Txid>,
+}
+
+/// `fee_known`: when the node has already supplied this tx's fee, a confirmed
+/// parent has nothing left to offer and is not requested. Parents in the
+/// mempool are unaffected.
+fn try_get_parent_txs_from_caches<'a>(
+    caches: ParentCaches<'a>,
     vin: &[TxIn],
+    fee_known: bool,
 ) -> ParentTxsResult<'a> {
+    let ParentCaches {
+        abandoned_pool,
+        mempool,
+        rejected_txs,
+        tx_cache,
+        unavailable_txs,
+        mempool_txids,
+    } = caches;
     let mut abandoned_input_txs = LinkedHashSet::new();
     let mut input_txs_needed = LinkedHashSet::new();
     let mut unavailable_input_txs = LinkedHashSet::new();
@@ -629,6 +682,10 @@ fn try_get_parent_txs_from_caches<'a>(
             abandoned_input_txs.replace(input_txid);
         } else if unavailable_txs.contains(&input_txid) {
             unavailable_input_txs.replace(input_txid);
+        } else if fee_known && !mempool_txids.contains(&input_txid) {
+            // Confirmed parent, and Core already gave us this tx's fee. It was
+            // only ever fetched to read the value of the output being spent,
+            // so there is nothing left to learn from it.
         } else {
             input_txs_needed.replace(input_txid);
         }
@@ -701,14 +758,17 @@ where
             return Ok(false);
         }
     };
-    match try_get_parent_txs_from_caches(
-        &inner.abandoned_pool,
-        &inner.mempool,
-        sync_state.rejected_txs,
-        sync_state.tx_cache,
-        sync_state.unavailable_txs,
-        &tx.input,
-    ) {
+    let known_fee = sync_state.known_fees.get(&txid).copied();
+    let caches = ParentCaches {
+        abandoned_pool: &inner.abandoned_pool,
+        mempool: &inner.mempool,
+        rejected_txs: sync_state.rejected_txs,
+        tx_cache: sync_state.tx_cache,
+        unavailable_txs: sync_state.unavailable_txs,
+        mempool_txids: sync_state.mempool_txids,
+    };
+    match try_get_parent_txs_from_caches(caches, &tx.input, known_fee.is_some())
+    {
         ParentTxsResult::Rejected(rejected_parent) => {
             // Reject tx
             tracing::trace!(
@@ -757,7 +817,10 @@ where
             Ok(true)
         }
         ParentTxsResult::Available(parent_txs) => {
-            let fee_delta = fee_delta(tx, &parent_txs)?;
+            let fee_delta = match known_fee {
+                Some(fee) => fee,
+                None => fee_delta(tx, &parent_txs)?,
+            };
             match inner
                 .enforcer
                 .borrow_mut()
@@ -941,6 +1004,8 @@ where
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &sync_state.mempool_txids,
             };
             try_add_tx_from_caches(inner, sync_state, txid)?.into()
         }
@@ -953,6 +1018,8 @@ where
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &sync_state.mempool_txids,
             };
             try_apply_seq_message(inner, sync_state, &seq_msg).await?
         }
@@ -985,12 +1052,19 @@ where
             let mut input_txs_needed = LinkedHashSet::new();
             for (tx, in_mempool) in txs {
                 if in_mempool {
+                    let fee_known =
+                        sync_state.known_fees.contains_key(&tx.compute_txid());
                     for input_txid in
                         tx.input.iter().map(|input| input.previous_output.txid)
                     {
-                        if !sync_state.tx_cache.contains_key(&input_txid) {
-                            input_txs_needed.replace(input_txid);
+                        if !needs_parent_fetch(
+                            sync_state,
+                            fee_known,
+                            &input_txid,
+                        ) {
+                            continue;
                         }
+                        input_txs_needed.replace(input_txid);
                     }
                 }
                 let () = handle_resp_tx(sync_state, tx);
@@ -1011,12 +1085,15 @@ where
         BatchedResponseItem::Single(ResponseItem::Tx(tx, in_mempool)) => {
             let mut input_txs_needed = LinkedHashSet::new();
             if in_mempool {
+                let fee_known =
+                    sync_state.known_fees.contains_key(&tx.compute_txid());
                 for input_txid in
                     tx.input.iter().map(|input| input.previous_output.txid)
                 {
-                    if !sync_state.tx_cache.contains_key(&input_txid) {
-                        input_txs_needed.replace(input_txid);
+                    if !needs_parent_fetch(sync_state, fee_known, &input_txid) {
+                        continue;
                     }
+                    input_txs_needed.replace(input_txid);
                 }
             }
             let () = handle_resp_tx(sync_state, *tx);
@@ -1262,6 +1339,45 @@ where
     } = rpc_client
         .get_raw_mempool(BoolWitness::<false>, BoolWitness::<true>)
         .await?;
+
+    // Ask Core for the fees it has already computed. Without this, the sync
+    // fetches every tx's parents purely to sum the values of the outputs being
+    // spent, which on a mainnet mempool measured as ~95% of the sync's wall clock.
+    //
+    // Best-effort: Core refuses `verbose` together with `mempool_sequence`, so
+    // this is a second call and its snapshot can differ from the one above. A
+    // tx missing from it falls back to deriving the fee from parents,
+    // which is what every tx did before this optimization.
+    let known_fees: HashMap<Txid, Amount> = {
+        let started = std::time::Instant::now();
+        match rpc_client
+            .get_raw_mempool(BoolWitness::<true>, BoolWitness::<false>)
+            .await
+        {
+            Ok(verbose) => {
+                let fees: HashMap<Txid, Amount> = verbose
+                    .entries
+                    .into_iter()
+                    .map(|(txid, info)| (txid, info.fees.base))
+                    .collect();
+                tracing::debug!(
+                    "took fees for {} of {} mempool txs from the node in {:?}",
+                    fees.len(),
+                    txids.len(),
+                    started.elapsed(),
+                );
+                fees
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "could not read mempool fees from the node, \
+                     deriving them from parent txs instead: {err}"
+                );
+                HashMap::new()
+            }
+        }
+    };
+    let mempool_txids: HashSet<Txid> = txids.iter().copied().collect();
     let (tip_watch, _) = watch::channel(best_block_hash);
     let inner = MempoolSyncInner {
         abandoned_pool: AbandonedPool::default(),
@@ -1305,6 +1421,8 @@ where
             tx_cache,
             txs_needed,
             unavailable_txs: HashSet::new(),
+            known_fees,
+            mempool_txids,
         }
     };
 
@@ -1542,6 +1660,8 @@ mod tests {
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
+                known_fees: &HashMap::new(),
+                mempool_txids: &HashSet::new(),
             };
             let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
                 &mut inner, sync_state, txid,
@@ -1569,6 +1689,8 @@ mod tests {
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
+                known_fees: &HashMap::new(),
+                mempool_txids: &HashSet::new(),
             };
             let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
                 &mut inner, sync_state, txid,
