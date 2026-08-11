@@ -3,7 +3,6 @@
 //! tweak policy from outside while the task is running.
 
 use std::{
-    borrow::Borrow,
     collections::{HashMap, HashSet},
     convert::Infallible,
     future::Future,
@@ -161,14 +160,10 @@ impl CusfEnforcer for MockEnforcer {
 
     type AcceptTxError = Infallible;
 
-    fn accept_tx<TxRef>(
+    fn accept_tx(
         &mut self,
         tx: &Transaction,
-        _tx_inputs: &HashMap<Txid, TxRef>,
-    ) -> Result<TxAcceptAction, Self::AcceptTxError>
-    where
-        TxRef: Borrow<Transaction>,
-    {
+    ) -> Result<TxAcceptAction, Self::AcceptTxError> {
         let txid = tx.compute_txid();
         let mut inner = self.inner.lock();
         inner.log.push(MockCall::AcceptTx(txid));
