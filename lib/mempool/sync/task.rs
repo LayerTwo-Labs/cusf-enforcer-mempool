@@ -773,7 +773,7 @@ where
                     let modified_weight = Weight::from_wu(modified_weight_wu);
                     match inner.mempool.insert(
                         tx.clone(),
-                        fee_delta.to_sat(),
+                        fee_delta,
                         conflicts_with.into(),
                         modified_weight,
                     ) {
