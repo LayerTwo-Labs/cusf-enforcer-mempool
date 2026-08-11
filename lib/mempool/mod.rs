@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bitcoin::{BlockHash, Transaction, Txid, Weight};
+use bitcoin::{Amount, BlockHash, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{OrdMap, OrdSet, ordmap};
@@ -205,7 +205,7 @@ mod refinement_cmp {
 
 #[derive(Clone, Copy, Debug)]
 pub struct FeeRate {
-    fee: u64,
+    fee: Amount,
     vsize: u64,
 }
 
@@ -228,8 +228,8 @@ impl FeeRate {
         use std::cmp::Ordering;
         // (self.fee / self.size) > (other.fee / other.size) ==>
         // (self.fee * other.size) > (other.fee * self.size)
-        let lhs = self.fee as u128 * other.vsize as u128;
-        let rhs = other.fee as u128 * self.vsize as u128;
+        let lhs = self.fee.to_sat() as u128 * other.vsize as u128;
+        let rhs = other.fee.to_sat() as u128 * self.vsize as u128;
         match lhs.cmp(&rhs) {
             Ordering::Equal => self.vsize.cmp(&other.vsize),
             res => res,
@@ -515,7 +515,7 @@ impl Mempool {
     pub fn insert(
         &mut self,
         tx: Transaction,
-        fee: u64,
+        fee: Amount,
         conflicts_with: imbl::OrdSet<Txid>,
         modified_weight: Weight,
     ) -> Result<Option<TxInfo>, MempoolInsertError> {
@@ -584,8 +584,8 @@ impl Mempool {
         let (ndeps, nspenders) = (info.depends.len(), info.spent_by.len());
         let res = self.txs.0.insert(txid, (tx, info)).map(|(_, info)| info);
         tracing::trace!(
-            fee = %bitcoin::Amount::from_sat(fee).display_dynamic(),
-            modified_fee = %bitcoin::Amount::from_sat(modified_fee).display_dynamic(),
+            fee = %fee.display_dynamic(),
+            modified_fee = %modified_fee.display_dynamic(),
             %txid,
             "Inserted tx into mempool with {ndeps} deps and {nspenders} spenders"
         );
@@ -936,7 +936,9 @@ impl Mempool {
                 txid,
                 hash: tx.compute_wtxid(),
                 depends,
-                fee: bitcoin::SignedAmount::from_sat(info.fees.base as i64),
+                fee: bitcoin::SignedAmount::from_sat(
+                    info.fees.base.to_sat() as i64
+                ),
                 // FIXME: compute this
                 sigops: None,
                 weight: tx.weight().to_wu(),
@@ -993,7 +995,12 @@ mod tests {
         let weight = tx.weight();
         let absent_txid = Txid::from_byte_array([0x42; 32]);
 
-        let result = mempool.insert(tx, 100, OrdSet::unit(absent_txid), weight);
+        let result = mempool.insert(
+            tx,
+            Amount::from_sat(100),
+            OrdSet::unit(absent_txid),
+            weight,
+        );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
     }
