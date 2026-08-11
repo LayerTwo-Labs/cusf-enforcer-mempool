@@ -1217,7 +1217,23 @@ where
                     apply_sync_action_timeout(&sync_state.action_queue).fuse();
             }
             CombinedStreamItem::Response(resp) => {
-                let resp = resp.map_err(SyncTaskError::Request)?;
+                let resp = match resp {
+                    Ok(resp) => resp,
+                    // Losing the race to fetch a tx that has since left the
+                    // mempool is not fatal. The `Removed` handler
+                    // already marked it unavailable and dropped it from
+                    // `txs_needed`.
+                    Err(RequestError::TxUnavailable { txid }) => {
+                        tracing::debug!(
+                            %txid,
+                            "dropping fetch for a tx that left the mempool"
+                        );
+                        sync_state.txs_needed.remove(&txid);
+                        sync_state.unavailable_txs.insert(txid);
+                        continue;
+                    }
+                    Err(err) => return Err(SyncTaskError::Request(err)),
+                };
                 {
                     let mut inner_write = inner.write().await;
                     let () = handle_resp(&mut inner_write, sync_state, resp)

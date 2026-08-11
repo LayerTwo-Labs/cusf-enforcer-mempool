@@ -390,6 +390,10 @@ enum BatchedResponseItem {
     Single(ResponseItem),
 }
 
+/// What Core answers `getrawtransaction` with when it has
+/// never heard of the tx, or no longer has it.
+const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
+
 #[derive(Debug, Error)]
 pub enum RequestError {
     #[error("`{method}` RPC call failed")]
@@ -398,6 +402,14 @@ pub enum RequestError {
         #[source]
         source: JsonRpcError,
     },
+    /// A tx we were fetching is no longer in Core's mempool.
+    ///
+    /// Requests are cancelled when a `Removed` arrives, but only while they
+    /// are still queued. One already in flight completes against a tx that
+    /// has since been replaced. Carries the txid so the sync task can drop it
+    /// rather than treat a lost race as fatal.
+    #[error("TX `{txid}` is no longer available")]
+    TxUnavailable { txid: Txid },
     #[error("failed to deserialize `{method}` response")]
     DeserializeResponse {
         method: &'static str,
@@ -507,7 +519,14 @@ where
                     None,
                 )
                 .await
-                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+                .map_err(|e| match &e {
+                    JsonRpcError::Call(err)
+                        if err.code() == RPC_INVALID_ADDRESS_OR_KEY =>
+                    {
+                        RequestError::TxUnavailable { txid }
+                    }
+                    _ => RequestError::JsonRpc { method, source: e },
+                })?;
             let tx: Transaction =
                 bitcoin::consensus::encode::deserialize_hex(&tx_hex).map_err(
                     |e| RequestError::DeserializeResponse { method, source: e },
