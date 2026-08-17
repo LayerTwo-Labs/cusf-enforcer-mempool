@@ -43,15 +43,63 @@ pub enum TxAcceptAction {
     Reject,
 }
 
+/// Error attempting to sync a [`CusfEnforcer`] to a tip.
+#[derive(Debug, Error)]
+pub enum SyncToTipError<E> {
+    /// The enforcer determined that a block is invalid, and stopped syncing
+    /// before connecting it.
+    /// `invalidateblock` will be called if this variant is encountered, and
+    /// the sync will be re-attempted against the node's resulting tip.
+    #[error("invalid block `{block_hash}`")]
+    InvalidBlock {
+        block_hash: BlockHash,
+        #[source]
+        reason: E,
+    },
+    /// Any other sync error
+    #[error(transparent)]
+    Other(E),
+}
+
+impl<E> SyncToTipError<E> {
+    /// Map the underlying error type, preserving the variant
+    pub fn map<E2, F>(self, f: F) -> SyncToTipError<E2>
+    where
+        F: FnOnce(E) -> E2,
+    {
+        match self {
+            Self::InvalidBlock { block_hash, reason } => {
+                SyncToTipError::InvalidBlock {
+                    block_hash,
+                    reason: f(reason),
+                }
+            }
+            Self::Other(err) => SyncToTipError::Other(f(err)),
+        }
+    }
+}
+
+impl<E> From<E> for SyncToTipError<E> {
+    fn from(err: E) -> Self {
+        Self::Other(err)
+    }
+}
+
 pub trait CusfEnforcer {
     type SyncError: std::error::Error + Send + Sync + 'static;
 
-    /// Attempt to sync to the specified tip
+    /// Attempt to sync to the specified tip.
+    ///
+    /// Implementations are not required to validate individual blocks while
+    /// syncing. An implementation that does validate blocks, and rejects one
+    /// as invalid, MUST NOT connect the invalid block. It should stop with
+    /// its state synced to an ancestor of the invalid block, and return
+    /// [`SyncToTipError::InvalidBlock`].
     fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
         shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> impl Future<Output = Result<(), Self::SyncError>> + Send;
+    ) -> impl Future<Output = Result<(), SyncToTipError<Self::SyncError>>> + Send;
 
     type ConnectBlockError: std::error::Error + Send + Sync + 'static;
 
@@ -99,6 +147,63 @@ where
     Sync(#[source] Enforcer::SyncError),
 }
 
+/// Sync the enforcer to the specified tip. If the enforcer reports a block as
+/// invalid, `invalidateblock` is called on the node, and the sync is
+/// re-attempted against the node's resulting tip. Returns the tip that was
+/// finally synced to, which differs from the requested tip if any block was
+/// invalidated. Errors are either the enforcer's own sync error, or a JSON-RPC
+/// error from invalidating a block or fetching the node's tip.
+pub async fn sync_to_tip<Enforcer, MainClient, Signal>(
+    enforcer: &mut Enforcer,
+    main_client: &MainClient,
+    shutdown_signal: Signal,
+    mut tip: BlockHash,
+) -> Result<
+    BlockHash,
+    Either<
+        <Enforcer as CusfEnforcer>::SyncError,
+        bitcoin_jsonrpsee::jsonrpsee::core::ClientError,
+    >,
+>
+where
+    Enforcer: CusfEnforcer,
+    MainClient: bitcoin_jsonrpsee::client::MainClient + Sync,
+    Signal: Future<Output = ()> + Send,
+{
+    let shutdown_signal = shutdown_signal.shared();
+    let mut invalidated_blocks = HashSet::<BlockHash>::new();
+    loop {
+        match enforcer.sync_to_tip(shutdown_signal.clone(), tip).await {
+            Ok(()) => return Ok(tip),
+            Err(SyncToTipError::InvalidBlock { block_hash, reason }) => {
+                assert!(
+                    invalidated_blocks.insert(block_hash),
+                    "enforcer reported block `{block_hash}` as invalid \
+                     again, after it was already invalidated: {reason}"
+                );
+                tracing::warn!(
+                    block_hash = %block_hash,
+                    reason = %reason,
+                    "invalidating block that the enforcer reported as \
+                     invalid during sync"
+                );
+                let () = main_client
+                    .invalidate_block(block_hash)
+                    .await
+                    .map_err(Either::Right)?;
+
+                tip = main_client
+                    .getbestblockhash()
+                    .await
+                    .map_err(Either::Right)?;
+            }
+            Err(SyncToTipError::Other(err)) => {
+                return Err(Either::Left(err));
+            }
+        }
+    }
+}
+
 #[derive(Educe)]
 #[educe(Debug(bound()))]
 #[derive(Error)]
@@ -116,6 +221,29 @@ where
     SequenceStreamEnded,
     #[error(transparent)]
     SubscribeSequence(#[from] crate::zmq::SubscribeSequenceError),
+}
+
+impl<Enforcer>
+    From<
+        Either<
+            <Enforcer as CusfEnforcer>::SyncError,
+            bitcoin_jsonrpsee::jsonrpsee::core::ClientError,
+        >,
+    > for InitialSyncError<Enforcer>
+where
+    Enforcer: CusfEnforcer,
+{
+    fn from(
+        err: Either<
+            <Enforcer as CusfEnforcer>::SyncError,
+            bitcoin_jsonrpsee::jsonrpsee::core::ClientError,
+        >,
+    ) -> Self {
+        match err {
+            Either::Left(err) => Self::CusfEnforcer(err),
+            Either::Right(err) => Self::JsonRpc(err),
+        }
+    }
 }
 
 /// Subscribe to ZMQ sequence and sync enforcer, obtaining a ZMQ sequence
@@ -160,10 +288,17 @@ where
             block_height = block_header.height,
             "syncing enforcer to tip"
         );
-        let () = enforcer
-            .sync_to_tip(shutdown_signal.clone(), block_hash)
-            .map_err(InitialSyncError::CusfEnforcer)
-            .await?;
+        // If a block is invalidated here, the requested `block_hash` is no
+        // longer in the node's active chain, so the tip-change handling below
+        // drops the disconnect messages that the invalidation produced from
+        // the sequence stream, and re-syncs against the node's new tip.
+        let _synced_tip: BlockHash = sync_to_tip(
+            enforcer,
+            main_client,
+            shutdown_signal.clone(),
+            block_hash,
+        )
+        .await?;
         let best_block_hash = main_client.getbestblockhash().await?;
         if block_hash == best_block_hash {
             tracing::debug!(
@@ -174,9 +309,10 @@ where
             return Ok((block_hash, sequence_stream));
         }
 
-        // We're NOT synced to the tip. This means that between we started the sync
-        // and finished, the tip has changed. That means we can expect to read something
-        // from the sequence stream!
+        // We're NOT synced to the tip. Either the tip changed between starting
+        // and finishing the sync, or a block was invalidated above, moving the
+        // tip away from the chain we were syncing. Either way, we can expect
+        // to read something from the sequence stream!
         'drop_seq_msgs: loop {
             tracing::trace!(
                 "reading next ZMQ sequence message, looking for block hash"
@@ -369,18 +505,18 @@ where
         &mut self,
         shutdown_signal: Signal,
         block_hash: BlockHash,
-    ) -> Result<(), Self::SyncError> {
+    ) -> Result<(), SyncToTipError<Self::SyncError>> {
         let shutdown_signal = shutdown_signal.shared();
 
         let () = self
             .0
             .sync_to_tip(shutdown_signal.clone(), block_hash)
-            .map_err(Either::Left)
+            .map_err(|err| err.map(Either::Left))
             .await?;
 
         self.1
             .sync_to_tip(shutdown_signal, block_hash)
-            .map_err(Either::Right)
+            .map_err(|err| err.map(Either::Right))
             .await
     }
 
@@ -499,7 +635,7 @@ impl CusfEnforcer for DefaultEnforcer {
         &mut self,
         _shutdown_signal: Signal,
         _block_hash: BlockHash,
-    ) -> Result<(), Self::SyncError> {
+    ) -> Result<(), SyncToTipError<Self::SyncError>> {
         Ok(())
     }
 
@@ -545,18 +681,18 @@ where
         &mut self,
         shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> Result<(), Self::SyncError> {
+    ) -> Result<(), SyncToTipError<Self::SyncError>> {
         let shutdown_signal = shutdown_signal.shared();
         match self {
             Self::Left(left) => {
                 left.sync_to_tip(shutdown_signal, tip)
-                    .map_err(Either::Left)
+                    .map_err(|err| err.map(Either::Left))
                     .await
             }
             Self::Right(right) => {
                 right
                     .sync_to_tip(shutdown_signal, tip)
-                    .map_err(Either::Right)
+                    .map_err(|err| err.map(Either::Right))
                     .await
             }
         }

@@ -284,7 +284,15 @@ impl TestSetup {
 
     /// Run `init_sync_mempool` + start the task on an existing `RegtestNode`.
     pub async fn start(node: RegtestNode) -> anyhow::Result<Self> {
-        let enforcer = MockEnforcer::new();
+        Self::start_with_enforcer(node, MockEnforcer::new()).await
+    }
+
+    /// As [`TestSetup::start`], but with a pre-configured enforcer — for
+    /// tests that must seed enforcer behavior before the initial sync runs.
+    pub async fn start_with_enforcer(
+        node: RegtestNode,
+        enforcer: MockEnforcer,
+    ) -> anyhow::Result<Self> {
         let (mempool_sync, task_errors) =
             start_mempool_sync(&node, enforcer.clone(), None).await?;
         Ok(Self {
