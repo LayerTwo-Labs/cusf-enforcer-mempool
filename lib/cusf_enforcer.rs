@@ -45,7 +45,7 @@ pub enum TxAcceptAction {
 
 /// Error attempting to sync a [`CusfEnforcer`] to a tip.
 #[derive(Debug, Error)]
-pub enum SyncToTipError<E> {
+pub enum SyncToTipError<InvalidBlock, E> {
     /// The enforcer determined that a block is invalid, and stopped syncing
     /// before connecting it.
     /// `invalidateblock` will be called if this variant is encountered, and
@@ -54,38 +54,68 @@ pub enum SyncToTipError<E> {
     InvalidBlock {
         block_hash: BlockHash,
         #[source]
-        reason: E,
+        reason: InvalidBlock,
     },
     /// Any other sync error
     #[error(transparent)]
-    Other(E),
+    Other(#[from] E),
 }
 
-impl<E> SyncToTipError<E> {
-    /// Map the underlying error type, preserving the variant
-    pub fn map<E2, F>(self, f: F) -> SyncToTipError<E2>
+impl<InvalidBlock, E> SyncToTipError<InvalidBlock, E> {
+    /// Map the error types, preserving the variant
+    #[inline]
+    pub fn map<InvalidBlock2, E2, F0, F1>(
+        self,
+        f0: F0,
+        f1: F1,
+    ) -> SyncToTipError<InvalidBlock2, E2>
     where
-        F: FnOnce(E) -> E2,
+        F0: FnOnce(InvalidBlock) -> InvalidBlock2,
+        F1: FnOnce(E) -> E2,
     {
         match self {
             Self::InvalidBlock { block_hash, reason } => {
                 SyncToTipError::InvalidBlock {
                     block_hash,
-                    reason: f(reason),
+                    reason: f0(reason),
                 }
             }
-            Self::Other(err) => SyncToTipError::Other(f(err)),
+            Self::Other(err) => SyncToTipError::Other(f1(err)),
         }
     }
-}
 
-impl<E> From<E> for SyncToTipError<E> {
-    fn from(err: E) -> Self {
-        Self::Other(err)
+    /// Map the invalid block reason error type, preserving the variant
+    #[inline(always)]
+    pub fn map_invalid_block_reason<InvalidBlock2, F>(
+        self,
+        f: F,
+    ) -> SyncToTipError<InvalidBlock2, E>
+    where
+        F: FnOnce(InvalidBlock) -> InvalidBlock2,
+    {
+        self.map(
+            f,
+            #[inline(always)]
+            |e| e,
+        )
+    }
+
+    /// Map the error type, preserving the variant
+    #[inline(always)]
+    pub fn map_other<E2, F>(self, f: F) -> SyncToTipError<InvalidBlock, E2>
+    where
+        F: FnOnce(E) -> E2,
+    {
+        self.map(
+            #[inline(always)]
+            |reason| reason,
+            f,
+        )
     }
 }
 
 pub trait CusfEnforcer {
+    type InvalidBlockReason: std::error::Error + Send + Sync + 'static;
     type SyncError: std::error::Error + Send + Sync + 'static;
 
     /// Attempt to sync to the specified tip.
@@ -99,7 +129,12 @@ pub trait CusfEnforcer {
         &mut self,
         shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> impl Future<Output = Result<(), SyncToTipError<Self::SyncError>>> + Send;
+    ) -> impl Future<
+        Output = Result<
+            (),
+            SyncToTipError<Self::InvalidBlockReason, Self::SyncError>,
+        >,
+    > + Send;
 
     type ConnectBlockError: std::error::Error + Send + Sync + 'static;
 
@@ -127,6 +162,14 @@ pub trait CusfEnforcer {
         &mut self,
         tx: &Transaction,
     ) -> Result<TxAcceptAction, Self::AcceptTxError>;
+}
+
+#[derive(Debug, Error)]
+pub enum FatalSyncToTipError<E> {
+    #[error(transparent)]
+    JsonRpc(#[from] bitcoin_jsonrpsee::jsonrpsee::core::ClientError),
+    #[error(transparent)]
+    Other(E),
 }
 
 /// General purpose error for [`CusfEnforcer`]
@@ -158,13 +201,7 @@ pub async fn sync_to_tip<Enforcer, MainClient, Signal>(
     main_client: &MainClient,
     shutdown_signal: Signal,
     mut tip: BlockHash,
-) -> Result<
-    BlockHash,
-    Either<
-        <Enforcer as CusfEnforcer>::SyncError,
-        bitcoin_jsonrpsee::jsonrpsee::core::ClientError,
-    >,
->
+) -> Result<BlockHash, FatalSyncToTipError<<Enforcer as CusfEnforcer>::SyncError>>
 where
     Enforcer: CusfEnforcer,
     MainClient: bitcoin_jsonrpsee::client::MainClient + Sync,
@@ -190,15 +227,15 @@ where
                 let () = main_client
                     .invalidate_block(block_hash)
                     .await
-                    .map_err(Either::Right)?;
+                    .map_err(FatalSyncToTipError::JsonRpc)?;
 
                 tip = main_client
                     .getbestblockhash()
                     .await
-                    .map_err(Either::Right)?;
+                    .map_err(FatalSyncToTipError::JsonRpc)?;
             }
             Err(SyncToTipError::Other(err)) => {
-                return Err(Either::Left(err));
+                return Err(FatalSyncToTipError::Other(err));
             }
         }
     }
@@ -223,25 +260,17 @@ where
     SubscribeSequence(#[from] crate::zmq::SubscribeSequenceError),
 }
 
-impl<Enforcer>
-    From<
-        Either<
-            <Enforcer as CusfEnforcer>::SyncError,
-            bitcoin_jsonrpsee::jsonrpsee::core::ClientError,
-        >,
-    > for InitialSyncError<Enforcer>
+impl<Enforcer> From<FatalSyncToTipError<<Enforcer as CusfEnforcer>::SyncError>>
+    for InitialSyncError<Enforcer>
 where
     Enforcer: CusfEnforcer,
 {
     fn from(
-        err: Either<
-            <Enforcer as CusfEnforcer>::SyncError,
-            bitcoin_jsonrpsee::jsonrpsee::core::ClientError,
-        >,
+        err: FatalSyncToTipError<<Enforcer as CusfEnforcer>::SyncError>,
     ) -> Self {
         match err {
-            Either::Left(err) => Self::CusfEnforcer(err),
-            Either::Right(err) => Self::JsonRpc(err),
+            FatalSyncToTipError::JsonRpc(err) => Self::JsonRpc(err),
+            FatalSyncToTipError::Other(err) => Self::CusfEnforcer(err),
         }
     }
 }
@@ -499,24 +528,27 @@ where
     C0: CusfEnforcer + Send + 'static,
     C1: CusfEnforcer + Send + 'static,
 {
+    type InvalidBlockReason =
+        Either<C0::InvalidBlockReason, C1::InvalidBlockReason>;
     type SyncError = Either<C0::SyncError, C1::SyncError>;
 
     async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
         shutdown_signal: Signal,
         block_hash: BlockHash,
-    ) -> Result<(), SyncToTipError<Self::SyncError>> {
+    ) -> Result<(), SyncToTipError<Self::InvalidBlockReason, Self::SyncError>>
+    {
         let shutdown_signal = shutdown_signal.shared();
 
         let () = self
             .0
             .sync_to_tip(shutdown_signal.clone(), block_hash)
-            .map_err(|err| err.map(Either::Left))
+            .map_err(|err| err.map(Either::Left, Either::Left))
             .await?;
 
         self.1
             .sync_to_tip(shutdown_signal, block_hash)
-            .map_err(|err| err.map(Either::Right))
+            .map_err(|err| err.map(Either::Right, Either::Right))
             .await
     }
 
@@ -629,13 +661,15 @@ where
 pub struct DefaultEnforcer;
 
 impl CusfEnforcer for DefaultEnforcer {
+    type InvalidBlockReason = Infallible;
     type SyncError = Infallible;
 
     async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
         _shutdown_signal: Signal,
         _block_hash: BlockHash,
-    ) -> Result<(), SyncToTipError<Self::SyncError>> {
+    ) -> Result<(), SyncToTipError<Self::InvalidBlockReason, Self::SyncError>>
+    {
         Ok(())
     }
 
@@ -675,24 +709,27 @@ where
     C0: CusfEnforcer + Send,
     C1: CusfEnforcer + Send,
 {
+    type InvalidBlockReason =
+        Either<C0::InvalidBlockReason, C1::InvalidBlockReason>;
     type SyncError = Either<C0::SyncError, C1::SyncError>;
 
     async fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
         shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> Result<(), SyncToTipError<Self::SyncError>> {
+    ) -> Result<(), SyncToTipError<Self::InvalidBlockReason, Self::SyncError>>
+    {
         let shutdown_signal = shutdown_signal.shared();
         match self {
             Self::Left(left) => {
                 left.sync_to_tip(shutdown_signal, tip)
-                    .map_err(|err| err.map(Either::Left))
+                    .map_err(|err| err.map(Either::Left, Either::Left))
                     .await
             }
             Self::Right(right) => {
                 right
                     .sync_to_tip(shutdown_signal, tip)
-                    .map_err(|err| err.map(Either::Right))
+                    .map_err(|err| err.map(Either::Right, Either::Right))
                     .await
             }
         }

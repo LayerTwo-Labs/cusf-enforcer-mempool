@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 /// The reason [`MockEnforcer::sync_to_tip`] reports a block as invalid
 #[derive(Debug, thiserror::Error)]
 #[error("mock enforcer: block is configured as invalid")]
-pub struct MockSyncError;
+pub struct MockInvalidBlockReason;
 
 #[derive(Clone, Debug)]
 pub enum MockCall {
@@ -124,14 +124,19 @@ impl MockEnforcer {
 }
 
 impl CusfEnforcer for MockEnforcer {
-    type SyncError = MockSyncError;
+    type InvalidBlockReason = MockInvalidBlockReason;
+    type SyncError = Infallible;
 
     fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
         _shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> impl Future<Output = Result<(), SyncToTipError<Self::SyncError>>> + Send
-    {
+    ) -> impl Future<
+        Output = Result<
+            (),
+            SyncToTipError<Self::InvalidBlockReason, Self::SyncError>,
+        >,
+    > + Send {
         let inner = self.inner.clone();
         async move {
             let mut inner = inner.lock();
@@ -140,7 +145,7 @@ impl CusfEnforcer for MockEnforcer {
                 let block_hash = inner.sync_invalid_blocks.remove(0);
                 return Err(SyncToTipError::InvalidBlock {
                     block_hash,
-                    reason: MockSyncError,
+                    reason: MockInvalidBlockReason,
                 });
             }
             Ok(())
