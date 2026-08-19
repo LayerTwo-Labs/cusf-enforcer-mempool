@@ -11,9 +11,15 @@ use std::{
 
 use bitcoin::{BlockHash, Transaction, Txid};
 use cusf_enforcer_mempool::cusf_enforcer::{
-    ConnectBlockAction, CusfEnforcer, DisconnectBlockAction, TxAcceptAction,
+    ConnectBlockAction, CusfEnforcer, DisconnectBlockAction, SyncToTipError,
+    TxAcceptAction,
 };
 use parking_lot::Mutex;
+
+/// The reason [`MockEnforcer::sync_to_tip`] reports a block as invalid
+#[derive(Debug, thiserror::Error)]
+#[error("mock enforcer: block is configured as invalid")]
+pub struct MockInvalidBlockReason;
 
 #[derive(Clone, Debug)]
 pub enum MockCall {
@@ -29,6 +35,11 @@ struct MockEnforcerInner {
     reject_all: bool,
     reject_blocks: HashSet<BlockHash>,
     reject_all_blocks: bool,
+    /// Blocks that `sync_to_tip` reports as invalid, one per call, in order.
+    /// Popped when reported: after the driver invalidates the reported block
+    /// and retries, the retry no longer reports it, like a real enforcer
+    /// syncing a chain that no longer contains the block.
+    sync_invalid_blocks: Vec<BlockHash>,
     remove_on_connect: HashMap<BlockHash, HashSet<Txid>>,
     always_remove_on_connect: HashSet<Txid>,
     remove_on_disconnect: HashMap<BlockHash, HashSet<Txid>>,
@@ -70,6 +81,25 @@ impl MockEnforcer {
         self.inner.lock().always_remove_on_disconnect = txids;
     }
 
+    /// Make the next `sync_to_tip` call report `block_hash` as invalid.
+    /// Multiple queued blocks are reported one per call, in order.
+    pub fn report_invalid_block_on_sync(&self, block_hash: BlockHash) {
+        self.inner.lock().sync_invalid_blocks.push(block_hash);
+    }
+
+    /// Tips that `sync_to_tip` has been invoked with, in call order.
+    pub fn sync_to_tip_calls(&self) -> Vec<BlockHash> {
+        self.inner
+            .lock()
+            .log
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::SyncToTip(tip) => Some(*tip),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn disconnect_block_calls(&self) -> usize {
         self.inner
             .lock()
@@ -94,16 +124,30 @@ impl MockEnforcer {
 }
 
 impl CusfEnforcer for MockEnforcer {
+    type InvalidBlockReason = MockInvalidBlockReason;
     type SyncError = Infallible;
 
     fn sync_to_tip<Signal: Future<Output = ()> + Send>(
         &mut self,
         _shutdown_signal: Signal,
         tip: BlockHash,
-    ) -> impl Future<Output = Result<(), Self::SyncError>> + Send {
+    ) -> impl Future<
+        Output = Result<
+            (),
+            SyncToTipError<Self::InvalidBlockReason, Self::SyncError>,
+        >,
+    > + Send {
         let inner = self.inner.clone();
         async move {
-            inner.lock().log.push(MockCall::SyncToTip(tip));
+            let mut inner = inner.lock();
+            inner.log.push(MockCall::SyncToTip(tip));
+            if !inner.sync_invalid_blocks.is_empty() {
+                let block_hash = inner.sync_invalid_blocks.remove(0);
+                return Err(SyncToTipError::InvalidBlock {
+                    block_hash,
+                    reason: MockInvalidBlockReason,
+                });
+            }
             Ok(())
         }
     }
