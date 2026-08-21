@@ -1048,9 +1048,21 @@ where
     BorrowedEnforcer: CusfEnforcer,
 {
     match resp {
-        BatchedResponseItem::BatchTx(txs) => {
+        BatchedResponseItem::BatchTx {
+            fetched,
+            unavailable,
+        } => {
+            // Lost the race with a `Removed`, see `tx_fetch_result`.
+            for txid in unavailable {
+                tracing::debug!(
+                    %txid,
+                    "dropping batched fetch for a tx that left the mempool"
+                );
+                sync_state.txs_needed.remove(&txid);
+                sync_state.unavailable_txs.insert(txid);
+            }
             let mut input_txs_needed = LinkedHashSet::new();
-            for (tx, in_mempool) in txs {
+            for (tx, in_mempool) in fetched {
                 if in_mempool {
                     let fee_known =
                         sync_state.known_fees.contains_key(&tx.compute_txid());
@@ -1081,30 +1093,6 @@ where
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
             tracing::debug!(%block.hash, "Handling block response");
             let () = handle_resp_block(inner, sync_state, *block).await?;
-        }
-        BatchedResponseItem::Single(ResponseItem::Tx(tx, in_mempool)) => {
-            let mut input_txs_needed = LinkedHashSet::new();
-            if in_mempool {
-                let fee_known =
-                    sync_state.known_fees.contains_key(&tx.compute_txid());
-                for input_txid in
-                    tx.input.iter().map(|input| input.previous_output.txid)
-                {
-                    if !needs_parent_fetch(sync_state, fee_known, &input_txid) {
-                        continue;
-                    }
-                    input_txs_needed.replace(input_txid);
-                }
-            }
-            let () = handle_resp_tx(sync_state, *tx);
-            sync_state
-                .txs_needed
-                .extend(input_txs_needed.iter().copied());
-            for input_txid in input_txs_needed.into_iter().rev() {
-                sync_state
-                    .request_queue
-                    .push_front(RequestItem::Tx(input_txid, false))
-            }
         }
         BatchedResponseItem::BatchRejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectBlock)
@@ -1217,23 +1205,10 @@ where
                     apply_sync_action_timeout(&sync_state.action_queue).fuse();
             }
             CombinedStreamItem::Response(resp) => {
-                let resp = match resp {
-                    Ok(resp) => resp,
-                    // Losing the race to fetch a tx that has since left the
-                    // mempool is not fatal. The `Removed` handler
-                    // already marked it unavailable and dropped it from
-                    // `txs_needed`.
-                    Err(RequestError::TxUnavailable { txid }) => {
-                        tracing::debug!(
-                            %txid,
-                            "dropping fetch for a tx that left the mempool"
-                        );
-                        sync_state.txs_needed.remove(&txid);
-                        sync_state.unavailable_txs.insert(txid);
-                        continue;
-                    }
-                    Err(err) => return Err(SyncTaskError::Request(err)),
-                };
+                // Losing the race to fetch a tx that has since left the
+                // mempool is not an error here. It comes back as a member of
+                // `BatchTx::unavailable`.
+                let resp = resp?;
                 {
                     let mut inner_write = inner.write().await;
                     let () = handle_resp(&mut inner_write, sync_state, resp)
