@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::Arc,
     task::{Poll, Waker},
     time::Instant,
@@ -11,9 +11,12 @@ use bitcoin_jsonrpsee::{
         GetBlockClient as _, GetRawTransactionClient as _,
         GetRawTransactionVerbose, U8Witness,
     },
-    jsonrpsee::core::{
-        ClientError as JsonRpcError,
-        params::{ArrayParams, BatchRequestBuilder, ObjectParams},
+    jsonrpsee::{
+        core::{
+            ClientError as JsonRpcError,
+            params::{ArrayParams, BatchRequestBuilder, ObjectParams},
+        },
+        types::ErrorObject,
     },
 };
 
@@ -375,18 +378,27 @@ enum ResponseItem {
     Block(Box<bitcoin_jsonrpsee::client::Block<true>>),
     RejectBlock,
     RejectTx,
-    /// Bool indicating if the tx is a mempool tx.
-    /// `false` if the tx is needed as a dependency for a mempool tx
-    Tx(Box<Transaction>, bool),
 }
 
 /// Responses received while syncing
 #[derive(Clone, Debug)]
 enum BatchedResponseItem {
     BatchRejectTx,
-    /// Bool indicating if the tx is a mempool tx.
-    /// `false` if the tx is needed as a dependency for a mempool tx
-    BatchTx(Vec<(Transaction, bool)>),
+    /// The outcome of a `getrawtransaction` fetch.
+    ///
+    /// One variant for both shapes on purpose. Fetching a single tx is just
+    /// fetching a batch of one, and giving it a response variant of its own is
+    /// what let the two drift apart.
+    BatchTx {
+        /// Bool indicating if the tx is a mempool tx.
+        /// `false` if the tx is needed as a dependency for a mempool tx
+        fetched: Vec<(Transaction, bool)>,
+        /// Members that lost the race described on [`tx_fetch_result`].
+        /// Reported alongside the rest of the fetch rather than in place of
+        /// it: the other members resolved fine, and discarding them would
+        /// strand every tx that was batched with the one that lost.
+        unavailable: Vec<Txid>,
+    },
     Single(ResponseItem),
 }
 
@@ -402,20 +414,37 @@ pub enum RequestError {
         #[source]
         source: JsonRpcError,
     },
-    /// A tx we were fetching is no longer in Core's mempool.
-    ///
-    /// Requests are cancelled when a `Removed` arrives, but only while they
-    /// are still queued. One already in flight completes against a tx that
-    /// has since been replaced. Carries the txid so the sync task can drop it
-    /// rather than treat a lost race as fatal.
-    #[error("TX `{txid}` is no longer available")]
-    TxUnavailable { txid: Txid },
     #[error("failed to deserialize `{method}` response")]
     DeserializeResponse {
         method: &'static str,
         #[source]
         source: bitcoin::consensus::encode::FromHexError,
     },
+}
+
+/// One member of a `getrawtransaction` fetch, single or batched.
+///
+/// `Ok(None)` is [`RPC_INVALID_ADDRESS_OR_KEY`]. The tx left the mempool while
+/// the fetch was in flight, too late to cancel it.
+fn tx_fetch_result(
+    method: &'static str,
+    entry: Result<String, ErrorObject<'_>>,
+) -> Result<Option<Transaction>, RequestError> {
+    match entry {
+        Ok(tx_hex) => {
+            let tx = bitcoin::consensus::encode::deserialize_hex(&tx_hex)
+                .map_err(|source| RequestError::DeserializeResponse {
+                    method,
+                    source,
+                })?;
+            Ok(Some(tx))
+        }
+        Err(err) if err.code() == RPC_INVALID_ADDRESS_OR_KEY => Ok(None),
+        Err(err) => Err(RequestError::JsonRpc {
+            method,
+            source: JsonRpcError::from(err.into_owned()),
+        }),
+    }
 }
 
 async fn batched_request<RpcClient>(
@@ -453,37 +482,36 @@ where
             Ok(BatchedResponseItem::BatchRejectTx)
         }
         BatchedRequestItem::BatchTx(txs) => {
-            let in_mempool = HashMap::<_, _>::from_iter(txs.iter().copied());
             let mut request = BatchRequestBuilder::new();
-            for (txid, _) in txs {
+            for (txid, _) in txs.iter().copied() {
                 let mut params = ArrayParams::new();
                 params.insert(txid).unwrap();
                 params.insert(false).unwrap();
                 request.insert("getrawtransaction", params).unwrap();
             }
-            let txs: Vec<(Transaction, bool)> = rpc_client
-                .batch_request(request)
+            let resp = rpc_client
+                .batch_request::<String>(request)
                 // Must box due to https://github.com/rust-lang/rust/issues/100013
                 .boxed()
                 .await
-                .map_err(|e| RequestError::JsonRpc { method, source: e })?
-                .into_ok()
-                .map_err(|mut errs| RequestError::JsonRpc {
-                    method,
-                    source: JsonRpcError::from(errs.next().unwrap()),
-                })?
-                .map(|tx_hex: String| {
-                    let tx: Transaction =
-                        bitcoin::consensus::encode::deserialize_hex(&tx_hex)
-                            .map_err(|e| RequestError::DeserializeResponse {
-                                method,
-                                source: e,
-                            })?;
-                    let txid = tx.compute_txid();
-                    Ok((tx, in_mempool[&txid]))
-                })
-                .collect::<Result<_, RequestError>>()?;
-            Ok(BatchedResponseItem::BatchTx(txs))
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+
+            // `into_ok` is not usable here: it collapses the whole batch on
+            // the first failed entry, which throws away every tx that did
+            // resolve and loses the txid the failure belongs to. Entries come
+            // back in request order, so zipping recovers it.
+            let mut fetched = Vec::with_capacity(txs.len());
+            let mut unavailable = Vec::new();
+            for ((txid, in_mempool), entry) in txs.iter().copied().zip(resp) {
+                match tx_fetch_result(method, entry)? {
+                    Some(tx) => fetched.push((tx, in_mempool)),
+                    None => unavailable.push(txid),
+                }
+            }
+            Ok(BatchedResponseItem::BatchTx {
+                fetched,
+                unavailable,
+            })
         }
         BatchedRequestItem::Single(RequestItem::Block(block_hash)) => {
             let block = rpc_client
@@ -512,27 +540,31 @@ where
             Ok(BatchedResponseItem::Single(resp))
         }
         BatchedRequestItem::Single(RequestItem::Tx(txid, in_mempool)) => {
-            let tx_hex = rpc_client
+            // Still one request on the wire, but reported as a batch of one so
+            // that it lands in the sync task's batched handler. See
+            // [`BatchedResponseItem::BatchTx`].
+            let entry = match rpc_client
                 .get_raw_transaction(
                     txid,
                     GetRawTransactionVerbose::<false>,
                     None,
                 )
                 .await
-                .map_err(|e| match &e {
-                    JsonRpcError::Call(err)
-                        if err.code() == RPC_INVALID_ADDRESS_OR_KEY =>
-                    {
-                        RequestError::TxUnavailable { txid }
-                    }
-                    _ => RequestError::JsonRpc { method, source: e },
-                })?;
-            let tx: Transaction =
-                bitcoin::consensus::encode::deserialize_hex(&tx_hex).map_err(
-                    |e| RequestError::DeserializeResponse { method, source: e },
-                )?;
-            let resp = ResponseItem::Tx(Box::new(tx), in_mempool);
-            Ok(BatchedResponseItem::Single(resp))
+            {
+                Ok(tx_hex) => Ok(tx_hex),
+                Err(JsonRpcError::Call(err)) => Err(err),
+                Err(source) => {
+                    return Err(RequestError::JsonRpc { method, source });
+                }
+            };
+            let (fetched, unavailable) = match tx_fetch_result(method, entry)? {
+                Some(tx) => (vec![(tx, in_mempool)], Vec::new()),
+                None => (Vec::new(), vec![txid]),
+            };
+            Ok(BatchedResponseItem::BatchTx {
+                fetched,
+                unavailable,
+            })
         }
     }
 }

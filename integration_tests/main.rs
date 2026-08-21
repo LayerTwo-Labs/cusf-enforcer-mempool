@@ -278,10 +278,23 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         ("gbt_long_poll", |bp, dirs| {
             Box::pin(test_gbt_long_poll::test_gbt_long_poll(bp, dirs))
         }),
+        // Same body, same assertions; only the shape of the in-flight
+        // fetch differs. See the module docs.
         ("tx_replaced_during_fetch", |bp, dirs| {
             Box::pin(
                 test_tx_replaced_during_fetch::test_tx_replaced_during_fetch(
-                    bp, dirs,
+                    bp,
+                    dirs,
+                    test_tx_replaced_during_fetch::FetchShape::Single,
+                ),
+            )
+        }),
+        ("tx_replaced_during_batch_fetch", |bp, dirs| {
+            Box::pin(
+                test_tx_replaced_during_fetch::test_tx_replaced_during_fetch(
+                    bp,
+                    dirs,
+                    test_tx_replaced_during_fetch::FetchShape::Batched,
                 ),
             )
         }),
