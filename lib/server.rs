@@ -201,13 +201,20 @@ where
     )
 }
 
+/// Renders an iterator as a bounded debug list.
+///
+/// Takes a closure rather than a collection so `Display::fmt` can start a fresh
+/// iterator on each call. That lets callers pass a projection without
+/// materialising it, and since `tracing` only evaluates field expressions when
+/// the event is enabled, a disabled event costs nothing.
 #[repr(transparent)]
-struct DisplayList<'a, T>(&'a T);
+struct DisplayList<F>(F);
 
-impl<'a, T> std::fmt::Display for DisplayList<'a, T>
+impl<F, I> std::fmt::Display for DisplayList<F>
 where
-    &'a T: IntoIterator,
-    <&'a T as IntoIterator>::Item: std::fmt::Display,
+    F: Fn() -> I,
+    I: Iterator,
+    I::Item: std::fmt::Display,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[repr(transparent)]
@@ -222,9 +229,18 @@ where
             }
         }
 
-        f.debug_list()
-            .entries(self.0.into_iter().map(DebugDisplay))
-            .finish()
+        /// Entries rendered in full by [`DisplayList`] before the rest are elided.
+        const DISPLAY_LIST_MAX: usize = 10;
+
+        let mut iter = (self.0)();
+        let () = f
+            .debug_list()
+            .entries((&mut iter).take(DISPLAY_LIST_MAX).map(DebugDisplay))
+            .finish()?;
+        match iter.count() {
+            0 => Ok(()),
+            elided => write!(f, " (+{elided} more)"),
+        }
     }
 }
 
@@ -440,8 +456,8 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
         .collect();
     {
         tracing::debug!(
-            prefix_txids = %DisplayList(&prefix_txids),
-            suffix_txids = %DisplayList(&suffix_txids),
+            prefix_txids = %DisplayList(|| prefix_txids.iter()),
+            suffix_txids = %DisplayList(|| suffix_txids.iter()),
         );
     }
     let mut mempool = mempool.clone();
@@ -485,9 +501,8 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             })?;
         tracing::debug!("Removing prefix txs");
         tracing::debug!(
-            excluded_txids = %DisplayList(
-                &initial_block_template.exclude_mempool_txs
-            ),
+            excluded_txids =
+                %DisplayList(|| initial_block_template.exclude_mempool_txs.iter()),
             "Removing excluded/suffix txs"
         );
         let _removed_txs = mempool
@@ -566,35 +581,10 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
             .to_wu()
             .saturating_sub(initial_block_template_weight.to_wu()),
     )))?;
-    {
-        let proposed_txids: String = {
-            use std::fmt::Write;
-            // Above this number of txs, truncate txids to save space in logs
-            const SHOW_FULL_TXIDS_MAX_TXS: usize = 10;
-            let mut proposed_txids = "[".to_owned();
-            let n_txs = mempool_txs.len();
-            for (idx, tx) in mempool_txs.iter().enumerate() {
-                if idx < SHOW_FULL_TXIDS_MAX_TXS {
-                    write!(&mut proposed_txids, "{}", tx.txid).unwrap();
-                } else {
-                    let txid_bytes = tx.txid.as_byte_array();
-                    for byte in txid_bytes.iter().rev().take(4) {
-                        write!(&mut proposed_txids, "{byte:02x}").unwrap();
-                    }
-                    write!(&mut proposed_txids, "...").unwrap();
-                    for byte in txid_bytes[..4].iter().rev() {
-                        write!(&mut proposed_txids, "{byte:02x}").unwrap();
-                    }
-                }
-                if idx + 1 < n_txs {
-                    write!(&mut proposed_txids, ", ").unwrap();
-                }
-            }
-            write!(&mut proposed_txids, "]").unwrap();
-            proposed_txids
-        };
-        tracing::debug!(%proposed_txids, "Proposed txs for inclusion in block");
-    }
+    tracing::debug!(
+        proposed_txids = %DisplayList(|| mempool_txs.iter().map(|tx| tx.txid)),
+        "Proposed {} tx(s) for inclusion in block", mempool_txs.len(),
+    );
     let mut filled_block_template: FilledBlockTemplate<COINBASE_TXN> =
         initial_block_template.into();
     filled_block_template
