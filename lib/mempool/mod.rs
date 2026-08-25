@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bitcoin::{Amount, BlockHash, Transaction, Txid, Weight};
-use bitcoin_jsonrpsee::client::{BlockTemplateTransaction, RawMempoolTxFees};
+use bitcoin_jsonrpsee::client::BlockTemplateTransaction;
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{OrdMap, OrdSet, ordmap};
 use indexmap::IndexSet;
@@ -257,6 +257,14 @@ impl refinement_cmp::RefinementPartialOrd for FeeRate {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct TxFees {
+    pub base: Amount,
+    pub modified: Amount,
+    pub ancestor: Amount,
+    pub descendant: Amount,
+}
+
 #[derive(Clone, Debug)]
 pub struct TxInfo {
     pub ancestor_modified_weight: Weight,
@@ -265,7 +273,7 @@ pub struct TxInfo {
     pub depends: OrdSet<Txid>,
     pub descendant_modified_weight: Weight,
     pub descendant_vsize: u64,
-    pub fees: RawMempoolTxFees,
+    pub fees: TxFees,
     pub modified_weight: Weight,
     pub spent_by: OrdSet<Txid>,
     /// Conflicts due to reasons other than shared inputs
@@ -571,7 +579,7 @@ impl Mempool {
             depends,
             descendant_modified_weight,
             descendant_vsize,
-            fees: RawMempoolTxFees {
+            fees: TxFees {
                 ancestor: ancestor_fees,
                 base: fee,
                 descendant: descendant_fees,
@@ -668,7 +676,7 @@ impl Mempool {
         let ancestor_modified_weight = info.ancestor_modified_weight;
         let modified_weight = info.modified_weight;
         let vsize = tx.vsize() as u64;
-        let fees = RawMempoolTxFees { ..info.fees };
+        let fees = info.fees;
         for spent_tx in tx.input.iter().map(|input| input.previous_output.txid)
         {
             self.tx_childs.remove(spent_tx, *txid);
