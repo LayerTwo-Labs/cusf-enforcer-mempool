@@ -162,6 +162,24 @@ pub trait CusfEnforcer {
         &mut self,
         tx: &Transaction,
     ) -> Result<TxAcceptAction, Self::AcceptTxError>;
+
+    type ValidateBlockError: std::error::Error + Send + Sync + 'static;
+
+    /// Check a block against the enforcer's rules without applying it,
+    /// `Ok(None)` accepts, `Ok(Some(reason))` rejects with a human-readable
+    /// reason.
+    ///
+    /// A proposal is a dry run, and the same block may be proposed
+    /// repeatedly and then never mined, so implementations MUST NOT mutate
+    /// any state that a later answer depends on.
+    ///
+    /// This answers only for the enforcer's own rules. Consensus validity
+    /// is the node's responsibility, and a caller that needs both answers
+    /// must also ask the underlying node.
+    fn validate_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<Option<String>, Self::ValidateBlockError>;
 }
 
 #[derive(Debug, Error)]
@@ -655,6 +673,21 @@ where
             TxAcceptAction::Reject => Ok(TxAcceptAction::Reject),
         }
     }
+
+    type ValidateBlockError =
+        Either<C0::ValidateBlockError, C1::ValidateBlockError>;
+
+    fn validate_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<Option<String>, Self::ValidateBlockError> {
+        if let Some(reason) =
+            self.0.validate_block(block).map_err(Either::Left)?
+        {
+            return Ok(Some(reason));
+        }
+        self.1.validate_block(block).map_err(Either::Right)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -701,6 +734,15 @@ impl CusfEnforcer for DefaultEnforcer {
             conflicts_with: HashSet::new(),
             weight_tweak: 0,
         })
+    }
+
+    type ValidateBlockError = Infallible;
+
+    fn validate_block(
+        &self,
+        _block: &bitcoin::Block,
+    ) -> Result<Option<String>, Self::ValidateBlockError> {
+        Ok(None)
     }
 }
 
@@ -783,6 +825,23 @@ where
         match self {
             Self::Left(left) => left.accept_tx(tx).map_err(Either::Left),
             Self::Right(right) => right.accept_tx(tx).map_err(Either::Right),
+        }
+    }
+
+    type ValidateBlockError =
+        Either<C0::ValidateBlockError, C1::ValidateBlockError>;
+
+    fn validate_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<Option<String>, Self::ValidateBlockError> {
+        match self {
+            Self::Left(left) => {
+                left.validate_block(block).map_err(Either::Left)
+            }
+            Self::Right(right) => {
+                right.validate_block(block).map_err(Either::Right)
+            }
         }
     }
 }
