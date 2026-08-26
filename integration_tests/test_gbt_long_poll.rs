@@ -11,7 +11,11 @@
 use std::{net::SocketAddr, time::Duration};
 
 use bitcoin::{BlockHash, Network, hashes::Hash as _};
-use bitcoin_jsonrpsee::{MainClient, client::BlockTemplateRequest, jsonrpsee};
+use bitcoin_jsonrpsee::{
+    MainClient,
+    client::{BlockTemplate, BlockTemplateRequest},
+    jsonrpsee,
+};
 use cusf_enforcer_mempool::{
     cusf_enforcer::DefaultEnforcer,
     // Both `MainClient` and the generated `RpcClient` define
@@ -23,6 +27,21 @@ use crate::{
     setup::{Directories, RegtestNode, start_mempool_sync},
     util::BinPaths,
 };
+
+/// `getblocktemplate` in template mode, unwrapping the response variant.
+/// `mode` is left unset, so this exercises the default-is-template path.
+async fn get_template(
+    client: &jsonrpsee::http_client::HttpClient,
+    request: BlockTemplateRequest,
+) -> anyhow::Result<BlockTemplate> {
+    RpcClient::get_block_template(client, request)
+        .await?
+        .into_template()
+        .map(|template| *template)
+        .ok_or_else(|| {
+            anyhow::anyhow!("expected a template, got a proposal verdict")
+        })
+}
 
 /// Upper bound for a request that must NOT long poll. Generous for slow CI,
 /// but far under the server's 30s long-poll window, so a request that
@@ -68,7 +87,7 @@ pub async fn test_gbt_long_poll(
     // 1. No longpollid: immediate response that advertises long polling.
     let template = tokio::time::timeout(
         IMMEDIATE,
-        RpcClient::get_block_template(&client, BlockTemplateRequest::default()),
+        get_template(&client, BlockTemplateRequest::default()),
     )
     .await
     .map_err(|_| anyhow::anyhow!("plain GBT did not respond immediately"))??;
@@ -86,7 +105,7 @@ pub async fn test_gbt_long_poll(
     // that is already outdated.
     let template = tokio::time::timeout(
         IMMEDIATE,
-        RpcClient::get_block_template(
+        get_template(
             &client,
             BlockTemplateRequest {
                 long_poll_id: Some(BlockHash::all_zeros().to_string()),
@@ -120,7 +139,7 @@ pub async fn test_gbt_long_poll(
         let client = client.clone();
         let long_poll_id = Some(first_long_poll_id);
         async move {
-            RpcClient::get_block_template(
+            get_template(
                 &client,
                 BlockTemplateRequest {
                     long_poll_id,

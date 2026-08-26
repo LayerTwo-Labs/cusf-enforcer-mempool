@@ -221,7 +221,7 @@ dependencies = [
 [[package]]
 name = "bitcoin-jsonrpsee"
 version = "0.1.1"
-source = "git+https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git?rev=37f2bf62778b20e818ee99bdeec528ea64529208#37f2bf62778b20e818ee99bdeec528ea64529208"
+source = "git+https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git?rev=3ca15900bef3c9a2fd83003f71480a738411f35e#3ca15900bef3c9a2fd83003f71480a738411f35e"
 dependencies = [
  "base64 0.23.1",
  "bitcoin",
@@ -498,6 +498,8 @@ dependencies = [
  "nonempty",
  "parking_lot",
  "polonius-the-crab",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",

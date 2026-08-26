@@ -13,12 +13,13 @@ use bitcoin::{
 };
 use bitcoin_jsonrpsee::client::{
     BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
-    CoinbaseTxnOrValue, NetworkInfo,
+    CoinbaseTxnOrValue, MODE_PROPOSAL, MODE_TEMPLATE, NetworkInfo,
 };
 use chrono::{DateTime, Utc};
 use educe::Educe;
 use futures::FutureExt;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorCode};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -29,13 +30,110 @@ use crate::{
     mempool::{self, Mempool, MempoolSync},
 };
 
+/// `getblocktemplate` result, which BIP22/BIP23 overload by request mode.
+///
+/// Serialized untagged because the wire format has no discriminant. The
+/// caller knows which mode it asked for, so deserialization is written by
+/// hand.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum BlockTemplateResponse {
+    /// `mode: "template"`: a block template.
+    Template(Box<BlockTemplate>),
+    /// `mode: "proposal"`: the verdict on the proposed block.
+    Proposal(Option<String>),
+}
+
+/// Not `#[serde(untagged)]`, which would be shorter but reports every failure
+/// as "data did not match any variant of untagged enum BlockTemplateResponse",
+/// discarding the reason the template itself failed to parse.
+impl<'de> Deserialize<'de> for BlockTemplateResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+
+        struct ResponseVisitor;
+
+        impl<'de> Visitor<'de> for ResponseVisitor {
+            type Value = BlockTemplateResponse;
+
+            fn expecting(
+                &self,
+                formatter: &mut std::fmt::Formatter,
+            ) -> std::fmt::Result {
+                formatter.write_str(
+                    "a block template object, a rejection reason string, or null",
+                )
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(BlockTemplateResponse::Proposal(None))
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                reason: &str,
+            ) -> Result<Self::Value, E> {
+                Ok(BlockTemplateResponse::Proposal(Some(reason.to_owned())))
+            }
+
+            fn visit_string<E: serde::de::Error>(
+                self,
+                reason: String,
+            ) -> Result<Self::Value, E> {
+                Ok(BlockTemplateResponse::Proposal(Some(reason)))
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                BlockTemplate::deserialize(MapAccessDeserializer::new(map)).map(
+                    |template| {
+                        BlockTemplateResponse::Template(Box::new(template))
+                    },
+                )
+            }
+        }
+
+        deserializer.deserialize_any(ResponseVisitor)
+    }
+}
+
+impl BlockTemplateResponse {
+    pub fn into_template(self) -> Option<Box<BlockTemplate>> {
+        match self {
+            Self::Template(template) => Some(template),
+            Self::Proposal(_) => None,
+        }
+    }
+}
+
+const SERVER_CAPABILITIES: &[&str] = &["proposal"];
+
+// Bitcoin Core's error codes, paired below with the exact messages it uses for
+// `getblocktemplate`, so a caller cannot tell the two servers apart.
+// https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/protocol.h#L41
+const RPC_TYPE_ERROR: i32 = -3;
+// https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/protocol.h#L44
+const RPC_INVALID_PARAMETER: i32 = -8;
+// https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/protocol.h#L46
+const RPC_DESERIALIZATION_ERROR: i32 = -22;
+
 #[rpc(client, server)]
 pub trait Rpc {
+    /// BIP22/BIP23 `getblocktemplate`.
+    ///
+    /// With `mode` absent or `"template"`, builds a template. With
+    /// `mode: "proposal"`, validates the block in `data` against the current
+    /// tip instead of building anything.
     #[method(name = "getblocktemplate")]
     async fn get_block_template(
         &self,
         request: BlockTemplateRequest,
-    ) -> RpcResult<BlockTemplate>;
+    ) -> RpcResult<BlockTemplateResponse>;
 
     /// Returns None if the block is invalid, otherwise the error code
     /// describing why the block was rejected.
@@ -703,13 +801,99 @@ enum CachedMempoolQueryOutput {
     Queried(Box<MempoolQueryOutput>),
 }
 
-#[async_trait]
-impl<BP, RpcClient> RpcServer for Server<BP, RpcClient>
+impl<BP, RpcClient> Server<BP, RpcClient>
 where
     BP: CusfBlockProducer + Send + Sync + 'static,
-    RpcClient: bitcoin_jsonrpsee::client::MainClient + Send + Sync + 'static,
+    RpcClient: bitcoin_jsonrpsee::client::MainClient
+        + jsonrpsee::core::client::ClientT
+        + Send
+        + Sync
+        + 'static,
 {
-    async fn get_block_template(
+    async fn validate_proposal(
+        &self,
+        request: BlockTemplateRequest,
+    ) -> RpcResult<Option<String>> {
+        // https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/mining.cpp#L733
+        let Some(data) = request.data().map(str::to_owned) else {
+            return Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                RPC_TYPE_ERROR,
+                "Missing data String key for proposal",
+                None::<()>,
+            ));
+        };
+        // https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/mining.cpp#L737
+        let block: Block = bitcoin::consensus::encode::deserialize_hex(&data)
+            .map_err(|_| {
+            jsonrpsee::types::ErrorObjectOwned::owned(
+                RPC_DESERIALIZATION_ERROR,
+                "Block decode failed",
+                None::<()>,
+            )
+        })?;
+
+        // Consensus validity is the node's question, so ask the node rather
+        // than reimplementing `CheckBlock` here. This covers the `bad-*`
+        // reject reasons and the `duplicate*` family.
+        //
+        // A failure to reach the node must never read as acceptance, so the
+        // only non-error outcome here is an answer the node actually gave.
+        let core_verdict: Option<String> = self
+            .rpc_client
+            .request(
+                "getblocktemplate",
+                jsonrpsee::rpc_params![BlockTemplateRequest {
+                    mode: Some(MODE_PROPOSAL.into()),
+                    data: Some(data.into()),
+                    rules: request.rules,
+                    capabilities: Default::default(),
+                    long_poll_id: None,
+                }],
+            )
+            .await
+            .map_err(|err| match err {
+                // The node's own -8/-22 and friends are more precise than
+                // anything restated here, so pass them through unchanged.
+                jsonrpsee::core::ClientError::Call(err) => err,
+                err => {
+                    let err = log_error(err);
+                    internal_error(err)
+                }
+            })?;
+        if core_verdict.is_some() {
+            return Ok(core_verdict);
+        }
+
+        // Holds the mempool read lock for the duration of the enforcer's
+        // check, which is the same contract `query_mempool` runs under.
+        self.mempool
+            .with(|mempool, enforcer| {
+                let tip = mempool.tip().hash;
+                async move {
+                    // The enforcer can only evaluate a block against its own
+                    // tip, so anything else is unanswerable rather than
+                    // invalid.
+                    if block.header.prev_blockhash != tip {
+                        return Ok(Some(
+                            "inconclusive-not-best-prevblk".to_owned(),
+                        ));
+                    }
+                    enforcer.validate_block(&block).map_err(|err| {
+                        let err = log_error(err);
+                        internal_error(err)
+                    })
+                }
+                .boxed()
+            })
+            .await
+            .ok_or_else(|| {
+                let err = anyhow::anyhow!("Mempool unavailable");
+                let err = log_error(err);
+                internal_error(err)
+            })?
+    }
+
+    async fn build_block_template(
         &self,
         request: BlockTemplateRequest,
     ) -> RpcResult<BlockTemplate> {
@@ -875,6 +1059,10 @@ where
             tip_block_mediantime as u64 + 1;
         let height = tip_block_height + 1;
         let res = BlockTemplate {
+            capabilities: SERVER_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
             version,
             rules: rules.clone(),
             version_bits_available: version_bits_available.clone(),
@@ -906,6 +1094,46 @@ where
                 .put(Box::new(res.clone()), now);
         }
         Ok(res)
+    }
+}
+
+#[async_trait]
+impl<BP, RpcClient> RpcServer for Server<BP, RpcClient>
+where
+    BP: CusfBlockProducer + Send + Sync + 'static,
+    RpcClient: bitcoin_jsonrpsee::client::MainClient + Send + Sync + 'static,
+{
+    async fn get_block_template(
+        &self,
+        request: BlockTemplateRequest,
+    ) -> RpcResult<BlockTemplateResponse> {
+        // A `mode` that is not a string is the same error as an unrecognised
+        // one, as in Core.
+        // https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/mining.cpp#L726
+        let Ok(mode) = request.mode() else {
+            return Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                RPC_INVALID_PARAMETER,
+                "Invalid mode",
+                None::<()>,
+            ));
+        };
+        match mode {
+            MODE_TEMPLATE => {
+                self.build_block_template(request).await.map(|template| {
+                    BlockTemplateResponse::Template(Box::new(template))
+                })
+            }
+            MODE_PROPOSAL => self
+                .validate_proposal(request)
+                .await
+                .map(BlockTemplateResponse::Proposal),
+            // https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/mining.cpp#L763
+            _ => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+                RPC_INVALID_PARAMETER,
+                "Invalid mode",
+                None::<()>,
+            )),
+        }
     }
 
     async fn submit_block(
@@ -966,5 +1194,72 @@ mod tests {
                 "weight `{block_weight}` exceeds limit for {spk_len}-byte spk"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+
+    /// BIP23: a proposal that would be accepted answers JSON `null`, and one
+    /// that would not answers the reason as a bare string. Neither is wrapped
+    /// in an object, so a stock `getblocktemplate` client reads them as-is.
+    #[test]
+    fn proposal_verdicts_are_bare_json() {
+        assert_eq!(
+            serde_json::to_string(&BlockTemplateResponse::Proposal(None))
+                .unwrap(),
+            "null"
+        );
+        assert_eq!(
+            serde_json::to_string(&BlockTemplateResponse::Proposal(Some(
+                "bad-txnmrklroot".to_owned()
+            )))
+            .unwrap(),
+            "\"bad-txnmrklroot\""
+        );
+    }
+
+    #[test]
+    fn proposal_verdicts_round_trip() {
+        for (json, want) in [
+            ("null", None),
+            ("\"bad-txnmrklroot\"", Some("bad-txnmrklroot")),
+        ] {
+            let response: BlockTemplateResponse =
+                serde_json::from_str(json).unwrap();
+            match &response {
+                BlockTemplateResponse::Proposal(verdict) => {
+                    assert_eq!(verdict.as_deref(), want)
+                }
+                BlockTemplateResponse::Template(_) => {
+                    panic!("`{json}` must decode as a proposal verdict")
+                }
+            }
+            assert_eq!(serde_json::to_string(&response).unwrap(), json);
+        }
+    }
+
+    /// The reason `Deserialize` is written by hand: a template that fails to
+    /// parse must say which field was wrong. `#[serde(untagged)]` reports
+    /// "data did not match any variant" instead, which cannot be acted on.
+    #[test]
+    fn template_decode_failure_names_the_field() {
+        let almost_a_template = serde_json::json!({
+            "version": 536870912,
+            "rules": ["segwit"],
+            "previousblockhash":
+                "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+            "transactions": []
+            // the remaining required fields are absent
+        });
+        let err =
+            serde_json::from_value::<BlockTemplateResponse>(almost_a_template)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("vbavailable"),
+            "a malformed template must name the offending field, got `{err}`"
+        );
     }
 }

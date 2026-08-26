@@ -10,9 +10,15 @@ use std::{
 };
 
 use bitcoin::{BlockHash, Transaction, Txid};
-use cusf_enforcer_mempool::cusf_enforcer::{
-    ConnectBlockAction, CusfEnforcer, DisconnectBlockAction, SyncToTipError,
-    TxAcceptAction,
+use cusf_enforcer_mempool::{
+    cusf_block_producer::{
+        CoinbaseTxn, CusfBlockProducer, FilledBlockTemplate,
+        InitialBlockTemplate, typewit,
+    },
+    cusf_enforcer::{
+        ConnectBlockAction, CusfEnforcer, DisconnectBlockAction,
+        SyncToTipError, TxAcceptAction,
+    },
 };
 use parking_lot::Mutex;
 
@@ -27,6 +33,7 @@ pub enum MockCall {
     ConnectBlock(BlockHash),
     DisconnectBlock(BlockHash),
     AcceptTx(Txid),
+    ValidateBlock(BlockHash),
 }
 
 #[derive(Default)]
@@ -59,6 +66,11 @@ impl MockEnforcer {
 
     pub fn reject_tx(&self, txid: Txid) {
         self.inner.lock().reject_txids.insert(txid);
+    }
+
+    /// Make both `connect_block` and `validate_block` reject `block_hash`.
+    pub fn reject_block(&self, block_hash: BlockHash) {
+        self.inner.lock().reject_blocks.insert(block_hash);
     }
 
     pub fn set_reject_all(&self, reject_all: bool) {
@@ -117,6 +129,19 @@ impl MockEnforcer {
             .iter()
             .filter_map(|c| match c {
                 MockCall::AcceptTx(t) => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Blocks that `validate_block` has been invoked with, in call order.
+    pub fn validate_block_calls(&self) -> Vec<BlockHash> {
+        self.inner
+            .lock()
+            .log
+            .iter()
+            .filter_map(|c| match c {
+                MockCall::ValidateBlock(block_hash) => Some(*block_hash),
                 _ => None,
             })
             .collect()
@@ -218,5 +243,59 @@ impl CusfEnforcer for MockEnforcer {
             conflicts_with: HashSet::new(),
             weight_tweak: 0,
         })
+    }
+
+    type ValidateBlockError = Infallible;
+
+    /// Mirrors `connect_block`'s policy, so a test can configure one rejection
+    /// and observe it through either path.
+    fn validate_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<Option<String>, Self::ValidateBlockError> {
+        let block_hash = block.block_hash();
+        let mut inner = self.inner.lock();
+        inner.log.push(MockCall::ValidateBlock(block_hash));
+        if inner.reject_all_blocks || inner.reject_blocks.contains(&block_hash)
+        {
+            return Ok(Some(
+                "mock enforcer: block is configured as invalid".to_owned(),
+            ));
+        }
+        Ok(None)
+    }
+}
+
+/// The GBT server bounds its enforcer by `CusfBlockProducer`, so the mock
+/// needs it to be usable there at all. Both hooks are deliberately no-ops:
+/// the mock exists to exercise enforcer *policy*, and leaving the template
+/// untouched matches what `DefaultEnforcer` does.
+impl CusfBlockProducer for MockEnforcer {
+    type InitialBlockTemplateError = Infallible;
+
+    async fn initial_block_template<const COINBASE_TXN: bool>(
+        &self,
+        _parent_block_hash: &BlockHash,
+        _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+        _template: &mut InitialBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::InitialBlockTemplateError>
+    where
+        typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+    {
+        Ok(())
+    }
+
+    type FinalizeBlockTemplateError = Infallible;
+
+    async fn finalize_block_template<const COINBASE_TXN: bool>(
+        &self,
+        _parent_block_hash: &BlockHash,
+        _coinbase_txn_wit: typewit::const_marker::BoolWit<COINBASE_TXN>,
+        _template: &mut FilledBlockTemplate<COINBASE_TXN>,
+    ) -> Result<(), Self::FinalizeBlockTemplateError>
+    where
+        typewit::const_marker::Bool<COINBASE_TXN>: CoinbaseTxn,
+    {
+        Ok(())
     }
 }
