@@ -142,6 +142,9 @@ pub struct SyncState {
     first_mempool_sequence: Option<u64>,
     /// Blocks rejected by the CUSF enforcer
     rejected_blocks: HashSet<BlockHash>,
+    /// Txs the CUSF enforcer removed while connecting each block, so that
+    /// their rejections can be undone if the block is disconnected
+    rejected_by_block: HashMap<BlockHash, HashSet<Txid>>,
     /// Txs rejected by the CUSF enforcer
     rejected_txs: HashSet<Txid>,
     request_queue: RequestQueue,
@@ -162,6 +165,9 @@ struct SyncStateBorrowedMut<'a> {
     blocks_needed: &'a mut LinkedHashSet<BlockHash>,
     /// Blocks rejected by the CUSF enforcer
     rejected_blocks: &'a mut HashSet<BlockHash>,
+    /// Txs the CUSF enforcer removed while connecting each block, so that
+    /// their rejections can be undone if the block is disconnected
+    rejected_by_block: &'a mut HashMap<BlockHash, HashSet<Txid>>,
     /// Txs rejected by the CUSF enforcer
     rejected_txs: &'a mut HashSet<Txid>,
     request_queue: &'a RequestQueue,
@@ -310,8 +316,11 @@ where
                 );
                 sync_state.rejected_txs.insert(txid);
                 sync_state
-                    .request_queue
-                    .push_front(RequestItem::RejectTx(txid));
+                    .rejected_by_block
+                    .entry(block.hash)
+                    .or_default()
+                    .insert(txid);
+                sync_state.request_queue.push_front_reject_tx(txid);
             }
             inner.mempool.chain.tip = block.hash;
             let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
@@ -326,15 +335,14 @@ where
     Ok(())
 }
 
-/// Returns `false` without applying the disconnect if the parent block must
-/// first be fetched into `chain.blocks`. The caller should retry once the
-/// parent block response has been handled.
+/// Returns [`ApplySyncActionResult::Pending`] without applying the disconnect
+/// if the parent block must first be fetched into `chain.blocks`. The caller
+/// should retry once the parent block response has been handled.
 async fn handle_disconnected_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
-    blocks_needed: &mut LinkedHashSet<BlockHash>,
-    request_queue: &RequestQueue,
+    sync_state: SyncStateBorrowedMut<'_>,
     block: &bitcoin_jsonrpsee::client::Block<true>,
-) -> Result<bool, SyncTaskError<BorrowedEnforcer>>
+) -> Result<ApplySyncActionResult, SyncTaskError<BorrowedEnforcer>>
 where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
@@ -347,6 +355,7 @@ where
             unfiltered_mempool_tip: inner.unfiltered_mempool.tip,
         });
     }
+    let mut push_txs_action_queue_front = Vec::new();
     if inner.mempool.chain.tip == block.hash {
         // Rolling the tip back requires the parent block to be present in
         // `chain.blocks` because `Mempool::tip` indexes into it. The parent is
@@ -355,16 +364,18 @@ where
         if block.previousblockhash.is_some()
             && !inner.mempool.chain.blocks.contains_key(&prev_blockhash)
         {
-            if !blocks_needed.contains(&prev_blockhash) {
+            if !sync_state.blocks_needed.contains(&prev_blockhash) {
                 tracing::debug!(
                     block_hash = %block.hash,
                     %prev_blockhash,
                     "Requesting parent block before disconnect"
                 );
-                blocks_needed.replace(prev_blockhash);
-                request_queue.push_front(RequestItem::Block(prev_blockhash));
+                sync_state.blocks_needed.replace(prev_blockhash);
+                sync_state
+                    .request_queue
+                    .push_front(RequestItem::Block(prev_blockhash));
             }
-            return Ok(false);
+            return Ok(ApplySyncActionResult::Pending);
         }
         let DisconnectBlockAction { remove_mempool_txs } = inner
             .enforcer
@@ -375,11 +386,36 @@ where
         for txid in remove_mempool_txs {
             inner.mempool.remove_with_descendants(&txid)?;
         }
+        // Connecting this block deprioritized the txs the enforcer removed.
+        // The block is gone, so the reason they were removed is gone with it,
+        // and the deprioritisation must be undone -- otherwise the tx sits in
+        // bitcoind's mempool at an unmineable feerate forever, and its txid
+        // poisons every descendant via `rejected_txs`.
+        for txid in sync_state
+            .rejected_by_block
+            .remove(&block.hash)
+            .unwrap_or_default()
+        {
+            tracing::trace!(
+                %txid,
+                block_hash = %block.hash,
+                "undoing deprioritisation of tx removed by disconnected block",
+            );
+            sync_state.rejected_txs.remove(&txid);
+            sync_state.request_queue.push_front_unreject_tx(txid);
+            // The tx never left bitcoind's mempool, so nothing announces it to
+            // us again. Re-insert it into the filtered mempool ourselves.
+            if inner.unfiltered_mempool.txs.remove(&txid) {
+                push_txs_action_queue_front.push(txid);
+            }
+        }
         inner.mempool.chain.tip = prev_blockhash;
         let _prev: BlockHash = inner.tip_watch.send_replace(prev_blockhash);
     }
     inner.unfiltered_mempool.tip = prev_blockhash;
-    Ok(true)
+    Ok(ApplySyncActionResult::Success {
+        push_txs_action_queue_front,
+    })
 }
 
 fn handle_block_hash_msg<Enforcer>(
@@ -548,6 +584,7 @@ where
                 let sync_state = SyncStateBorrowedMut {
                     blocks_needed: &mut sync_state.blocks_needed,
                     rejected_blocks: &mut sync_state.rejected_blocks,
+                    rejected_by_block: &mut sync_state.rejected_by_block,
                     rejected_txs: &mut sync_state.rejected_txs,
                     request_queue: &sync_state.request_queue,
                     tx_cache: &mut sync_state.tx_cache,
@@ -569,15 +606,36 @@ where
         ))) if *block_hash == resp_block.hash
             && inner.mempool.chain.tip == resp_block.hash =>
         {
-            if handle_disconnected_block(
-                inner,
-                &mut sync_state.blocks_needed,
-                &sync_state.request_queue,
-                &resp_block,
-            )
-            .await?
+            let res = {
+                let sync_state_borrowed = SyncStateBorrowedMut {
+                    blocks_needed: &mut sync_state.blocks_needed,
+                    rejected_blocks: &mut sync_state.rejected_blocks,
+                    rejected_by_block: &mut sync_state.rejected_by_block,
+                    rejected_txs: &mut sync_state.rejected_txs,
+                    request_queue: &sync_state.request_queue,
+                    tx_cache: &mut sync_state.tx_cache,
+                    txs_needed: &mut sync_state.txs_needed,
+                    unavailable_txs: &mut sync_state.unavailable_txs,
+                    known_fees: &sync_state.known_fees,
+                    mempool_txids: &sync_state.mempool_txids,
+                };
+                handle_disconnected_block(
+                    inner,
+                    sync_state_borrowed,
+                    &resp_block,
+                )
+                .await?
+            };
+            if let ApplySyncActionResult::Success {
+                push_txs_action_queue_front,
+            } = res
             {
                 sync_state.action_queue.pop_front();
+                for txid in push_txs_action_queue_front.into_iter().rev() {
+                    sync_state
+                        .action_queue
+                        .push_front(SyncAction::InsertTx(txid));
+                }
             }
         }
         Some(_) | None => (),
@@ -777,9 +835,7 @@ where
                 "rejecting tx: rejected parent",
             );
             sync_state.rejected_txs.insert(txid);
-            sync_state
-                .request_queue
-                .push_front(RequestItem::RejectTx(txid));
+            sync_state.request_queue.push_front_reject_tx(txid);
             inner.unfiltered_mempool.txs.insert(txid);
             Ok(true)
         }
@@ -881,7 +937,7 @@ where
                         sync_state.rejected_txs.insert(rejected_tx);
                         sync_state
                             .request_queue
-                            .push_front(RequestItem::RejectTx(rejected_tx));
+                            .push_front_reject_tx(rejected_tx);
                     }
                     inner.unfiltered_mempool.txs.insert(txid);
                     Ok(true)
@@ -931,14 +987,7 @@ where
             else {
                 return Ok(ApplySyncActionResult::Pending);
             };
-            let applied = handle_disconnected_block(
-                inner,
-                sync_state.blocks_needed,
-                sync_state.request_queue,
-                &block,
-            )
-            .await?;
-            Ok(ApplySyncActionResult::from(applied))
+            handle_disconnected_block(inner, sync_state, &block).await
         }
         SequenceMessage::TxHash(TxHashMessage {
             txid,
@@ -999,6 +1048,7 @@ where
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut sync_state.blocks_needed,
                 rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_by_block: &mut sync_state.rejected_by_block,
                 rejected_txs: &mut sync_state.rejected_txs,
                 request_queue: &sync_state.request_queue,
                 tx_cache: &mut sync_state.tx_cache,
@@ -1013,6 +1063,7 @@ where
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut sync_state.blocks_needed,
                 rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_by_block: &mut sync_state.rejected_by_block,
                 rejected_txs: &mut sync_state.rejected_txs,
                 request_queue: &sync_state.request_queue,
                 tx_cache: &mut sync_state.tx_cache,
@@ -1096,7 +1147,8 @@ where
         }
         BatchedResponseItem::BatchRejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectBlock)
-        | BatchedResponseItem::Single(ResponseItem::RejectTx) => {}
+        | BatchedResponseItem::Single(ResponseItem::RejectTx)
+        | BatchedResponseItem::Single(ResponseItem::UnrejectTx) => {}
     }
     while try_apply_next_sync_action(inner, sync_state).await? {}
     Ok(())
@@ -1407,6 +1459,7 @@ where
             blocks_needed: LinkedHashSet::from_iter([best_block_hash]),
             first_mempool_sequence: Some(mempool_sequence + 1),
             rejected_blocks: HashSet::new(),
+            rejected_by_block: HashMap::new(),
             rejected_txs: HashSet::new(),
             request_queue,
             tx_cache,
@@ -1636,6 +1689,7 @@ mod tests {
 
         let mut blocks_needed = LinkedHashSet::new();
         let mut rejected_blocks = HashSet::new();
+        let mut rejected_by_block = HashMap::new();
         let mut rejected_txs = HashSet::new();
         let request_queue = RequestQueue::default();
         let mut txs_needed = LinkedHashSet::new();
@@ -1646,6 +1700,7 @@ mod tests {
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut blocks_needed,
                 rejected_blocks: &mut rejected_blocks,
+                rejected_by_block: &mut rejected_by_block,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
                 tx_cache: &mut tx_cache,
@@ -1675,6 +1730,7 @@ mod tests {
             let sync_state = SyncStateBorrowedMut {
                 blocks_needed: &mut blocks_needed,
                 rejected_blocks: &mut rejected_blocks,
+                rejected_by_block: &mut rejected_by_block,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
                 tx_cache: &mut tx_cache,
