@@ -148,7 +148,9 @@ pub struct SyncState {
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: HashMap<Txid, Transaction>,
     txs_needed: LinkedHashSet<Txid>,
-    unavailable_txs: HashSet<Txid>,
+    /// Insertion-ordered so that the oldest entries can be evicted once
+    /// [`MAX_UNAVAILABLE_TXS`] is exceeded. See [`mark_tx_unavailable`].
+    unavailable_txs: LinkedHashSet<Txid>,
     /// Fees Core already computed, from `getrawmempool verbose`
     known_fees: HashMap<Txid, Amount>,
     /// Txids Core reported in the mempool. Used to tell a parent that is
@@ -168,7 +170,7 @@ struct SyncStateBorrowedMut<'a> {
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: &'a mut HashMap<Txid, Transaction>,
     txs_needed: &'a mut LinkedHashSet<Txid>,
-    unavailable_txs: &'a mut HashSet<Txid>,
+    unavailable_txs: &'a mut LinkedHashSet<Txid>,
     known_fees: &'a HashMap<Txid, Amount>,
     mempool_txids: &'a HashSet<Txid>,
 }
@@ -401,6 +403,47 @@ fn handle_block_hash_msg<Enforcer>(
     }
 }
 
+/// Bound on [`SyncState::unavailable_txs`].
+///
+/// Entries are otherwise only ever dropped by exact key, when the tx is
+/// re-added to the mempool or included in a block, so a tx that is removed for
+/// any other reason and never comes back stays there for the lifetime of the
+/// task.
+const MAX_UNAVAILABLE_TXS: usize = 100_000;
+
+/// Mark a tx as unavailable, evicting the oldest entries while
+/// [`MAX_UNAVAILABLE_TXS`] is exceeded.
+///
+/// A txid that the abandoned pool still names as an absent parent is kept,
+/// since dropping it would strand the children waiting on it. Evicting
+/// anything else is self-healing: a later `Added` for the txid requests it
+/// again, and the node reports it unavailable once more if it still is.
+fn mark_tx_unavailable(
+    abandoned_pool: &AbandonedPool,
+    unavailable_txs: &mut LinkedHashSet<Txid>,
+    txid: Txid,
+) {
+    unavailable_txs.replace(txid);
+    // A kept entry is moved to the back, so bound the scan to one pass over
+    // the set, rather than spinning if every entry is an absent parent.
+    let mut remaining_attempts = unavailable_txs.len();
+    while unavailable_txs.len() > MAX_UNAVAILABLE_TXS && remaining_attempts > 0
+    {
+        remaining_attempts -= 1;
+        let Some(oldest) = unavailable_txs.pop_front() else {
+            break;
+        };
+        if abandoned_pool.is_absent_parent(&oldest) {
+            unavailable_txs.replace(oldest);
+        } else {
+            tracing::trace!(
+                txid = %oldest,
+                "evicting oldest unavailable tx: at capacity"
+            );
+        }
+    }
+}
+
 fn handle_tx_hash_msg<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
@@ -475,7 +518,11 @@ where
         TxHashEvent::Removed => {
             tracing::trace!(%txid, "Removed tx from req queue");
             sync_state.txs_needed.remove(&txid);
-            sync_state.unavailable_txs.insert(txid);
+            let () = mark_tx_unavailable(
+                &inner.abandoned_pool,
+                &mut sync_state.unavailable_txs,
+                txid,
+            );
             sync_state
                 .request_queue
                 .remove(&RequestItem::Tx(txid, true));
@@ -643,7 +690,7 @@ struct ParentCaches<'a> {
     mempool: &'a Mempool,
     rejected_txs: &'a HashSet<Txid>,
     tx_cache: &'a HashMap<Txid, Transaction>,
-    unavailable_txs: &'a HashSet<Txid>,
+    unavailable_txs: &'a LinkedHashSet<Txid>,
     mempool_txids: &'a HashSet<Txid>,
 }
 
@@ -1059,7 +1106,11 @@ where
                     "dropping batched fetch for a tx that left the mempool"
                 );
                 sync_state.txs_needed.remove(&txid);
-                sync_state.unavailable_txs.insert(txid);
+                let () = mark_tx_unavailable(
+                    &inner.abandoned_pool,
+                    &mut sync_state.unavailable_txs,
+                    txid,
+                );
             }
             let mut input_txs_needed = LinkedHashSet::new();
             for (tx, in_mempool) in fetched {
@@ -1411,7 +1462,7 @@ where
             request_queue,
             tx_cache,
             txs_needed,
-            unavailable_txs: HashSet::new(),
+            unavailable_txs: LinkedHashSet::new(),
             known_fees,
             mempool_txids,
         }
@@ -1639,7 +1690,7 @@ mod tests {
         let mut rejected_txs = HashSet::new();
         let request_queue = RequestQueue::default();
         let mut txs_needed = LinkedHashSet::new();
-        let mut unavailable_txs = HashSet::new();
+        let mut unavailable_txs = LinkedHashSet::new();
 
         // First insertion adds the tx to the mempool.
         {
@@ -1695,6 +1746,89 @@ mod tests {
         assert!(
             inner.unfiltered_mempool.txs.contains(&txid),
             "tx should still be present in the unfiltered mempool after the second add"
+        );
+    }
+
+    /// `unavailable_txs` is only pruned by exact key, when a tx is re-added or
+    /// confirmed in a block. A tx removed for any other reason -- replaced,
+    /// evicted, expired -- is never named again, so without a bound the set
+    /// grows for as long as the sync task runs.
+    ///
+    /// Also verifies that the bound does not drop a txid that the abandoned
+    /// pool still needs, which is why the set is not simply cleared.
+    #[test]
+    fn unavailable_txs_are_bounded() {
+        fn removed(txid: Txid) -> TxHashMessage {
+            TxHashMessage {
+                txid,
+                event: TxHashEvent::Removed,
+                mempool_seq: 0,
+                zmq_seq: 0,
+            }
+        }
+
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+        let mut sync_state = SyncState {
+            action_queue: SyncActionQueue::default(),
+            blocks_needed: LinkedHashSet::new(),
+            first_mempool_sequence: None,
+            rejected_blocks: HashSet::new(),
+            rejected_txs: HashSet::new(),
+            request_queue: RequestQueue::default(),
+            tx_cache: HashMap::new(),
+            txs_needed: LinkedHashSet::new(),
+            unavailable_txs: LinkedHashSet::new(),
+            known_fees: HashMap::new(),
+            mempool_txids: HashSet::new(),
+        };
+
+        // The oldest entry, and an absent parent of an abandoned tx: evicting
+        // it would strand the child waiting on it.
+        let absent_parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let absent_parent_txid = absent_parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(absent_parent_txid, 0)], &[90_000]);
+        handle_tx_hash_msg::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            removed(absent_parent_txid),
+        )
+        .expect("removal should be handled");
+        inner
+            .abandoned_pool
+            .insert(child, HashSet::from_iter([absent_parent_txid]));
+
+        // Unique txids that are removed and never heard of again.
+        for idx in 0..MAX_UNAVAILABLE_TXS + 10 {
+            let mut txid_bytes = [0u8; 32];
+            txid_bytes[..8].copy_from_slice(&(idx as u64 + 1).to_le_bytes());
+            handle_tx_hash_msg::<_, DefaultEnforcer>(
+                &mut inner,
+                &mut sync_state,
+                removed(Txid::from_byte_array(txid_bytes)),
+            )
+            .expect("removal should be handled");
+        }
+
+        assert!(
+            sync_state.unavailable_txs.len() <= MAX_UNAVAILABLE_TXS,
+            "unavailable txs should be bounded, got {}",
+            sync_state.unavailable_txs.len(),
+        );
+        assert!(
+            sync_state.unavailable_txs.contains(&absent_parent_txid),
+            "an absent parent of an abandoned tx must not be evicted"
         );
     }
 }
