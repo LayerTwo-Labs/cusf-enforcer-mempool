@@ -51,6 +51,8 @@ enum RequestItem {
     /// Bool indicating if the tx is a mempool tx.
     /// `false` if the tx is needed as a dependency for a mempool tx
     Tx(Txid, bool),
+    /// Undo a tx rejection
+    UnrejectTx(Txid),
 }
 
 /// Batched items requested while syncing
@@ -67,9 +69,10 @@ impl BatchedRequestItem {
     /// The bitcoind RPC method this request is dispatched as.
     fn rpc_method(&self) -> &'static str {
         match self {
-            Self::BatchRejectTx(_) | Self::Single(RequestItem::RejectTx(_)) => {
-                "prioritisetransaction"
-            }
+            Self::BatchRejectTx(_)
+            | Self::Single(
+                RequestItem::RejectTx(_) | RequestItem::UnrejectTx(_),
+            ) => "prioritisetransaction",
             Self::Single(RequestItem::RejectBlock(_)) => "invalidateblock",
             Self::BatchTx(_) | Self::Single(RequestItem::Tx(..)) => {
                 "getrawtransaction"
@@ -114,6 +117,49 @@ impl RequestQueue {
             waker.wake()
         }
     }
+
+    /// Push a tx rejection to the front, cancelling a still-queued undo of
+    /// one instead. See [`Self::push_front_prioritisation`].
+    fn push_front_reject_tx(&self, txid: Txid) {
+        self.push_front_prioritisation(
+            RequestItem::RejectTx(txid),
+            RequestItem::UnrejectTx(txid),
+        )
+    }
+
+    /// Push the undo of a tx rejection to the front, cancelling a
+    /// still-queued rejection instead. See
+    /// [`Self::push_front_prioritisation`].
+    fn push_front_unreject_tx(&self, txid: Txid) {
+        self.push_front_prioritisation(
+            RequestItem::UnrejectTx(txid),
+            RequestItem::RejectTx(txid),
+        )
+    }
+
+    /// A rejection and its undo apply opposing `prioritisetransaction`
+    /// deltas, and those accumulate: they only cancel out if both reach the
+    /// node. Both are pushed to the front, so queueing one while
+    /// `counterpart` is still pending would dispatch the pair in reverse
+    /// order and leave the earlier request's delta applied. Dropping the
+    /// pending `counterpart` instead reaches the same accumulated delta
+    /// without putting anything on the wire.
+    fn push_front_prioritisation(
+        &self,
+        request: RequestItem,
+        counterpart: RequestItem,
+    ) {
+        let mut queue_lock = self.inner.queue.lock();
+        if queue_lock.contains(&counterpart) {
+            queue_lock.remove(&counterpart);
+            return;
+        }
+        queue_lock.replace(request);
+        queue_lock.to_front(&request);
+        if let Some(waker) = self.inner.waker.lock().take() {
+            waker.wake()
+        }
+    }
 }
 
 impl Stream for RequestQueue {
@@ -127,7 +173,9 @@ impl Stream for RequestQueue {
         *self.inner.waker.lock() = Some(cx.waker().clone());
         match queue_lock.pop_front() {
             Some(
-                request @ (RequestItem::Block(_) | RequestItem::RejectBlock(_)),
+                request @ (RequestItem::Block(_)
+                | RequestItem::RejectBlock(_)
+                | RequestItem::UnrejectTx(_)),
             ) => Poll::Ready(Some(BatchedRequestItem::Single(request))),
             Some(RequestItem::RejectTx(txid)) => {
                 let mut txids = NonEmpty::new(txid);
@@ -378,6 +426,7 @@ enum ResponseItem {
     Block(Box<bitcoin_jsonrpsee::client::Block<true>>),
     RejectBlock,
     RejectTx,
+    UnrejectTx,
 }
 
 /// Responses received while syncing
@@ -454,7 +503,8 @@ async fn batched_request<RpcClient>(
 where
     RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
 {
-    const NEGATIVE_MAX_SATS: i64 = -(21_000_000 * 100_000_000);
+    const POSITIVE_MAX_SATS: i64 = 21_000_000 * 100_000_000;
+    const NEGATIVE_MAX_SATS: i64 = -POSITIVE_MAX_SATS;
     let method = request.rpc_method();
     match request {
         BatchedRequestItem::BatchRejectTx(txs) => {
@@ -537,6 +587,17 @@ where
                 .await
                 .map_err(|e| RequestError::JsonRpc { method, source: e })?;
             let resp = ResponseItem::RejectTx;
+            Ok(BatchedResponseItem::Single(resp))
+        }
+        BatchedRequestItem::Single(RequestItem::UnrejectTx(txid)) => {
+            // `prioritisetransaction` deltas accumulate, so this cancels out
+            // the delta applied by the matching `RejectTx`, restoring the tx
+            // to its own feerate.
+            let _: bool = rpc_client
+                .prioritize_transaction(txid, POSITIVE_MAX_SATS)
+                .await
+                .map_err(|e| RequestError::JsonRpc { method, source: e })?;
+            let resp = ResponseItem::UnrejectTx;
             Ok(BatchedResponseItem::Single(resp))
         }
         BatchedRequestItem::Single(RequestItem::Tx(txid, in_mempool)) => {
@@ -710,5 +771,72 @@ where
         } else {
             Poll::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use bitcoin::{Txid, hashes::Hash as _};
+    use futures::stream::Stream as _;
+
+    use super::{BatchedRequestItem, RequestItem, RequestQueue};
+
+    /// Dispatch the request at the head of the queue, if any.
+    fn poll_next(queue: &RequestQueue) -> Poll<Option<BatchedRequestItem>> {
+        let mut queue = queue.clone();
+        Pin::new(&mut queue).poll_next(&mut Context::from_waker(Waker::noop()))
+    }
+
+    /// A tx rejection and the undo of one apply opposing
+    /// `prioritisetransaction` deltas, which accumulate on the node. Both are
+    /// pushed to the *front* of the queue, so queued together for one tx they
+    /// would reach the node newest-first and the older request would win. An
+    /// undo racing a rejection that has not been dispatched yet would then
+    /// leave the tx deprioritized forever, which is the very thing the undo
+    /// exists to prevent.
+    #[test]
+    fn reject_and_unreject_tx_cancel_out_in_request_queue() {
+        let txid = Txid::all_zeros();
+
+        let queue = RequestQueue::default();
+        queue.push_front_reject_tx(txid);
+        queue.push_front_unreject_tx(txid);
+        assert_eq!(
+            poll_next(&queue),
+            Poll::Pending,
+            "an undo must cancel a rejection that is still queued",
+        );
+
+        let queue = RequestQueue::default();
+        queue.push_front_unreject_tx(txid);
+        queue.push_front_reject_tx(txid);
+        assert_eq!(
+            poll_next(&queue),
+            Poll::Pending,
+            "a rejection must cancel an undo that is still queued",
+        );
+
+        // With nothing to cancel, both still reach the node: once a rejection
+        // has been dispatched, an undo is the only way to take its delta off.
+        let queue = RequestQueue::default();
+        queue.push_front_reject_tx(txid);
+        assert_eq!(
+            poll_next(&queue),
+            Poll::Ready(Some(BatchedRequestItem::Single(
+                RequestItem::RejectTx(txid)
+            ))),
+        );
+        queue.push_front_unreject_tx(txid);
+        assert_eq!(
+            poll_next(&queue),
+            Poll::Ready(Some(BatchedRequestItem::Single(
+                RequestItem::UnrejectTx(txid)
+            ))),
+        );
     }
 }
