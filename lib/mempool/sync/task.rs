@@ -149,8 +149,11 @@ pub struct SyncState {
     tx_cache: HashMap<Txid, Transaction>,
     txs_needed: LinkedHashSet<Txid>,
     unavailable_txs: HashSet<Txid>,
-    /// Fees Core already computed, from `getrawmempool verbose`
-    known_fees: HashMap<Txid, Amount>,
+    /// Base and modified fees Core already computed, from
+    /// `getrawmempool verbose`. `prioritisetransaction` deltas applied after
+    /// that snapshot are not reflected here, as Core does not notify us of
+    /// them.
+    known_fees: HashMap<Txid, (Amount, Amount)>,
     /// Txids Core reported in the mempool. Used to tell a parent that is
     /// itself in the mempool -- which carries dependency semantics and must
     /// still be resolved -- from a confirmed one, which does not.
@@ -169,7 +172,7 @@ struct SyncStateBorrowedMut<'a> {
     tx_cache: &'a mut HashMap<Txid, Transaction>,
     txs_needed: &'a mut LinkedHashSet<Txid>,
     unavailable_txs: &'a mut HashSet<Txid>,
-    known_fees: &'a HashMap<Txid, Amount>,
+    known_fees: &'a HashMap<Txid, (Amount, Amount)>,
     mempool_txids: &'a HashSet<Txid>,
 }
 
@@ -817,9 +820,14 @@ where
             Ok(true)
         }
         ParentTxsResult::Available(parent_txs) => {
-            let fee_delta = match known_fee {
-                Some(fee) => fee,
-                None => fee_delta(tx, &parent_txs)?,
+            let (fee, modified_fee) = match known_fee {
+                Some(fees) => fees,
+                None => {
+                    // The node did not give us a modified fee, so the base fee
+                    // is the best estimate available.
+                    let fee = fee_delta(tx, &parent_txs)?;
+                    (fee, fee)
+                }
             };
             match inner
                 .enforcer
@@ -836,7 +844,8 @@ where
                     let modified_weight = Weight::from_wu(modified_weight_wu);
                     match inner.mempool.insert(
                         tx.clone(),
-                        fee_delta,
+                        fee,
+                        modified_fee,
                         conflicts_with.into(),
                         modified_weight,
                     ) {
@@ -1339,17 +1348,29 @@ where
     // this is a second call and its snapshot can differ from the one above. A
     // tx missing from it falls back to deriving the fee from parents,
     // which is what every tx did before this optimization.
-    let known_fees: HashMap<Txid, Amount> = {
+    let known_fees: HashMap<Txid, (Amount, Amount)> = {
         let started = std::time::Instant::now();
         match rpc_client
             .get_raw_mempool(BoolWitness::<true>, BoolWitness::<false>)
             .await
         {
             Ok(verbose) => {
-                let fees: HashMap<Txid, Amount> = verbose
+                let fees: HashMap<Txid, (Amount, Amount)> = verbose
                     .entries
                     .into_iter()
-                    .map(|(txid, info)| (txid, info.fees.base))
+                    .map(|(txid, info)| {
+                        // The modified fee carries the node's
+                        // `prioritisetransaction` deltas, which block templates
+                        // must be ordered by. A negative delta can take it
+                        // below zero; such a tx is not worth including, so
+                        // treat it as fee-less.
+                        let modified = info
+                            .fees
+                            .modified
+                            .to_unsigned()
+                            .unwrap_or(Amount::ZERO);
+                        (txid, (info.fees.base, modified))
+                    })
                     .collect();
                 tracing::debug!(
                     "took fees for {} of {} mempool txs from the node in {:?}",
