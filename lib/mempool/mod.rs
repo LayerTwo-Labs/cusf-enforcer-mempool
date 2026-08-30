@@ -380,6 +380,32 @@ impl ByAncestorFeeRate {
     }
 }
 
+/// Maximum depth below the tip at which blocks are retained in
+/// [`Chain::blocks`].
+/// Only the tip and its recent ancestors are ever read, and a rollback that
+/// needs a deeper ancestor re-requests it, so retaining more than this only
+/// grows memory without bound.
+const MAX_RETAINED_BLOCK_DEPTH: u32 = 100;
+
+/// Block hashes to drop when pruning [`Chain::blocks`]: those more than
+/// `keep_depth` below `tip_height`.
+/// The tip is at `tip_height` itself, so it is never dropped and
+/// [`Mempool::tip`] (which indexes into [`Chain::blocks`]) keeps resolving.
+/// Blocks that are not connected yet are never dropped either, as they are
+/// above the tip.
+fn stale_block_hashes(
+    blocks: impl Iterator<Item = (BlockHash, u32)>,
+    tip_height: u32,
+    keep_depth: u32,
+) -> Vec<BlockHash> {
+    let min_height = tip_height.saturating_sub(keep_depth);
+    blocks
+        .filter_map(|(block_hash, height)| {
+            (height < min_height).then_some(block_hash)
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 struct Chain {
     tip: BlockHash,
@@ -404,6 +430,25 @@ impl Chain {
                 None
             }
         })
+    }
+
+    /// Drop blocks more than `keep_depth` below the tip.
+    /// Does nothing if the tip block is not (yet) known.
+    fn prune(&mut self, keep_depth: u32) {
+        let Some(tip_block) = self.blocks.get(&self.tip) else {
+            return;
+        };
+        let tip_height = tip_block.height;
+        let stale = stale_block_hashes(
+            self.blocks
+                .iter()
+                .map(|(block_hash, block)| (*block_hash, block.height)),
+            tip_height,
+            keep_depth,
+        );
+        for block_hash in stale {
+            let _block: Option<_> = self.blocks.remove(&block_hash);
+        }
     }
 }
 
@@ -992,6 +1037,12 @@ mod tests {
         Mempool::new(BlockHash::all_zeros())
     }
 
+    fn block_hash(height: u32) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(&height.to_le_bytes());
+        BlockHash::from_byte_array(bytes)
+    }
+
     /// Reproduces the prod crash: inserting a tx whose `conflicts_with`
     /// references a txid not present in the mempool (e.g. already confirmed
     /// in a block) must not panic or error.
@@ -1011,5 +1062,43 @@ mod tests {
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    /// `Chain::blocks` grows with every fetched block, so pruning must bound
+    /// it: everything more than `MAX_RETAINED_BLOCK_DEPTH` below the tip is
+    /// dropped, while the tip is retained so that `Mempool::tip` (which
+    /// indexes into `Chain::blocks`) keeps resolving.
+    #[test]
+    fn pruning_bounds_blocks_and_retains_tip() {
+        const EXTRA_BLOCKS: u32 = 50;
+        let tip_height = MAX_RETAINED_BLOCK_DEPTH + EXTRA_BLOCKS;
+        // A chain from genesis to the tip, i.e. more blocks than are retained
+        let blocks: Vec<(BlockHash, u32)> = (0..=tip_height)
+            .map(|height| (block_hash(height), height))
+            .collect();
+
+        let stale = stale_block_hashes(
+            blocks.iter().copied(),
+            tip_height,
+            MAX_RETAINED_BLOCK_DEPTH,
+        );
+
+        assert_eq!(
+            blocks.len() - stale.len(),
+            MAX_RETAINED_BLOCK_DEPTH as usize + 1,
+            "retained blocks are not bounded by the retention depth"
+        );
+        assert!(
+            stale.contains(&block_hash(0)),
+            "blocks below the retention depth must be dropped"
+        );
+        assert!(
+            !stale.contains(&block_hash(tip_height)),
+            "the tip must never be dropped"
+        );
+        assert!(
+            !stale.contains(&block_hash(tip_height - 1)),
+            "the tip's parent must never be dropped"
+        );
     }
 }

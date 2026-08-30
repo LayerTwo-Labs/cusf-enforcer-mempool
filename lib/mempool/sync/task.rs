@@ -36,7 +36,8 @@ use crate::{
         self, ConnectBlockAction, CusfEnforcer, DisconnectBlockAction,
     },
     mempool::{
-        Mempool, MempoolInsertError, MempoolRemoveError, MempoolUpdateError,
+        MAX_RETAINED_BLOCK_DEPTH, Mempool, MempoolInsertError,
+        MempoolRemoveError, MempoolUpdateError,
         sync::{
             ApplySyncActionResult, ApplySyncActionTimeoutError,
             BatchedResponseItem, CombinedStream, CombinedStreamItem,
@@ -587,6 +588,9 @@ where
         .chain
         .blocks
         .insert(resp_block.hash, resp_block);
+    // Every fetched block is kept, so without this the chain grows for as long
+    // as the sync task runs.
+    inner.mempool.chain.prune(MAX_RETAINED_BLOCK_DEPTH);
     Ok(())
 }
 
@@ -929,6 +933,11 @@ where
             let Some(block) =
                 inner.mempool.chain.blocks.get(block_hash).cloned()
             else {
+                // Unlike the connect case below, pruning cannot cause this
+                // miss: `block_hash` is the chain tip here, and pruning
+                // retains every block at or above the tip's height. The block
+                // is absent only if it was never fetched, in which case
+                // `handle_block_hash_msg` has already queued a request for it.
                 return Ok(ApplySyncActionResult::Pending);
             };
             let applied = handle_disconnected_block(
@@ -969,6 +978,15 @@ where
             ..
         }) => {
             let Some(block) = inner.mempool.chain.blocks.get(block_hash) else {
+                // The block may have been pruned from `chain.blocks` after the
+                // connect message was queued, in which case nothing is in
+                // flight to fetch it and waiting alone would stall the queue.
+                if !sync_state.blocks_needed.contains(block_hash) {
+                    sync_state.blocks_needed.replace(*block_hash);
+                    sync_state
+                        .request_queue
+                        .push_front(RequestItem::Block(*block_hash));
+                }
                 tracing::debug!(
                     %block_hash,
                     "waiting for block to connect"
