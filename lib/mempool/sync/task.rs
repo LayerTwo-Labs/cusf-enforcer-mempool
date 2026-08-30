@@ -958,10 +958,20 @@ where
             if inner.unfiltered_mempool.txs.remove(txid) {
                 inner.mempool.remove(txid)?;
                 inner.abandoned_pool.remove(txid);
-                Ok(ApplySyncActionResult::from(true))
             } else {
-                Err(SyncTaskError::UnfilteredMempoolMissingTx(*txid))
+                // We never held this tx, so there is nothing to remove. This
+                // happens when a tx is added and removed before the initial
+                // mempool snapshot is taken, as the removal is still delivered
+                // on the sequence stream.
+                //
+                // Erroring instead would abort the sync task, and with it the
+                // block template server, for a message that requires no work.
+                tracing::debug!(
+                    %txid,
+                    "ignoring removal for a tx that was never held",
+                );
             }
+            Ok(ApplySyncActionResult::from(true))
         }
         SequenceMessage::BlockHash(BlockHashMessage {
             block_hash,
@@ -1695,6 +1705,69 @@ mod tests {
         assert!(
             inner.unfiltered_mempool.txs.contains(&txid),
             "tx should still be present in the unfiltered mempool after the second add"
+        );
+    }
+
+    /// A `Removed` sequence message can refer to a tx that we never held, e.g.
+    /// a tx that was both added and removed before the initial mempool
+    /// snapshot was taken, as the removal is still delivered on the sequence
+    /// stream.
+    ///
+    /// Applying it must be a no-op success, as erroring would abort the sync
+    /// task and with it the block template server.
+    #[test]
+    fn removed_for_never_held_tx_is_tolerated() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        // A tx that is absent from both the filtered and unfiltered mempools.
+        let txid = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000])
+            .compute_txid();
+        let seq_msg = SequenceMessage::TxHash(TxHashMessage {
+            txid,
+            event: TxHashEvent::Removed,
+            mempool_seq: 0,
+            zmq_seq: 0,
+        });
+
+        let mut blocks_needed = LinkedHashSet::new();
+        let mut rejected_blocks = HashSet::new();
+        let mut rejected_txs = HashSet::new();
+        let request_queue = RequestQueue::default();
+        let mut tx_cache = HashMap::new();
+        let mut txs_needed = LinkedHashSet::new();
+        let mut unavailable_txs = HashSet::new();
+        let sync_state = SyncStateBorrowedMut {
+            blocks_needed: &mut blocks_needed,
+            rejected_blocks: &mut rejected_blocks,
+            rejected_txs: &mut rejected_txs,
+            request_queue: &request_queue,
+            tx_cache: &mut tx_cache,
+            txs_needed: &mut txs_needed,
+            unavailable_txs: &mut unavailable_txs,
+            known_fees: &HashMap::new(),
+            mempool_txids: &HashSet::new(),
+        };
+        let apply = try_apply_seq_message::<_, DefaultEnforcer>(
+            &mut inner, sync_state, &seq_msg,
+        );
+        let res = futures::executor::block_on(apply).expect(
+            "removal for a tx we never held must not error \
+             (it would abort the sync task)",
+        );
+        assert!(
+            matches!(res, ApplySyncActionResult::Success { .. }),
+            "removal for a tx we never held should be applied as a no-op"
         );
     }
 }
