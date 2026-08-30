@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     convert::Infallible,
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -196,6 +195,89 @@ impl CachedBlockTemplates {
     }
 }
 
+/// Target for the block building on a known tip, once fetched.
+///
+/// A target is only valid for the block that follows the tip it was fetched
+/// for, so a tip change replaces the entry rather than accumulating one per
+/// tip.
+#[derive(Debug, Default)]
+struct KnownTarget(parking_lot::RwLock<Option<(BlockHash, bitcoin::Target)>>);
+
+impl KnownTarget {
+    /// Target for the block at `height`, building on `prev_blockhash`, asking
+    /// `next_block` for the height and target the node is building on a miss.
+    ///
+    /// We used to calculate the next block's target here. This didn't work
+    /// with signets with custom block times. Instead we always read directly
+    /// from Core. This only happens 1 time per chain tip, so the performance
+    /// impact is negligible.
+    ///
+    /// Core answers for its own tip, which may lag or lead the filtered
+    /// mempool's tip while a reorg is being processed. The target it reports
+    /// belongs to the height it reports, and across a retarget boundary that
+    /// is not the target for our block, so a height mismatch is retried
+    /// rather than cached or served.
+    async fn get_with<F, Fut>(
+        &self,
+        prev_blockhash: BlockHash,
+        height: u32,
+        next_block: F,
+    ) -> RpcResult<bitcoin::Target>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = RpcResult<(u32, bitcoin::Target)>>,
+    {
+        // A disagreement about the tip is transient, so allow the node a
+        // short window to catch up before giving up on this request.
+        const RETRIES: usize = 5;
+        const RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+        if let Some((tip, target)) = *self.0.read()
+            && tip == prev_blockhash
+        {
+            return Ok(target);
+        }
+        let mut retries_left = RETRIES;
+        loop {
+            let (next_height, target) = next_block().await?;
+            if next_height == height {
+                *self.0.write() = Some((prev_blockhash, target));
+                return Ok(target);
+            }
+            if retries_left == 0 {
+                let err = anyhow::anyhow!(
+                    "node tip does not match enforcer tip; retry (node is \
+                     building block {next_height}, enforcer is building \
+                     block {height})"
+                );
+                let err = log_error(err);
+                return Err(internal_error(err));
+            }
+            retries_left -= 1;
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+
+    /// [`Self::get_with`], reading the block the node is building from
+    /// `getmininginfo`.
+    async fn get<RpcClient>(
+        &self,
+        rpc_client: &RpcClient,
+        prev_blockhash: BlockHash,
+        height: u32,
+    ) -> RpcResult<bitcoin::Target>
+    where
+        RpcClient: bitcoin_jsonrpsee::client::MainClient + Sync,
+    {
+        self.get_with(prev_blockhash, height, || async move {
+            let mining_info =
+                rpc_client.get_mining_info().await.map_err(internal_error)?;
+            Ok((mining_info.next.height, mining_info.next.target))
+        })
+        .await
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CreateServerError {
     #[error("Sample block template cannot set coinbasetxn field")]
@@ -227,8 +309,8 @@ pub struct Server<Enforcer, RpcClient> {
     rpc_client: RpcClient,
     cached_block_templates: Option<parking_lot::RwLock<CachedBlockTemplates>>,
     sample_block_template: BlockTemplate,
-    /// Map of block hashes to known targets for the next block
-    known_targets: parking_lot::RwLock<HashMap<BlockHash, bitcoin::Target>>,
+    /// Target for the block building on the mempool's tip, once fetched.
+    known_target: KnownTarget,
     /// Tip observer used to park long-poll requests until the tip changes.
     tip_rx: tokio::sync::watch::Receiver<BlockHash>,
     /// Uniquifying suffix for `longpollid`s, see [`parse_long_poll_tip`].
@@ -270,7 +352,7 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
             rpc_client,
             cached_block_templates,
             sample_block_template,
-            known_targets: parking_lot::RwLock::new(HashMap::new()),
+            known_target: KnownTarget::default(),
             tip_rx,
             long_poll_seq: AtomicU64::new(0),
         })
@@ -1002,26 +1084,11 @@ where
             }
             CachedMempoolQueryOutput::Queried(query_output) => *query_output,
         };
-        let target = {
-            let known_target =
-                self.known_targets.read().get(&prev_blockhash).copied();
-            if let Some(target) = known_target {
-                target
-            } else {
-                // We used to calculate the next block's target here. This didn't
-                // work with signets with custom block times. Instead we always
-                // read directly from Core. This only happens 1 time per chain tip,
-                // so the performance impact is negligible.
-                let mining_info = self
-                    .rpc_client
-                    .get_mining_info()
-                    .await
-                    .map_err(internal_error)?;
-                let target = mining_info.next.target;
-                self.known_targets.write().insert(prev_blockhash, target);
-                target
-            }
-        };
+        let height = tip_block_height + 1;
+        let target = self
+            .known_target
+            .get(&self.rpc_client, prev_blockhash, height)
+            .await?;
         let coinbase_txn_or_value = if let Some(coinbase_txn) = coinbase_txn {
             let fee = coinbase_txn
                 .output
@@ -1057,7 +1124,6 @@ where
             )
             */
             tip_block_mediantime as u64 + 1;
-        let height = tip_block_height + 1;
         let res = BlockTemplate {
             capabilities: SERVER_CAPABILITIES
                 .iter()
@@ -1152,7 +1218,85 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use bitcoin::{CompactTarget, Target, hashes::Hash as _};
+
     use super::*;
+
+    fn target(compact: u32) -> Target {
+        Target::from_compact(CompactTarget::from_consensus(compact))
+    }
+
+    /// `getmininginfo` answers for Core's own tip, which can lag or lead the
+    /// filtered mempool's while a reorg is being processed. Across a retarget
+    /// boundary the target Core reports is not the target for our block, so a
+    /// height mismatch must be neither served nor cached.
+    #[tokio::test]
+    async fn target_for_another_height_is_not_served() {
+        let known_target = KnownTarget::default();
+        let calls = AtomicUsize::new(0);
+        let res = known_target
+            .get_with(BlockHash::all_zeros(), 2016, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Ok((2015, target(0x1d00_ffff))))
+            })
+            .await;
+        assert!(
+            res.is_err(),
+            "a target for another height must not be served"
+        );
+        assert!(
+            known_target.0.read().is_none(),
+            "a target for another height must not be cached"
+        );
+        assert!(
+            calls.load(Ordering::Relaxed) > 1,
+            "the node must be re-asked before the request is given up on"
+        );
+    }
+
+    /// The target is read from Core once per tip, so a second template for
+    /// the same tip is served from the cache.
+    #[tokio::test]
+    async fn target_is_fetched_once_per_tip() {
+        let known_target = KnownTarget::default();
+        let calls = AtomicUsize::new(0);
+        let expected = target(0x1d00_ffff);
+        let tip = BlockHash::all_zeros();
+        for _ in 0..2 {
+            let res = known_target
+                .get_with(tip, 2016, || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(Ok((2016, expected)))
+                })
+                .await;
+            assert_eq!(res.unwrap(), expected);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// A target is only valid for the block that follows the tip it was
+    /// fetched for, so a new tip must refetch rather than reuse it.
+    #[tokio::test]
+    async fn new_tip_refetches_target() {
+        let known_target = KnownTarget::default();
+        let old_target = target(0x1d00_ffff);
+        let new_target = target(0x1c00_ffff);
+        let res = known_target
+            .get_with(BlockHash::all_zeros(), 2016, || {
+                std::future::ready(Ok((2016, old_target)))
+            })
+            .await;
+        assert_eq!(res.unwrap(), old_target);
+        let new_tip = BlockHash::from_byte_array([1u8; 32]);
+        let res = known_target
+            .get_with(new_tip, 2017, || {
+                std::future::ready(Ok((2017, new_target)))
+            })
+            .await;
+        assert_eq!(res.unwrap(), new_target);
+    }
 
     /// A block consists of the header, the txs array length, the coinbase tx,
     /// and the txs selected within `MAX_USABLE_BLOCK_WEIGHT`, so the weight
