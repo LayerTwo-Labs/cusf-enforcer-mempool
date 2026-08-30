@@ -274,6 +274,9 @@ where
     SequenceStream(#[from] crate::zmq::SequenceStreamError),
     #[error("ZMQ sequence stream ended unexpectedly")]
     SequenceStreamEnded,
+    // TODO - this is not really an error...
+    #[error("Initial sync was stopped")]
+    Shutdown,
     #[error(transparent)]
     SubscribeSequence(#[from] crate::zmq::SubscribeSequenceError),
 }
@@ -329,6 +332,10 @@ where
     let shutdown_signal = shutdown_signal.shared();
 
     let mut block_parent = block_header.prev_blockhash;
+    // Pin a clone of the shutdown signal, so that shutdown can be observed
+    // while dropping sequence messages
+    let drop_msgs_shutdown_signal = shutdown_signal.clone();
+    futures::pin_mut!(drop_msgs_shutdown_signal);
     'sync: loop {
         tracing::debug!(
             block_hash = %block_hash,
@@ -346,7 +353,7 @@ where
             block_hash,
         )
         .await?;
-        let best_block_hash = main_client.getbestblockhash().await?;
+        let mut best_block_hash = main_client.getbestblockhash().await?;
         if block_hash == best_block_hash {
             tracing::debug!(
                 block_hash = %block_hash,
@@ -364,7 +371,15 @@ where
             tracing::trace!(
                 "reading next ZMQ sequence message, looking for block hash"
             );
-            let Some(msg) = sequence_stream.try_next().await? else {
+            let Some(msg) = tokio::select! {
+                // borrow the shutdown signal, don't move
+                _ = &mut drop_msgs_shutdown_signal => {
+                    tracing::info!("shutdown signal received, stopping");
+                    return Err(InitialSyncError::Shutdown);
+                }
+                sequence_res = sequence_stream.try_next() => sequence_res
+            }?
+            else {
                 return Err(InitialSyncError::SequenceStreamEnded);
             };
             match msg {
@@ -385,6 +400,13 @@ where
                                 .prev_blockhash;
                         }
                     }
+                    // Re-read the node's tip, instead of only comparing
+                    // against the tip that was read before this loop. That
+                    // tip may never be tracked here, if the message
+                    // announcing it was published before the subscription
+                    // was active, in which case waiting for it alone would
+                    // block here forever, even as the chain advances.
+                    best_block_hash = main_client.getbestblockhash().await?;
                     if block_hash == best_block_hash {
                         break 'drop_seq_msgs;
                     } else {
