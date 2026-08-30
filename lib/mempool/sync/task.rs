@@ -459,6 +459,11 @@ where
                     restored_txs.into_iter().rev()
                 {
                     sync_state.tx_cache.insert(restored_txid, restored_tx);
+                    // Abandoning the tx marked it as handled in the unfiltered
+                    // mempool. Clear that mark, otherwise the insertion below
+                    // is short-circuited as a duplicate and the restored tx
+                    // ends up in neither pool.
+                    inner.unfiltered_mempool.txs.remove(&restored_txid);
                     // Push to the front of the action queue, so that
                     // previously abandoned txs can be added into the mempool
                     sync_state
@@ -526,6 +531,10 @@ where
             .rev()
         {
             sync_state.tx_cache.insert(restored_txid, restored_tx);
+            // See `handle_tx_hash_msg`: the abandon marked the tx as
+            // handled in the unfiltered mempool, which would otherwise
+            // short-circuit the insertion below.
+            inner.unfiltered_mempool.txs.remove(&restored_txid);
             sync_state
                 .action_queue
                 .push_front(SyncAction::InsertTx(restored_txid));
@@ -1695,6 +1704,133 @@ mod tests {
         assert!(
             inner.unfiltered_mempool.txs.contains(&txid),
             "tx should still be present in the unfiltered mempool after the second add"
+        );
+    }
+
+    /// A tx abandoned on an unavailable parent is marked in the unfiltered
+    /// mempool. Once the parent becomes available again and the tx is restored
+    /// from the abandoned pool, that mark must not short-circuit the restored
+    /// insertion, which would leave the tx in neither the mempool nor the
+    /// abandoned pool.
+    #[test]
+    fn restored_abandoned_tx_is_reevaluated() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        // The parent was removed from the node's mempool, so the child cannot
+        // be validated yet.
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let child_txid = child.compute_txid();
+
+        let mut tx_cache = HashMap::new();
+        tx_cache.insert(child_txid, child);
+        let mut unavailable_txs = HashSet::new();
+        unavailable_txs.insert(parent_txid);
+        let mut sync_state = SyncState {
+            action_queue: SyncActionQueue::default(),
+            blocks_needed: LinkedHashSet::new(),
+            first_mempool_sequence: None,
+            rejected_blocks: HashSet::new(),
+            rejected_txs: HashSet::new(),
+            request_queue: RequestQueue::default(),
+            tx_cache,
+            txs_needed: LinkedHashSet::new(),
+            unavailable_txs,
+            known_fees: HashMap::new(),
+            mempool_txids: HashSet::new(),
+        };
+
+        // The child is abandoned on its unavailable parent.
+        {
+            let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
+                rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_txs: &mut sync_state.rejected_txs,
+                request_queue: &sync_state.request_queue,
+                tx_cache: &mut sync_state.tx_cache,
+                txs_needed: &mut sync_state.txs_needed,
+                unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &sync_state.mempool_txids,
+            };
+            let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
+                &mut inner, sync_state, child_txid,
+            )
+            .expect("abandoning the child should succeed");
+            assert!(added, "child should be abandoned");
+        }
+        assert!(
+            inner.abandoned_pool.contains(&child_txid),
+            "child should be present in the abandoned pool"
+        );
+
+        // The parent is announced again, restoring the child.
+        let () = handle_tx_hash_msg::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            TxHashMessage {
+                txid: parent_txid,
+                event: TxHashEvent::Added,
+                mempool_seq: 0,
+                zmq_seq: 0,
+            },
+        )
+        .expect("handling the parent announcement should succeed");
+        assert!(
+            !inner.abandoned_pool.contains(&child_txid),
+            "child should have been restored from the abandoned pool"
+        );
+        match sync_state
+            .action_queue
+            .front()
+            .as_ref()
+            .map(|front| front.action)
+        {
+            Some(SyncAction::InsertTx(txid)) => assert_eq!(txid, child_txid),
+            other => panic!("expected an insertion for the child: {other:?}"),
+        }
+
+        // The parent tx response arrives, and the restored insertion is
+        // applied.
+        let () = handle_resp_tx(&mut sync_state, parent);
+        {
+            let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
+                rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_txs: &mut sync_state.rejected_txs,
+                request_queue: &sync_state.request_queue,
+                tx_cache: &mut sync_state.tx_cache,
+                txs_needed: &mut sync_state.txs_needed,
+                unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &sync_state.mempool_txids,
+            };
+            let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
+                &mut inner, sync_state, child_txid,
+            )
+            .expect("restored insertion should succeed");
+            assert!(added, "restored child should be added");
+        }
+        assert!(
+            inner.mempool.txs.0.contains_key(&child_txid),
+            "restored child should be re-evaluated and added to the mempool"
+        );
+        assert!(
+            inner.unfiltered_mempool.txs.contains(&child_txid),
+            "restored child should be present in the unfiltered mempool"
         );
     }
 }
