@@ -294,15 +294,17 @@ where
                 mined_txids.insert(txid);
             }
             for txid in remove_mempool_txs {
-                inner.mempool.remove_with_descendants(&txid)?;
-
                 // Don't remove TXs mined by this very block.
+                // They were already removed non-cascadingly above, and their
+                // descendants are still valid, so cascading here would evict
+                // them.
                 // `prioritisetransaction` works even for a tx absent from the
                 // mempool, so deprioritizing a confirmed tx would silently
                 // poison it if a later reorg returned it to the mempool.
                 if mined_txids.contains(&txid) {
                     continue;
                 }
+                inner.mempool.remove_with_descendants(&txid)?;
                 tracing::trace!(
                     %txid,
                     block_hash = %block.hash,

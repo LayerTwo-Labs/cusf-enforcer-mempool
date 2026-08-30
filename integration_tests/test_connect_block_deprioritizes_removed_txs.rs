@@ -10,12 +10,20 @@
 //! bid targets one mainchain tip, a block supersedes that tip, and the bid is
 //! consensus-dead from then on -- but it stays nominally resident in
 //! bitcoind's mempool at full fee, which for a BMM bid is deliberately large.
+//!
+//! An enforcer may also name a tx the block *mined* in `remove_mempool_txs`
+//! (the winning bid is removed along with the losers). Applying the block
+//! already removed that tx non-cascadingly, so removing it a second time --
+//! this time with descendants -- would evict children that the block left
+//! perfectly valid. This test covers that too.
 
 use std::{collections::HashSet, time::Duration};
 
 use crate::{
     setup::TestSetup,
-    util::{generate_block, modified_fee_sat, prioritised_txids},
+    util::{
+        generate_block, modified_fee_sat, prioritised_txids, submit_child_tx,
+    },
 };
 
 pub async fn test_connect_block_deprioritizes_removed_txs(
@@ -24,6 +32,17 @@ pub async fn test_connect_block_deprioritizes_removed_txs(
     let rpc = &setup.node.rpc_client;
 
     let tx_mined = setup.submit_and_wait(40_000).await?;
+    // An unconfirmed child of the tx that the block confirms. Mining its parent
+    // does not invalidate it, so it must survive the connect even though the
+    // enforcer names the parent in `remove_mempool_txs`.
+    let tx_child = submit_child_tx(rpc, tx_mined, 1_000).await?;
+    setup
+        .wait_for_local_mempool(
+            Duration::from_secs(5),
+            |txids| txids.contains(&tx_child),
+            "child of the mined tx",
+        )
+        .await?;
     let tx_stale = setup.submit_and_wait(50_000).await?;
 
     // Verify the bid really is attractive to fee-driven
@@ -49,9 +68,20 @@ pub async fn test_connect_block_deprioritizes_removed_txs(
         .wait_for_local_tip(block, Duration::from_secs(10))
         .await?;
 
+    let local_txids = setup.local_mempool_txids().await;
     anyhow::ensure!(
-        !setup.local_mempool_txids().await.contains(&tx_stale),
+        !local_txids.contains(&tx_stale),
         "{tx_stale} should be gone from the local mempool mirror"
+    );
+
+    // The mined tx was already removed non-cascadingly as part of applying the
+    // block, so the `remove_mempool_txs` entry naming it must be skipped
+    // rather than cascaded: cascading evicts descendants that are still valid.
+    anyhow::ensure!(
+        local_txids.contains(&tx_child),
+        "{tx_child} spends the mined {tx_mined} and is still valid, but it was \
+         dropped from the local mempool mirror; it would be missing from every \
+         block template we build"
     );
 
     // `RejectTx` goes through the sync task's request queue, so the RPC lands
