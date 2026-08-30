@@ -145,6 +145,8 @@ pub struct SyncState {
     /// Txs rejected by the CUSF enforcer
     rejected_txs: HashSet<Txid>,
     request_queue: RequestQueue,
+    /// Blocks whose connect notification was ignored as stale
+    stale_blocks: HashSet<BlockHash>,
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: HashMap<Txid, Transaction>,
     txs_needed: LinkedHashSet<Txid>,
@@ -165,6 +167,8 @@ struct SyncStateBorrowedMut<'a> {
     /// Txs rejected by the CUSF enforcer
     rejected_txs: &'a mut HashSet<Txid>,
     request_queue: &'a RequestQueue,
+    /// Blocks whose connect notification was ignored as stale
+    stale_blocks: &'a mut HashSet<BlockHash>,
     /// Txs not needed in mempool, but requested in order to determine fees
     tx_cache: &'a mut HashMap<Txid, Transaction>,
     txs_needed: &'a mut LinkedHashSet<Txid>,
@@ -212,21 +216,31 @@ where
         }
         // A subscriber that joins while bitcoind is still flushing its ZMQ
         // notification queue receives connect events for blocks that the
-        // initial-sync tip snapshot already covers.
-        if block.confirmations > 0
+        // initial-sync tip snapshot already covers. A legitimate next block is
+        // always at tip height + 1, so anything at or below the tip height is
+        // a replay, whether it is still on the active chain (`confirmations >
+        // 0`), was reorged out (`confirmations == -1`), or is a same-height
+        // sibling of the tip.
+        // The stale *unfiltered tip* case handled below is not a stale
+        // notification, so leave it to the check that follows.
+        if prev_blockhash != inner.mempool.chain.tip
             && let Some(tip_block) = inner
                 .mempool
                 .chain
                 .blocks
                 .get(&inner.unfiltered_mempool.tip)
-            && block.height < tip_block.height
+            && block.height <= tip_block.height
         {
             tracing::debug!(
                 block_hash = %block.hash,
                 block_height = block.height,
+                confirmations = block.confirmations,
                 tip = %inner.unfiltered_mempool.tip,
-                "Ignoring stale block connect below current tip"
+                "Ignoring stale block connect at or below current tip"
             );
+            // The disconnect replayed after this connect must not wait for a
+            // tip that will never become this block.
+            sync_state.stale_blocks.insert(block.hash);
             return Ok(());
         }
         // A disconnect for a rejected block is deliberately ignored,
@@ -550,6 +564,7 @@ where
                     rejected_blocks: &mut sync_state.rejected_blocks,
                     rejected_txs: &mut sync_state.rejected_txs,
                     request_queue: &sync_state.request_queue,
+                    stale_blocks: &mut sync_state.stale_blocks,
                     tx_cache: &mut sync_state.tx_cache,
                     txs_needed: &mut sync_state.txs_needed,
                     unavailable_txs: &mut sync_state.unavailable_txs,
@@ -907,7 +922,9 @@ where
             ..
         }) => {
             if inner.mempool.chain.tip != *block_hash {
-                if sync_state.rejected_blocks.contains(block_hash) {
+                if sync_state.rejected_blocks.contains(block_hash)
+                    || sync_state.stale_blocks.contains(block_hash)
+                {
                     // We never connected this block, so there is nothing to
                     // disconnect. Sync actions apply in order, so any connect for
                     // the same block has already been handled by the time this one
@@ -1001,6 +1018,7 @@ where
                 rejected_blocks: &mut sync_state.rejected_blocks,
                 rejected_txs: &mut sync_state.rejected_txs,
                 request_queue: &sync_state.request_queue,
+                stale_blocks: &mut sync_state.stale_blocks,
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
@@ -1015,6 +1033,7 @@ where
                 rejected_blocks: &mut sync_state.rejected_blocks,
                 rejected_txs: &mut sync_state.rejected_txs,
                 request_queue: &sync_state.request_queue,
+                stale_blocks: &mut sync_state.stale_blocks,
                 tx_cache: &mut sync_state.tx_cache,
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
@@ -1409,6 +1428,7 @@ where
             rejected_blocks: HashSet::new(),
             rejected_txs: HashSet::new(),
             request_queue,
+            stale_blocks: HashSet::new(),
             tx_cache,
             txs_needed,
             unavailable_txs: HashSet::new(),
@@ -1638,6 +1658,7 @@ mod tests {
         let mut rejected_blocks = HashSet::new();
         let mut rejected_txs = HashSet::new();
         let request_queue = RequestQueue::default();
+        let mut stale_blocks = HashSet::new();
         let mut txs_needed = LinkedHashSet::new();
         let mut unavailable_txs = HashSet::new();
 
@@ -1648,6 +1669,7 @@ mod tests {
                 rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
+                stale_blocks: &mut stale_blocks,
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
@@ -1677,6 +1699,7 @@ mod tests {
                 rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
+                stale_blocks: &mut stale_blocks,
                 tx_cache: &mut tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
@@ -1695,6 +1718,226 @@ mod tests {
         assert!(
             inner.unfiltered_mempool.txs.contains(&txid),
             "tx should still be present in the unfiltered mempool after the second add"
+        );
+    }
+
+    /// Height of the tip built by [`synced_inner`]
+    const TIP_HEIGHT: u32 = 100;
+
+    /// Build a block as the sync task receives it: `Block<true>` is the
+    /// decoded form of a `getblock` verbosity 2 response.
+    fn make_block(
+        hash: BlockHash,
+        previousblockhash: BlockHash,
+        height: u32,
+        confirmations: i64,
+    ) -> bitcoin_jsonrpsee::client::Block<true> {
+        let block = serde_json::json!({
+            "hash": hash.to_string(),
+            "confirmations": confirmations,
+            "size": 285,
+            "strippedsize": 285,
+            "weight": 1140,
+            "height": height,
+            "version": 536_870_912,
+            "versionHex": "20000000",
+            "merkleroot": Txid::all_zeros().to_string(),
+            "tx": [],
+            "time": 1_231_006_505,
+            "mediantime": 1_231_006_505,
+            "nonce": 0,
+            "bits": "207fffff",
+            "target": format!("{:064x}", 0x7fffffu32),
+            "difficulty": 1.0,
+            "chainwork": format!("{:064x}", height + 1),
+            "nTx": 0,
+            "previousblockhash": previousblockhash.to_string(),
+        });
+        serde_json::from_value(block)
+            .expect("`getblock` verbosity 2 response should decode")
+    }
+
+    /// Owned backing storage for a [`SyncStateBorrowedMut`]
+    #[derive(Default)]
+    struct TestSyncState {
+        blocks_needed: LinkedHashSet<BlockHash>,
+        known_fees: HashMap<Txid, Amount>,
+        mempool_txids: HashSet<Txid>,
+        rejected_blocks: HashSet<BlockHash>,
+        rejected_txs: HashSet<Txid>,
+        request_queue: RequestQueue,
+        stale_blocks: HashSet<BlockHash>,
+        tx_cache: HashMap<Txid, Transaction>,
+        txs_needed: LinkedHashSet<Txid>,
+        unavailable_txs: HashSet<Txid>,
+    }
+
+    impl TestSyncState {
+        fn borrowed_mut(&mut self) -> SyncStateBorrowedMut<'_> {
+            SyncStateBorrowedMut {
+                blocks_needed: &mut self.blocks_needed,
+                rejected_blocks: &mut self.rejected_blocks,
+                rejected_txs: &mut self.rejected_txs,
+                request_queue: &self.request_queue,
+                stale_blocks: &mut self.stale_blocks,
+                tx_cache: &mut self.tx_cache,
+                txs_needed: &mut self.txs_needed,
+                unavailable_txs: &mut self.unavailable_txs,
+                known_fees: &self.known_fees,
+                mempool_txids: &self.mempool_txids,
+            }
+        }
+    }
+
+    /// Filtered and unfiltered mempools synced to `tip`, which is the child of
+    /// `tip_parent` at [`TIP_HEIGHT`].
+    fn synced_inner(
+        tip: BlockHash,
+        tip_parent: BlockHash,
+    ) -> MempoolSyncInner<DefaultEnforcer> {
+        let (tip_watch, _) = watch::channel(tip);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(tip),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip,
+                txs: HashSet::new(),
+            },
+        };
+        inner
+            .mempool
+            .chain
+            .blocks
+            .insert(tip, make_block(tip, tip_parent, TIP_HEIGHT, 1));
+        inner
+    }
+
+    /// The paths under test never await, so blocking on the future is enough.
+    fn connect(
+        inner: &mut MempoolSyncInner<DefaultEnforcer>,
+        sync_state: &mut TestSyncState,
+        block: &bitcoin_jsonrpsee::client::Block<true>,
+    ) -> Result<(), SyncTaskError<DefaultEnforcer>> {
+        futures::executor::block_on(connect_block(
+            inner,
+            sync_state.borrowed_mut(),
+            block,
+        ))
+    }
+
+    /// The paths under test never await, so blocking on the future is enough.
+    fn apply_disconnect(
+        inner: &mut MempoolSyncInner<DefaultEnforcer>,
+        sync_state: &mut TestSyncState,
+        block_hash: BlockHash,
+    ) -> Result<ApplySyncActionResult, SyncTaskError<DefaultEnforcer>> {
+        let seq_msg = SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash,
+            event: BlockHashEvent::Disconnected,
+            zmq_seq: 0,
+        });
+        futures::executor::block_on(try_apply_seq_message(
+            inner,
+            sync_state.borrowed_mut(),
+            &seq_msg,
+        ))
+    }
+
+    /// Regression test: bitcoind is still flushing its ZMQ notification queue
+    /// when we subscribe, so it replays connects for blocks that the
+    /// initial-sync tip snapshot already covers. A block that was reorged out
+    /// before we subscribed is reported by `getblock` with
+    /// `confirmations = -1`, and must still be recognised as a stale replay
+    /// rather than killing the sync task with an unexpected tip.
+    #[test]
+    fn stale_connect_for_reorged_out_block_is_ignored() {
+        let tip = BlockHash::from_byte_array([1; 32]);
+        let tip_parent = BlockHash::from_byte_array([2; 32]);
+        let stale = BlockHash::from_byte_array([3; 32]);
+        let stale_parent = BlockHash::from_byte_array([4; 32]);
+        let mut inner = synced_inner(tip, tip_parent);
+        let mut sync_state = TestSyncState::default();
+
+        connect(
+            &mut inner,
+            &mut sync_state,
+            &make_block(stale, stale_parent, TIP_HEIGHT - 1, -1),
+        )
+        .expect("a stale connect below the tip must not be fatal");
+
+        assert_eq!(
+            inner.unfiltered_mempool.tip, tip,
+            "a stale connect must not move the unfiltered tip"
+        );
+        assert_eq!(
+            inner.mempool.chain.tip, tip,
+            "a stale connect must not move the filtered tip"
+        );
+        assert!(
+            sync_state.stale_blocks.contains(&stale),
+            "the ignored block must be recorded as stale"
+        );
+    }
+
+    /// A reorged-out sibling of the tip is at the *same* height, so comparing
+    /// heights with `<` would not recognise it as stale. A legitimate next
+    /// block is always at tip height + 1.
+    #[test]
+    fn stale_connect_for_same_height_sibling_is_ignored() {
+        let tip = BlockHash::from_byte_array([1; 32]);
+        let tip_parent = BlockHash::from_byte_array([2; 32]);
+        let sibling = BlockHash::from_byte_array([5; 32]);
+        let mut inner = synced_inner(tip, tip_parent);
+        let mut sync_state = TestSyncState::default();
+
+        connect(
+            &mut inner,
+            &mut sync_state,
+            &make_block(sibling, tip_parent, TIP_HEIGHT, -1),
+        )
+        .expect("a stale connect for a tip sibling must not be fatal");
+
+        assert_eq!(
+            inner.unfiltered_mempool.tip, tip,
+            "a stale connect must not move the unfiltered tip"
+        );
+        assert_eq!(
+            inner.mempool.chain.tip, tip,
+            "a stale connect must not move the filtered tip"
+        );
+        assert!(
+            sync_state.stale_blocks.contains(&sibling),
+            "the ignored sibling must be recorded as stale"
+        );
+    }
+
+    /// The disconnect that bitcoind replays after a stale connect must not
+    /// wait for a tip that can never become the stale block: it would sit at
+    /// the head of the action queue until the apply timeout kills the task.
+    #[test]
+    fn disconnect_of_stale_block_does_not_stall_the_queue() {
+        let tip = BlockHash::from_byte_array([1; 32]);
+        let tip_parent = BlockHash::from_byte_array([2; 32]);
+        let stale = BlockHash::from_byte_array([3; 32]);
+        let stale_parent = BlockHash::from_byte_array([4; 32]);
+        let mut inner = synced_inner(tip, tip_parent);
+        let mut sync_state = TestSyncState::default();
+        connect(
+            &mut inner,
+            &mut sync_state,
+            &make_block(stale, stale_parent, TIP_HEIGHT - 1, -1),
+        )
+        .expect("a stale connect below the tip must not be fatal");
+
+        let res = apply_disconnect(&mut inner, &mut sync_state, stale)
+            .expect("a disconnect for a stale block must not be fatal");
+
+        assert!(
+            matches!(res, ApplySyncActionResult::Success { .. }),
+            "the replayed disconnect must be dropped, not left pending at \
+             the head of the queue"
         );
     }
 }
