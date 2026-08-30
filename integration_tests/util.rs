@@ -302,6 +302,71 @@ pub async fn submit_tx(
     send_to_address(rpc, &dest, amount_sat).await
 }
 
+/// Spend `parent`'s largest wallet output back to a fresh address, leaving an
+/// unconfirmed child of `parent` in bitcoind's mempool. Returns the child txid.
+///
+/// Built as a raw tx rather than through `sendtoaddress` because coin selection
+/// offers no way to insist on spending a specific parent.
+pub async fn submit_child_tx(
+    rpc: &RpcClient,
+    parent: Txid,
+    fee_sat: u64,
+) -> anyhow::Result<Txid> {
+    #[derive(serde::Deserialize)]
+    struct Unspent {
+        txid: String,
+        vout: u32,
+        amount: f64,
+    }
+    #[derive(serde::Deserialize)]
+    struct SignedTx {
+        hex: String,
+        complete: bool,
+    }
+    let parent_str = parent.to_string();
+    // `minconf = 0`, so the parent's outputs are visible while it is itself
+    // still in the mempool.
+    let unspent: Vec<Unspent> =
+        rpc.request("listunspent", rpc_params![0]).await?;
+    let utxo = unspent
+        .into_iter()
+        .filter(|out| out.txid == parent_str)
+        .max_by(|l, r| l.amount.total_cmp(&r.amount))
+        .ok_or_else(|| {
+            anyhow!("no spendable output of {parent} in `listunspent 0`")
+        })?;
+    let amount_btc = utxo.amount - (fee_sat as f64) / 100_000_000.0;
+    anyhow::ensure!(
+        amount_btc > 0.0,
+        "output of {parent} ({} BTC) does not cover a {fee_sat} sat fee",
+        utxo.amount
+    );
+    let dest = get_new_address(rpc).await?;
+    let inputs = serde_json::json!([{ "txid": parent_str, "vout": utxo.vout }]);
+    let mut outputs = serde_json::Map::new();
+    let _prev: Option<serde_json::Value> = outputs.insert(
+        dest.to_string(),
+        serde_json::Value::String(format!("{amount_btc:.8}")),
+    );
+    let unsigned: String = rpc
+        .request(
+            "createrawtransaction",
+            rpc_params![inputs, serde_json::Value::Object(outputs)],
+        )
+        .await?;
+    let signed: SignedTx = rpc
+        .request("signrawtransactionwithwallet", rpc_params![unsigned])
+        .await?;
+    anyhow::ensure!(
+        signed.complete,
+        "signrawtransactionwithwallet could not fully sign a child of {parent}"
+    );
+    let txid: String = rpc
+        .request("sendrawtransaction", rpc_params![signed.hex])
+        .await?;
+    Ok(txid.parse()?)
+}
+
 /// `getrawmempool` — bitcoind's current mempool as a list of txids.
 pub async fn mempool_txids(rpc: &RpcClient) -> anyhow::Result<Vec<Txid>> {
     // We bypass MainClient::get_raw_mempool because its typed
