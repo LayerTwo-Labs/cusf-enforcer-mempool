@@ -382,6 +382,52 @@ where
     Ok(true)
 }
 
+/// Roll the unfiltered mempool tip back to the parent of `block_hash`, if it
+/// is currently that block. The unfiltered mempool follows every connected
+/// block, including the ones the enforcer rejects -- `connect_block` advances
+/// its tip before consulting the enforcer -- but the disconnect for a rejected
+/// block skips [`handle_disconnected_block`], the only other place that rolls
+/// that tip back. Left stuck on the rejected block, it makes the disconnect of
+/// the accepted parent fail with [`SyncTaskError::DisconnectTipMismatch`].
+///
+/// Returns `false` without rolling back if the block must first be fetched
+/// into `chain.blocks`. The caller should retry once the block response has
+/// been handled.
+fn try_rollback_unfiltered_tip<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    blocks_needed: &mut LinkedHashSet<BlockHash>,
+    request_queue: &RequestQueue,
+    block_hash: &BlockHash,
+) -> bool {
+    if inner.unfiltered_mempool.tip != *block_hash {
+        return true;
+    }
+    let Some(block) = inner.mempool.chain.blocks.get(block_hash) else {
+        // Connecting the block required fetching it, so this is unreachable
+        // in practice. Request it rather than leave the tip stuck.
+        if !blocks_needed.contains(block_hash) {
+            tracing::debug!(
+                %block_hash,
+                "Requesting rejected block before rolling back the \
+                 unfiltered mempool tip"
+            );
+            blocks_needed.replace(*block_hash);
+            request_queue.push_front(RequestItem::Block(*block_hash));
+        }
+        return false;
+    };
+    let prev_blockhash =
+        block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
+    tracing::debug!(
+        %block_hash,
+        %prev_blockhash,
+        "rolling back unfiltered mempool tip for a disconnected block that \
+         was never connected",
+    );
+    inner.unfiltered_mempool.tip = prev_blockhash;
+    true
+}
+
 fn handle_block_hash_msg<Enforcer>(
     inner: &MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
@@ -916,6 +962,17 @@ where
                     // Waiting instead would stall the queue permanently. Nothing
                     // requests the block, the tip cannot become it, and the action
                     // stays at the head until the apply timeout kills the task.
+                    //
+                    // The unfiltered mempool did follow the block, though, so
+                    // its tip must still be rolled back here.
+                    if !try_rollback_unfiltered_tip(
+                        inner,
+                        sync_state.blocks_needed,
+                        sync_state.request_queue,
+                        block_hash,
+                    ) {
+                        return Ok(ApplySyncActionResult::Pending);
+                    }
                     tracing::debug!(
                         %block_hash,
                         tip = %inner.mempool.chain.tip,
