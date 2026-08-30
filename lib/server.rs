@@ -562,7 +562,7 @@ async fn block_txs<const COINBASE_TXN: bool, BP>(
     tracing::debug!("Inserting prefix txs into cloned mempool");
     for (tx, fee) in initial_block_template.prefix_txs.iter().cloned() {
         let weight = tx.weight();
-        match mempool.insert(tx, fee, Default::default(), weight) {
+        match mempool.insert(tx, fee, fee, Default::default(), weight) {
             Ok(_)
             | Err(crate::mempool::MempoolInsertError::TxAlreadyExists {
                 ..

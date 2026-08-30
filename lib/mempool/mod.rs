@@ -520,10 +520,14 @@ impl Mempool {
     /// Insert a tx into the mempool,
     /// stating conflicts with other txs due to reasons other than shared
     /// inputs.
+    /// `modified_fee` is the base fee plus any `prioritisetransaction` delta
+    /// that the node applied to the tx. It is what block templates are ordered
+    /// by, while `fee` is what they report.
     pub fn insert(
         &mut self,
         tx: Transaction,
         fee: Amount,
+        modified_fee: Amount,
         conflicts_with: imbl::OrdSet<Txid>,
         modified_weight: Weight,
     ) -> Result<Option<TxInfo>, MempoolInsertError> {
@@ -532,10 +536,9 @@ impl Mempool {
             return Err(MempoolInsertError::TxAlreadyExists { txid });
         }
         // initially incorrect, must be computed after insertion
-        let mut ancestor_fees = fee;
+        let mut ancestor_fees = modified_fee;
         // initially incorrect, must be computed after insertion
-        let mut descendant_fees = fee;
-        let modified_fee = fee;
+        let mut descendant_fees = modified_fee;
         let vsize = tx.vsize() as u64;
         // initially incorrect, must be computed after insertion
         let mut ancestor_modified_weight = modified_weight;
@@ -1006,10 +1009,42 @@ mod tests {
         let result = mempool.insert(
             tx,
             Amount::from_sat(100),
+            Amount::from_sat(100),
             OrdSet::unit(absent_txid),
             weight,
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    /// A `prioritisetransaction` delta must decide which tx makes it into a
+    /// block template, and must not change the fee reported for it.
+    #[test]
+    fn propose_txs_orders_by_modified_fee() {
+        let mut mempool = test_mempool();
+        let base_fee = Amount::from_sat(1000);
+        let boosted_fee = Amount::from_sat(10_000);
+
+        let tx = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let boosted_tx =
+            make_tx(&[OutPoint::new(Txid::from_byte_array([1; 32]), 0)], 1);
+        let boosted_txid = boosted_tx.compute_txid();
+        let weight = tx.weight();
+        assert_eq!(weight, boosted_tx.weight());
+
+        mempool
+            .insert(tx, base_fee, base_fee, OrdSet::new(), weight)
+            .unwrap();
+        mempool
+            .insert(boosted_tx, base_fee, boosted_fee, OrdSet::new(), weight)
+            .unwrap();
+
+        // Only one of the two txs fits
+        let weight_limit = Weight::from_vb_unwrap(weight.to_vbytes_ceil());
+        let proposed = mempool.propose_txs(Some(weight_limit)).unwrap();
+
+        assert_eq!(proposed.len(), 1);
+        assert_eq!(proposed[0].txid, boosted_txid);
+        assert_eq!(proposed[0].fee.to_sat(), base_fee.to_sat() as i64);
     }
 }
