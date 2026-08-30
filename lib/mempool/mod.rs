@@ -304,6 +304,8 @@ pub enum MempoolInsertError {
     #[error(transparent)]
     MissingAncestor(#[from] MissingAncestorError),
     #[error(transparent)]
+    MissingByAncestorFeeRateKey(#[from] MissingByAncestorFeeRateKeyError),
+    #[error(transparent)]
     MissingDescendant(#[from] MissingDescendantError),
     #[error(transparent)]
     MissingDescendantsKey(#[from] MissingDescendantsKeyError),
@@ -615,8 +617,27 @@ impl Mempool {
                 Ok(())
             },
         )?;
-        self.txs.descendants_mut(txid).skip(1).for_each(
-            |(descendant_tx, descendant_info)| {
+        let mut descendants = self.txs.descendants_mut(txid);
+        // Skip first element
+        let _: Option<_> = descendants.next()?;
+        let () = descendants
+            .map_err(MempoolInsertError::MissingDescendant)
+            .for_each(|(descendant_tx, descendant_info)| {
+                let descendant_txid = descendant_tx.compute_txid();
+                let ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
+                if !self
+                    .by_ancestor_fee_rate
+                    .remove(ancestor_fee_rate, descendant_txid)
+                {
+                    let err =
+                        MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
+                    return Err(err.into());
+                };
                 descendant_vsize += descendant_tx.vsize() as u64;
                 descendant_modified_weight = saturating_add_weight(
                     descendant_modified_weight,
@@ -630,13 +651,29 @@ impl Mempool {
                         modified_weight,
                     );
                 descendant_info.fees.ancestor += modified_fee;
+                // The descendant may have been inserted before this tx, in
+                // which case it does not yet know that this tx is a dep.
+                if descendant_tx
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output.txid == txid)
+                {
+                    descendant_info.depends.insert(txid);
+                }
                 descendant_info.conflicts_with = descendant_info
                     .conflicts_with
                     .clone()
                     .union(conflicts_with.clone());
-                Ok(())
-            },
-        )?;
+                let ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
+                self.by_ancestor_fee_rate
+                    .insert(ancestor_fee_rate, descendant_txid);
+                Result::<_, MempoolInsertError>::Ok(())
+            })?;
         for conflict_txid in conflicts_with {
             // The conflicting tx may have already been removed from the
             // mempool (e.g. confirmed in a block). Skip it.
@@ -1011,5 +1048,36 @@ mod tests {
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    /// Txs are not necessarily inserted in topological order (eg. during
+    /// initial sync), so inserting a child before its parent must still leave
+    /// the child depending on the parent, and must re-key the child in
+    /// `by_ancestor_fee_rate` so that proposing txs succeeds.
+    #[test]
+    fn insert_child_before_parent() {
+        let mut mempool = test_mempool();
+
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let parent_weight = parent.weight();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+        let child_weight = child.weight();
+
+        let _: Option<TxInfo> = mempool
+            .insert(child, Amount::from_sat(200), OrdSet::new(), child_weight)
+            .expect("child insert failed");
+        let _: Option<TxInfo> = mempool
+            .insert(parent, Amount::from_sat(100), OrdSet::new(), parent_weight)
+            .expect("parent insert failed");
+
+        let (_, child_info) = &mempool.txs.0[&child_txid];
+        assert_eq!(child_info.depends, OrdSet::unit(parent_txid));
+
+        let proposed = mempool.propose_txs(None).expect("propose_txs failed");
+        let proposed_txids: Vec<Txid> =
+            proposed.iter().map(|tx| tx.txid).collect();
+        assert_eq!(proposed_txids, vec![parent_txid, child_txid]);
     }
 }
