@@ -556,6 +556,8 @@ where
     BorrowedEnforcer: CusfEnforcer,
 {
     sync_state.blocks_needed.remove(&resp_block.hash);
+    let block_txids: HashSet<Txid> =
+        resp_block.tx.iter().map(|tx_info| tx_info.txid).collect();
     for tx_info in resp_block.tx.iter().rev() {
         sync_state.unavailable_txs.remove(&tx_info.txid);
         for (restored_txid, restored_tx) in inner
@@ -564,12 +566,23 @@ where
             .into_iter()
             .rev()
         {
+            sync_state.tx_cache.insert(restored_txid, restored_tx);
+            // A parked descendant that is itself confirmed by this very block
+            // (parent and child mined together) must NOT be re-inserted into
+            // the mempool: it would put an already-mined tx into every block
+            // template — mining it is `bad-txns-inputs-missingorspent`
+            // (issue #611, the stale-template half, observed live as tx
+            // bfea81ef… restored-and-proposed right after the block that
+            // mined it). Caching it above is enough — that is all a confirmed
+            // tx is needed for.
+            if block_txids.contains(&restored_txid) {
+                continue;
+            }
             // Parked txs stay recorded in the unfiltered mempool; drop that
             // record or the re-insert below is silently swallowed by the
             // already-present short-circuit in `try_add_tx_from_caches` and
             // the restored tx is never admitted. (issue #611)
             inner.unfiltered_mempool.txs.remove(&restored_txid);
-            sync_state.tx_cache.insert(restored_txid, restored_tx);
             sync_state
                 .action_queue
                 .push_front(SyncAction::InsertTx(restored_txid));
