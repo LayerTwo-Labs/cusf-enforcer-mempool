@@ -674,7 +674,19 @@ fn try_get_parent_txs_from_caches<'a>(
         } = input.previous_output;
         if rejected_txs.contains(&input_txid) {
             return ParentTxsResult::Rejected(input_txid);
-        } else if let Some(input_tx) = tx_cache.get(&input_txid) {
+        } else if let Some(input_tx) = tx_cache.get(&input_txid).filter(|_| {
+            // The tx cache holds fetched parent txs so we can read the value of
+            // the output being spent — all a *confirmed* parent is needed for.
+            // An unconfirmed *mempool* parent, though, must be present in the
+            // enforced mempool before its child is admitted: a cache hit must
+            // not stand in for that presence, or the child is inserted as a
+            // rootless orphan and the block template it lands in is
+            // closure-broken (`bad-txns-inputs-missingorspent`). When such a
+            // parent is only cached, fall through so the child is deferred
+            // (`Required`) until the parent is actually inserted. (issue #611)
+            !mempool_txids.contains(&input_txid)
+                || mempool.txs.0.contains_key(&input_txid)
+        }) {
             input_txs.insert(input_txid, input_tx);
         } else if let Some((input_tx, _)) = mempool.txs.0.get(&input_txid) {
             input_txs.insert(input_txid, input_tx);
@@ -1695,6 +1707,78 @@ mod tests {
         assert!(
             inner.unfiltered_mempool.txs.contains(&txid),
             "tx should still be present in the unfiltered mempool after the second add"
+        );
+    }
+
+    /// Regression for issue #611 (the silent closure-broken-template half). A
+    /// child must not be admitted to the enforced mempool ahead of an
+    /// *unconfirmed mempool* parent that is present only in the tx cache. The
+    /// tx cache exists to read a confirmed parent's spent-output value; letting
+    /// a cache hit stand in for an unconfirmed mempool parent's *presence*
+    /// inserts the child as a rootless orphan, so the block template it lands
+    /// in is closure-broken and mines to `bad-txns-inputs-missingorspent`.
+    #[test]
+    fn child_not_admitted_ahead_of_unconfirmed_mempool_parent() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        // An UNCONFIRMED MEMPOOL parent, currently only in the tx cache (e.g.
+        // fetched as a dependency) and NOT yet inserted into the enforced
+        // mempool. Its child spends its output.
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let txid = tx.compute_txid();
+
+        let mut tx_cache = HashMap::new();
+        tx_cache.insert(parent_txid, parent);
+        tx_cache.insert(txid, tx);
+
+        // Both are unconfirmed node-mempool txs.
+        let mempool_txids: HashSet<Txid> =
+            [parent_txid, txid].into_iter().collect();
+
+        let mut blocks_needed = LinkedHashSet::new();
+        let mut rejected_blocks = HashSet::new();
+        let mut rejected_txs = HashSet::new();
+        let request_queue = RequestQueue::default();
+        let mut txs_needed = LinkedHashSet::new();
+        let mut unavailable_txs = HashSet::new();
+
+        let sync_state = SyncStateBorrowedMut {
+            blocks_needed: &mut blocks_needed,
+            rejected_blocks: &mut rejected_blocks,
+            rejected_txs: &mut rejected_txs,
+            request_queue: &request_queue,
+            tx_cache: &mut tx_cache,
+            txs_needed: &mut txs_needed,
+            unavailable_txs: &mut unavailable_txs,
+            known_fees: &HashMap::new(),
+            mempool_txids: &mempool_txids,
+        };
+        let _ = try_add_tx_from_caches::<_, DefaultEnforcer>(
+            &mut inner, sync_state, txid,
+        )
+        .expect("add must not error");
+
+        // The child must not be in the enforced mempool while its unconfirmed
+        // mempool parent is absent from it — that is the closure break.
+        assert!(
+            !(inner.mempool.txs.0.contains_key(&txid)
+                && !inner.mempool.txs.0.contains_key(&parent_txid)),
+            "child was admitted to the enforced mempool ahead of its unconfirmed \
+             mempool parent (parent absent) — a closure-broken template"
         );
     }
 }
