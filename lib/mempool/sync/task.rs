@@ -170,7 +170,9 @@ struct SyncStateBorrowedMut<'a> {
     txs_needed: &'a mut LinkedHashSet<Txid>,
     unavailable_txs: &'a mut HashSet<Txid>,
     known_fees: &'a HashMap<Txid, Amount>,
-    mempool_txids: &'a HashSet<Txid>,
+    /// Pruned as members confirm or are removed, so a stale entry cannot
+    /// classify a since-confirmed tx as still-unconfirmed (issue #611).
+    mempool_txids: &'a mut HashSet<Txid>,
 }
 
 pub struct MempoolSyncing<Enforcer> {
@@ -291,6 +293,11 @@ where
                 let txid = tx.compute_txid();
                 let _removed: Option<_> = inner.mempool.remove(&txid)?;
                 sync_state.txs_needed.remove(&txid);
+                // The initial-sync snapshot must forget confirmed members, or
+                // a later child of this tx resolves it as a still-unconfirmed
+                // mempool parent and re-admits the mined tx from the tx cache
+                // into block templates (issue #611, observed live).
+                sync_state.mempool_txids.remove(&txid);
                 sync_state
                     .request_queue
                     .remove(&RequestItem::Tx(txid, true));
@@ -611,7 +618,7 @@ where
                     txs_needed: &mut sync_state.txs_needed,
                     unavailable_txs: &mut sync_state.unavailable_txs,
                     known_fees: &sync_state.known_fees,
-                    mempool_txids: &sync_state.mempool_txids,
+                    mempool_txids: &mut sync_state.mempool_txids,
                 };
                 let () = connect_block(inner, sync_state, &resp_block).await?;
             };
@@ -854,7 +861,7 @@ where
         rejected_txs: sync_state.rejected_txs,
         tx_cache: sync_state.tx_cache,
         unavailable_txs: sync_state.unavailable_txs,
-        mempool_txids: sync_state.mempool_txids,
+        mempool_txids: &*sync_state.mempool_txids,
         unfiltered_txs: &inner.unfiltered_mempool.txs,
     };
     match try_get_parent_txs_from_caches(caches, &tx.input, known_fee.is_some())
@@ -1083,6 +1090,7 @@ where
             if inner.unfiltered_mempool.txs.remove(txid) {
                 inner.mempool.remove(txid)?;
                 inner.abandoned_pool.remove(txid);
+                sync_state.mempool_txids.remove(txid);
                 Ok(ApplySyncActionResult::from(true))
             } else {
                 Err(SyncTaskError::UnfilteredMempoolMissingTx(*txid))
@@ -1130,7 +1138,7 @@ where
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
                 known_fees: &sync_state.known_fees,
-                mempool_txids: &sync_state.mempool_txids,
+                mempool_txids: &mut sync_state.mempool_txids,
             };
             try_add_tx_from_caches(inner, sync_state, txid)?
         }
@@ -1144,7 +1152,7 @@ where
                 txs_needed: &mut sync_state.txs_needed,
                 unavailable_txs: &mut sync_state.unavailable_txs,
                 known_fees: &sync_state.known_fees,
-                mempool_txids: &sync_state.mempool_txids,
+                mempool_txids: &mut sync_state.mempool_txids,
             };
             try_apply_seq_message(inner, sync_state, &seq_msg).await?
         }
@@ -1777,7 +1785,7 @@ mod tests {
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
                 known_fees: &HashMap::new(),
-                mempool_txids: &HashSet::new(),
+                mempool_txids: &mut HashSet::new(),
             };
             let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
                 &mut inner, sync_state, txid,
@@ -1809,7 +1817,7 @@ mod tests {
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
                 known_fees: &HashMap::new(),
-                mempool_txids: &HashSet::new(),
+                mempool_txids: &mut HashSet::new(),
             };
             let added = try_add_tx_from_caches::<_, DefaultEnforcer>(
                 &mut inner, sync_state, txid,
@@ -1836,7 +1844,7 @@ mod tests {
     fn drive_add(
         inner: &mut MempoolSyncInner<DefaultEnforcer>,
         tx_cache: &mut HashMap<Txid, Transaction>,
-        mempool_txids: &HashSet<Txid>,
+        mempool_txids: &mut HashSet<Txid>,
         txid: Txid,
     ) {
         let request_queue = RequestQueue::default();
@@ -1855,11 +1863,11 @@ mod tests {
                 rejected_blocks: &mut rejected_blocks,
                 rejected_txs: &mut rejected_txs,
                 request_queue: &request_queue,
-                tx_cache,
+                tx_cache: &mut *tx_cache,
                 txs_needed: &mut txs_needed,
                 unavailable_txs: &mut unavailable_txs,
                 known_fees: &HashMap::new(),
-                mempool_txids,
+                mempool_txids: &mut *mempool_txids,
             };
             match try_add_tx_from_caches::<_, DefaultEnforcer>(
                 inner, sync_state, next,
@@ -1925,10 +1933,10 @@ mod tests {
         tx_cache.insert(Txid::all_zeros(), make_tx(&[], &[200_000]));
 
         // Both are unconfirmed node-mempool txs, from the initial snapshot.
-        let mempool_txids: HashSet<Txid> =
+        let mut mempool_txids: HashSet<Txid> =
             [parent_txid, txid].into_iter().collect();
 
-        drive_add(&mut inner, &mut tx_cache, &mempool_txids, txid);
+        drive_add(&mut inner, &mut tx_cache, &mut mempool_txids, txid);
 
         // The closure invariant (never child-without-parent) plus liveness:
         // the requeue must have admitted both, parent first.
@@ -1978,7 +1986,7 @@ mod tests {
         // Post-snapshot world: the frozen snapshot knows neither tx. The
         // parent is in the node's mempool (unfiltered mirror) but NOT the
         // enforced mempool, and is marked unavailable from the earlier race.
-        let mempool_txids: HashSet<Txid> = HashSet::new();
+        let mut mempool_txids: HashSet<Txid> = HashSet::new();
         inner.unfiltered_mempool.txs.insert(parent_txid);
 
         let mut tx_cache = HashMap::new();
@@ -2001,7 +2009,7 @@ mod tests {
             txs_needed: &mut txs_needed,
             unavailable_txs: &mut unavailable_txs,
             known_fees: &HashMap::new(),
-            mempool_txids: &mempool_txids,
+            mempool_txids: &mut mempool_txids,
         };
         let _res = try_add_tx_from_caches::<_, DefaultEnforcer>(
             &mut inner, sync_state, txid,
@@ -2064,9 +2072,9 @@ mod tests {
         inner.unfiltered_mempool.txs.insert(parent_txid);
 
         // Post-snapshot world.
-        let mempool_txids: HashSet<Txid> = HashSet::new();
+        let mut mempool_txids: HashSet<Txid> = HashSet::new();
 
-        drive_add(&mut inner, &mut tx_cache, &mempool_txids, txid);
+        drive_add(&mut inner, &mut tx_cache, &mut mempool_txids, txid);
 
         assert!(
             inner.mempool.txs.0.contains_key(&parent_txid),
@@ -2127,7 +2135,7 @@ mod tests {
             txs_needed: &mut txs_needed,
             unavailable_txs: &mut unavailable_txs,
             known_fees: &HashMap::new(),
-            mempool_txids: &HashSet::new(),
+            mempool_txids: &mut HashSet::new(),
         };
         let res = futures::executor::block_on(try_apply_seq_message::<
             _,
