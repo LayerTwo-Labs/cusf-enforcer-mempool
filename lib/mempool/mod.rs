@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bitcoin::{Amount, BlockHash, Transaction, Txid, Weight};
+use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::BlockTemplateTransaction;
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{OrdMap, OrdSet, ordmap};
@@ -615,14 +615,37 @@ impl Mempool {
                 Ok(())
             },
         )?;
+        // Direct children of this tx that were already in the mempool when it
+        // was inserted (i.e. inserted out-of-order, before their parent). Their
+        // `depends` was computed without this tx and must be backfilled below.
+        let direct_children: imbl::HashSet<Txid> =
+            self.tx_childs.0.get(&txid).cloned().unwrap_or_default();
         self.txs.descendants_mut(txid).skip(1).for_each(
             |(descendant_tx, descendant_info)| {
+                let descendant_txid = descendant_tx.compute_txid();
                 descendant_vsize += descendant_tx.vsize() as u64;
                 descendant_modified_weight = saturating_add_weight(
                     descendant_modified_weight,
                     descendant_info.modified_weight,
                 );
                 descendant_fees += descendant_info.fees.modified;
+                // The descendant's ancestor set now includes this tx, which
+                // changes its ancestor fee rate. Re-key it in
+                // `by_ancestor_fee_rate` (remove the stale key, insert the new
+                // one), mirroring what `remove` does in reverse. This only
+                // fires for out-of-order inserts (a topologically-ordered
+                // insert has no descendants yet); without it a later
+                // `remove`/`propose_txs` fails with `MissingByAncestorFeeRateKey`
+                // because the descendant's stored key no longer matches its
+                // stats. (issue #611)
+                let old_ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
+                self.by_ancestor_fee_rate
+                    .remove(old_ancestor_fee_rate, descendant_txid);
                 descendant_info.ancestor_vsize += vsize;
                 descendant_info.ancestor_modified_weight =
                     saturating_add_weight(
@@ -630,6 +653,22 @@ impl Mempool {
                         modified_weight,
                     );
                 descendant_info.fees.ancestor += modified_fee;
+                let new_ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
+                self.by_ancestor_fee_rate
+                    .insert(new_ancestor_fee_rate, descendant_txid);
+                // If this descendant spends one of the newly-inserted tx's
+                // outputs (a direct child) but was inserted before it, its
+                // `depends` never recorded the dependency. Backfill it, else it
+                // can be proposed ahead of / without its parent -> invalid
+                // template. (issue #611)
+                if direct_children.contains(&descendant_txid) {
+                    descendant_info.depends.insert(txid);
+                }
                 descendant_info.conflicts_with = descendant_info
                     .conflicts_with
                     .clone()
@@ -774,6 +813,25 @@ impl Mempool {
             );
         }
         Ok(res)
+    }
+
+    /// Txids of mempool txs spending the given outpoint.
+    pub(crate) fn spenders_of(&self, outpoint: &OutPoint) -> Vec<Txid> {
+        let Some(childs) = self.tx_childs.0.get(&outpoint.txid) else {
+            return Vec::new();
+        };
+        childs
+            .iter()
+            .filter(|child_txid| {
+                self.txs.0.get(*child_txid).is_some_and(|(child_tx, _)| {
+                    child_tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == *outpoint)
+                })
+            })
+            .copied()
+            .collect()
     }
 
     /// Retain txs for which the provided closure returns `true`.
@@ -1011,5 +1069,175 @@ mod tests {
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    /// Assert that a block template is a valid block order: every tx that spends
+    /// the output of another *in-mempool* (unconfirmed) tx must (a) have that
+    /// parent present in the template, and (b) appear strictly after it.
+    /// A miner that violates either produces a block rejected with
+    /// `bad-txns-inputs-missingorspent`.
+    fn assert_template_topologically_valid(
+        template: &[BlockTemplateTransaction],
+        mempool: &Mempool,
+    ) {
+        let position: HashMap<Txid, usize> = template
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.txid, i))
+            .collect();
+        for (i, t) in template.iter().enumerate() {
+            let tx: Transaction = bitcoin::consensus::deserialize(&t.data)
+                .expect("template tx data did not deserialize");
+            for input in &tx.input {
+                let parent = input.previous_output.txid;
+                // Only in-mempool parents matter; anything else is assumed
+                // confirmed on-chain.
+                if !mempool.txs.0.contains_key(&parent) {
+                    continue;
+                }
+                let parent_pos = position.get(&parent).unwrap_or_else(|| {
+                    panic!(
+                        "template not closed: tx {} (pos {i}) spends in-mempool \
+                         parent {parent}, which is absent from the template",
+                        t.txid
+                    )
+                });
+                assert!(
+                    *parent_pos < i,
+                    "template out of order: tx {} at pos {i} spends parent \
+                     {parent} at pos {parent_pos}",
+                    t.txid
+                );
+            }
+        }
+    }
+
+    /// Regression for the silent invalid-template bug (issue #611). When a child
+    /// tx is inserted BEFORE its parent (out-of-order mempool sync, routine
+    /// under RBF churn / batched-fetch gaps), the child's `depends` set is
+    /// computed once at insert time and never learns about the later-arriving
+    /// parent, and the descendant's `by_ancestor_fee_rate` key is left stale.
+    /// `propose_txs` then either errors with `MissingByAncestorFeeRateKey` or
+    /// emits the child ahead of — or without — its parent, yielding a template
+    /// that mines to a block rejected `bad-txns-inputs-missingorspent`.
+    /// Regression for issue #611 (the stale-template half). When a block
+    /// confirms a tx, mempool txs spending the same outpoint (RBF variants /
+    /// double-spends) are evicted by the node WITHOUT a removal sequence
+    /// message; `spenders_of` is what the sync layer uses to find and evict
+    /// them locally at block connect, together with their descendants.
+    #[test]
+    fn spenders_of_finds_conflicting_spender() {
+        let mut mempool = test_mempool();
+
+        let funding_outpoint = OutPoint::new(Txid::all_zeros(), 0);
+        // A spends the funding outpoint; C spends A's output 0.
+        let tx_a = make_tx(&[funding_outpoint], 1);
+        let txid_a = tx_a.compute_txid();
+        let tx_c = make_tx(&[OutPoint::new(txid_a, 0)], 1);
+        let txid_c = tx_c.compute_txid();
+        // B spends an unrelated outpoint of the same funding tx.
+        let tx_b = make_tx(&[OutPoint::new(Txid::all_zeros(), 1)], 1);
+        let txid_b = tx_b.compute_txid();
+
+        for tx in [tx_a, tx_c, tx_b] {
+            let weight = tx.weight();
+            mempool
+                .insert(tx, Amount::from_sat(1000), OrdSet::new(), weight)
+                .unwrap();
+        }
+
+        // Only A spends the funding outpoint itself.
+        assert_eq!(mempool.spenders_of(&funding_outpoint), vec![txid_a]);
+        assert_eq!(
+            mempool.spenders_of(&OutPoint::new(Txid::all_zeros(), 7)),
+            Vec::<Txid>::new()
+        );
+
+        // The sweep at block connect: a confirmed tx consumed the funding
+        // outpoint, so A and its descendant C must go; B stays.
+        let removed = mempool.remove_with_descendants(&txid_a).unwrap();
+        assert!(removed.contains_key(&txid_a));
+        assert!(removed.contains_key(&txid_c));
+        assert!(!mempool.txs.0.contains_key(&txid_a));
+        assert!(!mempool.txs.0.contains_key(&txid_c));
+        assert!(mempool.txs.0.contains_key(&txid_b));
+        assert_eq!(mempool.spenders_of(&funding_outpoint), Vec::<Txid>::new());
+    }
+
+    #[test]
+    fn out_of_order_insert_yields_valid_template() {
+        let mut mempool = test_mempool();
+
+        // parent P (spends a confirmed output), child A (spends P's output 0).
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+
+        // Insert the CHILD first, then the PARENT.
+        let child_weight = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), child_weight)
+            .unwrap();
+        let parent_weight = parent.weight();
+        mempool
+            .insert(
+                parent,
+                Amount::from_sat(1000),
+                OrdSet::new(),
+                parent_weight,
+            )
+            .unwrap();
+
+        let template = mempool
+            .propose_txs(None)
+            .expect("propose_txs returned an error");
+        assert_template_topologically_valid(&template, &mempool);
+    }
+
+    /// Multi-level variant: a 3-tx chain (grandparent -> parent -> child)
+    /// inserted in FULLY REVERSED order (child, then parent, then grandparent).
+    /// Each late-arriving ancestor must re-key every descendant's
+    /// `by_ancestor_fee_rate` entry and backfill its direct child's `depends`,
+    /// so the proposed template still lists all three in a valid block order —
+    /// exercising the fix across more than one dependency level.
+    #[test]
+    fn out_of_order_insert_chain_yields_valid_template() {
+        let mut mempool = test_mempool();
+
+        // chain: grandparent G (confirmed input) <- parent P <- child C.
+        let grandparent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let grandparent_txid = grandparent.compute_txid();
+        let parent = make_tx(&[OutPoint::new(grandparent_txid, 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+
+        // Insert fully reversed: CHILD, then PARENT, then GRANDPARENT.
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = parent.weight();
+        mempool
+            .insert(parent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = grandparent.weight();
+        mempool
+            .insert(grandparent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+
+        let template = mempool
+            .propose_txs(None)
+            .expect("propose_txs returned an error");
+        assert_template_topologically_valid(&template, &mempool);
+        // The whole chain must be proposed — none silently dropped.
+        let ids: std::collections::HashSet<Txid> =
+            template.iter().map(|t| t.txid).collect();
+        assert!(
+            ids.contains(&grandparent_txid)
+                && ids.contains(&parent_txid)
+                && ids.contains(&child_txid),
+            "template is missing part of the chain: {ids:?}"
+        );
     }
 }
