@@ -645,6 +645,11 @@ struct ParentCaches<'a> {
     tx_cache: &'a HashMap<Txid, Transaction>,
     unavailable_txs: &'a HashSet<Txid>,
     mempool_txids: &'a HashSet<Txid>,
+    /// Live mirror of the node's mempool (`unfiltered_mempool.txs`).
+    /// `mempool_txids` is a snapshot frozen at initial sync, so it knows
+    /// nothing about txs the node accepted afterwards; a parent is known to be
+    /// an unconfirmed mempool tx if it appears in EITHER set.
+    unfiltered_txs: &'a HashSet<Txid>,
 }
 
 /// `fee_known`: when the node has already supplied this tx's fee, a confirmed
@@ -662,7 +667,19 @@ fn try_get_parent_txs_from_caches<'a>(
         tx_cache,
         unavailable_txs,
         mempool_txids,
+        unfiltered_txs,
     } = caches;
+    // Whether a parent is known to be an unconfirmed tx in the node's mempool.
+    // `mempool_txids` covers the initial-sync snapshot; `unfiltered_txs` is the
+    // live mirror maintained from the sequence stream and covers everything the
+    // node accepted after that snapshot. Consulting only the frozen snapshot
+    // classified every post-startup mempool parent as "confirmed", which let
+    // the tx cache stand in for it below — admitting its child as a rootless
+    // orphan (issue #611, the live recurrence).
+    let is_node_mempool_tx = |input_txid: &Txid| {
+        mempool_txids.contains(input_txid)
+            || unfiltered_txs.contains(input_txid)
+    };
     let mut abandoned_input_txs = LinkedHashSet::new();
     let mut input_txs_needed = LinkedHashSet::new();
     let mut unavailable_input_txs = LinkedHashSet::new();
@@ -684,7 +701,7 @@ fn try_get_parent_txs_from_caches<'a>(
             // closure-broken (`bad-txns-inputs-missingorspent`). When such a
             // parent is only cached, fall through so the child is deferred
             // (`Required`) until the parent is actually inserted. (issue #611)
-            !mempool_txids.contains(&input_txid)
+            !is_node_mempool_tx(&input_txid)
                 || mempool.txs.0.contains_key(&input_txid)
         }) {
             input_txs.insert(input_txid, input_tx);
@@ -694,7 +711,7 @@ fn try_get_parent_txs_from_caches<'a>(
             abandoned_input_txs.replace(input_txid);
         } else if unavailable_txs.contains(&input_txid) {
             unavailable_input_txs.replace(input_txid);
-        } else if fee_known && !mempool_txids.contains(&input_txid) {
+        } else if fee_known && !is_node_mempool_tx(&input_txid) {
             // Confirmed parent, and Core already gave us this tx's fee. It was
             // only ever fetched to read the value of the output being spent,
             // so there is nothing left to learn from it.
@@ -744,30 +761,33 @@ where
     Ok(fee_delta)
 }
 
-// returns `true` if the tx was added to the mempool, abandoned pool, or already exists in the unfiltered mempool
-// successfully, was already marked unavailable, or was rejected.
-// returns `false` if the tx or the tx's parent txs are required.
+// Returns `Success` if the tx was added to the mempool or abandoned pool,
+// already exists in the unfiltered mempool, was already marked unavailable, or
+// was rejected. `Success` may carry front-of-queue inserts: parents that are
+// already fetched but whose own insert is still queued *behind* this tx, which
+// must be applied first (followed by this tx again).
+// Returns `Pending` if the tx or its parent txs must be fetched first.
 fn try_add_tx_from_caches<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: SyncStateBorrowedMut<'_>,
     txid: Txid,
-) -> Result<bool, SyncTaskError<BorrowedEnforcer>>
+) -> Result<ApplySyncActionResult, SyncTaskError<BorrowedEnforcer>>
 where
     Enforcer: BorrowMut<BorrowedEnforcer>,
     BorrowedEnforcer: CusfEnforcer,
 {
     if inner.unfiltered_mempool.txs.contains(&txid) {
-        return Ok(true);
+        return Ok(ApplySyncActionResult::from(true));
     }
     let Some(tx) = sync_state.tx_cache.get(&txid) else {
         if sync_state.unavailable_txs.contains(&txid) {
             inner.unfiltered_mempool.txs.insert(txid);
-            return Ok(true);
+            return Ok(ApplySyncActionResult::from(true));
         } else {
             sync_state
                 .request_queue
                 .push_front(RequestItem::Tx(txid, true));
-            return Ok(false);
+            return Ok(ApplySyncActionResult::Pending);
         }
     };
     let known_fee = sync_state.known_fees.get(&txid).copied();
@@ -778,6 +798,7 @@ where
         tx_cache: sync_state.tx_cache,
         unavailable_txs: sync_state.unavailable_txs,
         mempool_txids: sync_state.mempool_txids,
+        unfiltered_txs: &inner.unfiltered_mempool.txs,
     };
     match try_get_parent_txs_from_caches(caches, &tx.input, known_fee.is_some())
     {
@@ -793,7 +814,7 @@ where
                 .request_queue
                 .push_front(RequestItem::RejectTx(txid));
             inner.unfiltered_mempool.txs.insert(txid);
-            Ok(true)
+            Ok(ApplySyncActionResult::from(true))
         }
         ParentTxsResult::Unavailable(unavailable_parents) => {
             let tx = sync_state
@@ -806,17 +827,36 @@ where
                 .insert(tx, unavailable_parents.into_iter().collect());
             tracing::trace!(%txid, "added tx to abandoned pool");
             inner.unfiltered_mempool.txs.insert(txid);
-            Ok(true)
+            Ok(ApplySyncActionResult::from(true))
         }
         ParentTxsResult::Required(required_parents) => {
-            for input_txid in required_parents.into_iter().rev() {
+            // A required parent that is already in the tx cache needs no
+            // fetch: it reached `Required` because it is a known node-mempool
+            // tx whose own insert has not applied yet. Since the action queue
+            // is strictly FIFO, that insert can be queued BEHIND this tx (an
+            // out-of-order initial snapshot, or a child announced right after
+            // its parent) — returning `Pending` would then deadlock the queue
+            // head until the apply timeout kills the task. Instead, requeue:
+            // apply the parents' inserts first, then retry this tx.
+            let (queued_parents, fetch_parents): (Vec<Txid>, Vec<Txid>) =
+                required_parents.into_iter().partition(|input_txid| {
+                    sync_state.tx_cache.contains_key(input_txid)
+                });
+            if fetch_parents.is_empty() {
+                let mut push_txs_action_queue_front = queued_parents;
+                push_txs_action_queue_front.push(txid);
+                return Ok(ApplySyncActionResult::Success {
+                    push_txs_action_queue_front,
+                });
+            }
+            for input_txid in fetch_parents.into_iter().rev() {
                 sync_state.txs_needed.replace(input_txid);
                 sync_state.txs_needed.to_front(&input_txid);
                 sync_state
                     .request_queue
                     .push_front(RequestItem::Tx(input_txid, false))
             }
-            Ok(false)
+            Ok(ApplySyncActionResult::Pending)
         }
         ParentTxsResult::Abandoned(_abandoned_parents) => {
             let tx = sync_state
@@ -826,7 +866,7 @@ where
             inner.abandoned_pool.insert(tx, HashSet::new());
             tracing::trace!(%txid, "added tx to abandoned pool");
             inner.unfiltered_mempool.txs.insert(txid);
-            Ok(true)
+            Ok(ApplySyncActionResult::from(true))
         }
         ParentTxsResult::Available(parent_txs) => {
             let fee_delta = match known_fee {
@@ -869,7 +909,7 @@ where
                     }
                     inner.unfiltered_mempool.txs.insert(txid);
                     tracing::trace!(%txid, "added tx to mempool");
-                    Ok(true)
+                    Ok(ApplySyncActionResult::from(true))
                 }
                 cusf_enforcer::TxAcceptAction::Reject => {
                     tracing::trace!(%txid, "rejecting tx");
@@ -896,7 +936,7 @@ where
                             .push_front(RequestItem::RejectTx(rejected_tx));
                     }
                     inner.unfiltered_mempool.txs.insert(txid);
-                    Ok(true)
+                    Ok(ApplySyncActionResult::from(true))
                 }
             }
         }
@@ -958,8 +998,13 @@ where
             mempool_seq: _,
             zmq_seq: _,
         }) => {
-            let added = try_add_tx_from_caches(inner, sync_state, *txid)?;
-            Ok(ApplySyncActionResult::from(added))
+            // The node (re-)announced this tx, so any earlier `unavailable`
+            // verdict (a fetch that lost a race with a removal) is stale.
+            // Clearing it lets the tx be fetched and admitted this time;
+            // leaving it would skip the tx forever while its descendants keep
+            // arriving — and being admitted around it. (issue #611)
+            sync_state.unavailable_txs.remove(txid);
+            try_add_tx_from_caches(inner, sync_state, *txid)
         }
         SequenceMessage::TxHash(TxHashMessage {
             txid,
@@ -1019,7 +1064,7 @@ where
                 known_fees: &sync_state.known_fees,
                 mempool_txids: &sync_state.mempool_txids,
             };
-            try_add_tx_from_caches(inner, sync_state, txid)?.into()
+            try_add_tx_from_caches(inner, sync_state, txid)?
         }
         SyncAction::SequenceMessage(seq_msg) => {
             let sync_state = SyncStateBorrowedMut {
@@ -1670,7 +1715,10 @@ mod tests {
                 &mut inner, sync_state, txid,
             )
             .expect("first add should succeed");
-            assert!(added, "tx should be added to the mempool");
+            assert!(
+                matches!(added, ApplySyncActionResult::Success { .. }),
+                "tx should be added to the mempool"
+            );
         }
         assert!(
             inner.mempool.txs.0.contains_key(&txid),
@@ -1702,12 +1750,66 @@ mod tests {
                 "re-adding an already-present tx must not error \
                  (idempotent reconciliation)",
             );
-            assert!(added, "re-add should report success");
+            assert!(
+                matches!(added, ApplySyncActionResult::Success { .. }),
+                "re-add should report success"
+            );
         }
         assert!(
             inner.unfiltered_mempool.txs.contains(&txid),
             "tx should still be present in the unfiltered mempool after the second add"
         );
+    }
+
+    /// Builds a `SyncStateBorrowedMut` and applies `try_add_tx_from_caches`
+    /// the way the action-queue loop does: front-pushed inserts are applied
+    /// first (in order), then any remaining requeued txs. Panics on `Pending`
+    /// (all txs a driven test uses are already in the tx cache).
+    fn drive_add(
+        inner: &mut MempoolSyncInner<DefaultEnforcer>,
+        tx_cache: &mut HashMap<Txid, Transaction>,
+        mempool_txids: &HashSet<Txid>,
+        txid: Txid,
+    ) {
+        let request_queue = RequestQueue::default();
+        let mut queue = std::collections::VecDeque::from([txid]);
+        let mut steps = 0;
+        while let Some(next) = queue.pop_front() {
+            steps += 1;
+            assert!(steps <= 64, "requeue loop failed to converge");
+            let mut blocks_needed = LinkedHashSet::new();
+            let mut rejected_blocks = HashSet::new();
+            let mut rejected_txs = HashSet::new();
+            let mut txs_needed = LinkedHashSet::new();
+            let mut unavailable_txs = HashSet::new();
+            let sync_state = SyncStateBorrowedMut {
+                blocks_needed: &mut blocks_needed,
+                rejected_blocks: &mut rejected_blocks,
+                rejected_txs: &mut rejected_txs,
+                request_queue: &request_queue,
+                tx_cache,
+                txs_needed: &mut txs_needed,
+                unavailable_txs: &mut unavailable_txs,
+                known_fees: &HashMap::new(),
+                mempool_txids,
+            };
+            match try_add_tx_from_caches::<_, DefaultEnforcer>(
+                inner, sync_state, next,
+            )
+            .expect("add must not error")
+            {
+                ApplySyncActionResult::Success {
+                    push_txs_action_queue_front,
+                } => {
+                    for tx in push_txs_action_queue_front.into_iter().rev() {
+                        queue.push_front(tx);
+                    }
+                }
+                ApplySyncActionResult::Pending => {
+                    panic!("unexpected Pending for a fully-cached tx {next}")
+                }
+            }
+        }
     }
 
     /// Regression for issue #611 (the silent closure-broken-template half). A
@@ -1717,6 +1819,12 @@ mod tests {
     /// a cache hit stand in for an unconfirmed mempool parent's *presence*
     /// inserts the child as a rootless orphan, so the block template it lands
     /// in is closure-broken and mines to `bad-txns-inputs-missingorspent`.
+    ///
+    /// Also covers the strictly-FIFO deadlock: since the parent's own insert
+    /// is queued behind the child (an out-of-order initial snapshot), simply
+    /// deferring the child would block the queue head forever. The child's add
+    /// must instead requeue the parent's insert in front of its own, and
+    /// driving that requeue must admit BOTH, parent first.
     #[test]
     fn child_not_admitted_ahead_of_unconfirmed_mempool_parent() {
         let genesis = BlockHash::all_zeros();
@@ -1744,17 +1852,77 @@ mod tests {
         let mut tx_cache = HashMap::new();
         tx_cache.insert(parent_txid, parent);
         tx_cache.insert(txid, tx);
+        // The parent's own (confirmed) funding tx, fetched for its output
+        // value. Not a node-mempool tx, so the cache may stand in for it.
+        tx_cache.insert(Txid::all_zeros(), make_tx(&[], &[200_000]));
 
-        // Both are unconfirmed node-mempool txs.
+        // Both are unconfirmed node-mempool txs, from the initial snapshot.
         let mempool_txids: HashSet<Txid> =
             [parent_txid, txid].into_iter().collect();
+
+        drive_add(&mut inner, &mut tx_cache, &mempool_txids, txid);
+
+        // The closure invariant (never child-without-parent) plus liveness:
+        // the requeue must have admitted both, parent first.
+        assert!(
+            inner.mempool.txs.0.contains_key(&parent_txid),
+            "parent should have been admitted via the front-of-queue requeue; \
+             admitting the child without it is a closure-broken template"
+        );
+        assert!(
+            inner.mempool.txs.0.contains_key(&txid),
+            "child should have been admitted after its parent"
+        );
+    }
+
+    /// Regression for issue #611, the live recurrence. `mempool_txids` is a
+    /// snapshot frozen at initial sync, so a parent the node accepted *after*
+    /// startup is not in it; classifying such a parent as "confirmed" let the
+    /// tx cache stand in for it and its child was admitted as a rootless
+    /// orphan. The live node-mempool mirror (`unfiltered_mempool.txs`) must be
+    /// consulted too.
+    ///
+    /// Modelled here in the state the field failure was observed in: the
+    /// parent was marked unavailable (its fetch raced a removal), the node
+    /// re-accepted it (so it is in the unfiltered mempool but not the enforced
+    /// one), and the child's dependency fetch has placed it in the tx cache.
+    #[test]
+    fn late_arriving_parent_not_masked_by_tx_cache() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let txid = tx.compute_txid();
+
+        // Post-snapshot world: the frozen snapshot knows neither tx. The
+        // parent is in the node's mempool (unfiltered mirror) but NOT the
+        // enforced mempool, and is marked unavailable from the earlier race.
+        let mempool_txids: HashSet<Txid> = HashSet::new();
+        inner.unfiltered_mempool.txs.insert(parent_txid);
+
+        let mut tx_cache = HashMap::new();
+        tx_cache.insert(parent_txid, parent);
+        tx_cache.insert(txid, tx);
 
         let mut blocks_needed = LinkedHashSet::new();
         let mut rejected_blocks = HashSet::new();
         let mut rejected_txs = HashSet::new();
         let request_queue = RequestQueue::default();
         let mut txs_needed = LinkedHashSet::new();
-        let mut unavailable_txs = HashSet::new();
+        let mut unavailable_txs = HashSet::from([parent_txid]);
 
         let sync_state = SyncStateBorrowedMut {
             blocks_needed: &mut blocks_needed,
@@ -1767,18 +1935,93 @@ mod tests {
             known_fees: &HashMap::new(),
             mempool_txids: &mempool_txids,
         };
-        let _ = try_add_tx_from_caches::<_, DefaultEnforcer>(
+        let _res = try_add_tx_from_caches::<_, DefaultEnforcer>(
             &mut inner, sync_state, txid,
         )
         .expect("add must not error");
 
-        // The child must not be in the enforced mempool while its unconfirmed
-        // mempool parent is absent from it — that is the closure break.
+        // The child must not be admitted while its (unconfirmed, re-accepted)
+        // parent is absent from the enforced mempool; it parks in the
+        // abandoned pool until the parent is admitted.
         assert!(
-            !(inner.mempool.txs.0.contains_key(&txid)
-                && !inner.mempool.txs.0.contains_key(&parent_txid)),
-            "child was admitted to the enforced mempool ahead of its unconfirmed \
-             mempool parent (parent absent) — a closure-broken template"
+            !inner.mempool.txs.0.contains_key(&txid),
+            "child was admitted to the enforced mempool although its \
+             unconfirmed node-mempool parent is absent from it — a \
+             closure-broken template (live #611 recurrence)"
+        );
+        assert!(
+            inner.abandoned_pool.contains(&txid),
+            "child should be parked in the abandoned pool until its parent \
+             is admitted"
+        );
+    }
+
+    /// A fresh `Added` sequence message must clear a stale `unavailable`
+    /// verdict: the verdict recorded that a fetch lost a race with a removal,
+    /// and the node re-announcing the tx means it is back. Leaving the verdict
+    /// in place skips the tx forever (`try_add_tx_from_caches` short-circuits
+    /// on it) while its descendants keep arriving. (issue #611)
+    #[test]
+    fn added_seq_message_clears_stale_unavailable_verdict() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+
+        let mut tx_cache = HashMap::new();
+        let mut blocks_needed = LinkedHashSet::new();
+        let mut rejected_blocks = HashSet::new();
+        let mut rejected_txs = HashSet::new();
+        let request_queue = RequestQueue::default();
+        let mut txs_needed = LinkedHashSet::new();
+        // Stale verdict from a fetch that raced the tx's earlier removal.
+        let mut unavailable_txs = HashSet::from([parent_txid]);
+
+        let seq_msg = SequenceMessage::TxHash(TxHashMessage {
+            txid: parent_txid,
+            event: TxHashEvent::Added,
+            mempool_seq: 1,
+            zmq_seq: 1,
+        });
+        let sync_state = SyncStateBorrowedMut {
+            blocks_needed: &mut blocks_needed,
+            rejected_blocks: &mut rejected_blocks,
+            rejected_txs: &mut rejected_txs,
+            request_queue: &request_queue,
+            tx_cache: &mut tx_cache,
+            txs_needed: &mut txs_needed,
+            unavailable_txs: &mut unavailable_txs,
+            known_fees: &HashMap::new(),
+            mempool_txids: &HashSet::new(),
+        };
+        let res = futures::executor::block_on(try_apply_seq_message::<
+            _,
+            DefaultEnforcer,
+        >(
+            &mut inner, sync_state, &seq_msg,
+        ))
+        .expect("applying Added must not error");
+
+        assert!(
+            !unavailable_txs.contains(&parent_txid),
+            "a fresh `Added` must clear the stale unavailable verdict"
+        );
+        // Not yet in the tx cache, so the tx is requested for fetch.
+        assert!(
+            matches!(res, ApplySyncActionResult::Pending),
+            "the re-announced tx should now be pending its fetch, not skipped"
         );
     }
 }
