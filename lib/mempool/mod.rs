@@ -615,14 +615,37 @@ impl Mempool {
                 Ok(())
             },
         )?;
+        // Direct children of this tx that were already in the mempool when it
+        // was inserted (i.e. inserted out-of-order, before their parent). Their
+        // `depends` was computed without this tx and must be backfilled below.
+        let direct_children: imbl::HashSet<Txid> =
+            self.tx_childs.0.get(&txid).cloned().unwrap_or_default();
         self.txs.descendants_mut(txid).skip(1).for_each(
             |(descendant_tx, descendant_info)| {
+                let descendant_txid = descendant_tx.compute_txid();
                 descendant_vsize += descendant_tx.vsize() as u64;
                 descendant_modified_weight = saturating_add_weight(
                     descendant_modified_weight,
                     descendant_info.modified_weight,
                 );
                 descendant_fees += descendant_info.fees.modified;
+                // The descendant's ancestor set now includes this tx, which
+                // changes its ancestor fee rate. Re-key it in
+                // `by_ancestor_fee_rate` (remove the stale key, insert the new
+                // one), mirroring what `remove` does in reverse. This only
+                // fires for out-of-order inserts (a topologically-ordered
+                // insert has no descendants yet); without it a later
+                // `remove`/`propose_txs` fails with `MissingByAncestorFeeRateKey`
+                // because the descendant's stored key no longer matches its
+                // stats. (issue #611)
+                let old_ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
+                self.by_ancestor_fee_rate
+                    .remove(old_ancestor_fee_rate, descendant_txid);
                 descendant_info.ancestor_vsize += vsize;
                 descendant_info.ancestor_modified_weight =
                     saturating_add_weight(
@@ -630,6 +653,22 @@ impl Mempool {
                         modified_weight,
                     );
                 descendant_info.fees.ancestor += modified_fee;
+                let new_ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
+                self.by_ancestor_fee_rate
+                    .insert(new_ancestor_fee_rate, descendant_txid);
+                // If this descendant spends one of the newly-inserted tx's
+                // outputs (a direct child) but was inserted before it, its
+                // `depends` never recorded the dependency. Backfill it, else it
+                // can be proposed ahead of / without its parent -> invalid
+                // template. (issue #611)
+                if direct_children.contains(&descendant_txid) {
+                    descendant_info.depends.insert(txid);
+                }
                 descendant_info.conflicts_with = descendant_info
                     .conflicts_with
                     .clone()
