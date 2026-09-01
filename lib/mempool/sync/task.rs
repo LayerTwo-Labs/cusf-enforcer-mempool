@@ -458,6 +458,12 @@ where
                 for (restored_txid, restored_tx) in
                     restored_txs.into_iter().rev()
                 {
+                    // The abandoned tx was recorded in the unfiltered mempool
+                    // when it was parked; left there, the re-insert below is
+                    // silently swallowed by the already-present short-circuit
+                    // in `try_add_tx_from_caches` and the tx is never
+                    // admitted. (issue #611)
+                    inner.unfiltered_mempool.txs.remove(&restored_txid);
                     sync_state.tx_cache.insert(restored_txid, restored_tx);
                     // Push to the front of the action queue, so that
                     // previously abandoned txs can be added into the mempool
@@ -525,6 +531,11 @@ where
             .into_iter()
             .rev()
         {
+            // Parked txs stay recorded in the unfiltered mempool; drop that
+            // record or the re-insert below is silently swallowed by the
+            // already-present short-circuit in `try_add_tx_from_caches` and
+            // the restored tx is never admitted. (issue #611)
+            inner.unfiltered_mempool.txs.remove(&restored_txid);
             sync_state.tx_cache.insert(restored_txid, restored_tx);
             sync_state
                 .action_queue
@@ -844,6 +855,17 @@ where
                 });
             if fetch_parents.is_empty() {
                 let mut push_txs_action_queue_front = queued_parents;
+                for parent_txid in &push_txs_action_queue_front {
+                    // A parent can linger in the unfiltered mempool without
+                    // any terminal state (it reached `Required`, so it is in
+                    // none of them) — e.g. a tx restored from the abandoned
+                    // pool that was never scrubbed from the unfiltered set.
+                    // Left in place, its requeued insert is swallowed by the
+                    // already-present short-circuit above and this tx requeues
+                    // the same parent forever. Scrub it so the insert makes
+                    // progress. (issue #611)
+                    inner.unfiltered_mempool.txs.remove(parent_txid);
+                }
                 push_txs_action_queue_front.push(txid);
                 return Ok(ApplySyncActionResult::Success {
                     push_txs_action_queue_front,
@@ -1953,6 +1975,61 @@ mod tests {
             inner.abandoned_pool.contains(&txid),
             "child should be parked in the abandoned pool until its parent \
              is admitted"
+        );
+    }
+
+    /// A parent can linger in the unfiltered mempool with no terminal state
+    /// and no enforced-mempool entry — the state a tx restored from the
+    /// abandoned pool was left in when the restore forgot to scrub the
+    /// unfiltered set (its queued re-insert was then swallowed by the
+    /// already-present short-circuit). A child resolving such a "ghost"
+    /// parent must scrub it and requeue its insert so both are admitted —
+    /// not requeue the same swallowed insert forever. (issue #611)
+    #[test]
+    fn ghost_unfiltered_parent_is_scrubbed_and_admitted() {
+        let genesis = BlockHash::all_zeros();
+        let (tip_watch, _) = watch::channel(genesis);
+        let mut inner = MempoolSyncInner {
+            abandoned_pool: AbandonedPool::default(),
+            enforcer: DefaultEnforcer,
+            mempool: Mempool::new(genesis),
+            tip_watch,
+            unfiltered_mempool: UnfilteredMempool {
+                tip: genesis,
+                txs: HashSet::new(),
+            },
+        };
+
+        // Confirmed funding tx -> ghost parent -> child.
+        let funding = make_tx(&[], &[150_000]);
+        let funding_txid = funding.compute_txid();
+        let parent = make_tx(&[OutPoint::new(funding_txid, 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let tx = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let txid = tx.compute_txid();
+
+        let mut tx_cache = HashMap::new();
+        tx_cache.insert(funding_txid, funding);
+        tx_cache.insert(parent_txid, parent);
+        tx_cache.insert(txid, tx);
+
+        // The ghost state: in the unfiltered mempool, in no terminal state,
+        // absent from the enforced mempool.
+        inner.unfiltered_mempool.txs.insert(parent_txid);
+
+        // Post-snapshot world.
+        let mempool_txids: HashSet<Txid> = HashSet::new();
+
+        drive_add(&mut inner, &mut tx_cache, &mempool_txids, txid);
+
+        assert!(
+            inner.mempool.txs.0.contains_key(&parent_txid),
+            "ghost parent should be scrubbed from the unfiltered set and \
+             admitted (a swallowed insert here spins the requeue forever)"
+        );
+        assert!(
+            inner.mempool.txs.0.contains_key(&txid),
+            "child should be admitted after its parent"
         );
     }
 
