@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use bitcoin::{Amount, BlockHash, Transaction, Txid, Weight};
+use bitcoin::{Amount, BlockHash, OutPoint, Transaction, Txid, Weight};
 use bitcoin_jsonrpsee::client::BlockTemplateTransaction;
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use imbl::{OrdMap, OrdSet, ordmap};
@@ -815,6 +815,25 @@ impl Mempool {
         Ok(res)
     }
 
+    /// Txids of mempool txs spending the given outpoint.
+    pub(crate) fn spenders_of(&self, outpoint: &OutPoint) -> Vec<Txid> {
+        let Some(childs) = self.tx_childs.0.get(&outpoint.txid) else {
+            return Vec::new();
+        };
+        childs
+            .iter()
+            .filter(|child_txid| {
+                self.txs.0.get(*child_txid).is_some_and(|(child_tx, _)| {
+                    child_tx
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == *outpoint)
+                })
+            })
+            .copied()
+            .collect()
+    }
+
     /// Retain txs for which the provided closure returns `true`.
     /// The closure's second argument is the in-mempool input txs for the
     /// transaction.
@@ -1101,6 +1120,50 @@ mod tests {
     /// `propose_txs` then either errors with `MissingByAncestorFeeRateKey` or
     /// emits the child ahead of — or without — its parent, yielding a template
     /// that mines to a block rejected `bad-txns-inputs-missingorspent`.
+    /// Regression for issue #611 (the stale-template half). When a block
+    /// confirms a tx, mempool txs spending the same outpoint (RBF variants /
+    /// double-spends) are evicted by the node WITHOUT a removal sequence
+    /// message; `spenders_of` is what the sync layer uses to find and evict
+    /// them locally at block connect, together with their descendants.
+    #[test]
+    fn spenders_of_finds_conflicting_spender() {
+        let mut mempool = test_mempool();
+
+        let funding_outpoint = OutPoint::new(Txid::all_zeros(), 0);
+        // A spends the funding outpoint; C spends A's output 0.
+        let tx_a = make_tx(&[funding_outpoint], 1);
+        let txid_a = tx_a.compute_txid();
+        let tx_c = make_tx(&[OutPoint::new(txid_a, 0)], 1);
+        let txid_c = tx_c.compute_txid();
+        // B spends an unrelated outpoint of the same funding tx.
+        let tx_b = make_tx(&[OutPoint::new(Txid::all_zeros(), 1)], 1);
+        let txid_b = tx_b.compute_txid();
+
+        for tx in [tx_a, tx_c, tx_b] {
+            let weight = tx.weight();
+            mempool
+                .insert(tx, Amount::from_sat(1000), OrdSet::new(), weight)
+                .unwrap();
+        }
+
+        // Only A spends the funding outpoint itself.
+        assert_eq!(mempool.spenders_of(&funding_outpoint), vec![txid_a]);
+        assert_eq!(
+            mempool.spenders_of(&OutPoint::new(Txid::all_zeros(), 7)),
+            Vec::<Txid>::new()
+        );
+
+        // The sweep at block connect: a confirmed tx consumed the funding
+        // outpoint, so A and its descendant C must go; B stays.
+        let removed = mempool.remove_with_descendants(&txid_a).unwrap();
+        assert!(removed.contains_key(&txid_a));
+        assert!(removed.contains_key(&txid_c));
+        assert!(!mempool.txs.0.contains_key(&txid_a));
+        assert!(!mempool.txs.0.contains_key(&txid_c));
+        assert!(mempool.txs.0.contains_key(&txid_b));
+        assert_eq!(mempool.spenders_of(&funding_outpoint), Vec::<Txid>::new());
+    }
+
     #[test]
     fn out_of_order_insert_yields_valid_template() {
         let mut mempool = test_mempool();

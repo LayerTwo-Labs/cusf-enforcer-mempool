@@ -282,7 +282,11 @@ where
         .map_err(cusf_enforcer::Error::ConnectBlock)?
     {
         ConnectBlockAction::Accept { remove_mempool_txs } => {
-            let mut mined_txids = HashSet::new();
+            let mined_txids: HashSet<Txid> = block_decoded
+                .txdata
+                .iter()
+                .map(Transaction::compute_txid)
+                .collect();
             for tx in block_decoded.txdata {
                 let txid = tx.compute_txid();
                 let _removed: Option<_> = inner.mempool.remove(&txid)?;
@@ -290,8 +294,37 @@ where
                 sync_state
                     .request_queue
                     .remove(&RequestItem::Tx(txid, true));
+                // Evict mempool txs that conflict with this confirmed tx:
+                // they spend an outpoint it just consumed. The node evicts
+                // them at block connect WITHOUT emitting a removal sequence
+                // message, so without this sweep they linger in the enforced
+                // mempool and every template they land in mines to
+                // `bad-txns-inputs-missingorspent` (issue #611, the
+                // stale-template half). Their descendants go with them — the
+                // output they spend no longer exists. Txs mined in this same
+                // block are skipped: they were removed above, and their
+                // still-unconfirmed descendants remain valid.
+                for input in &tx.input {
+                    for spender in
+                        inner.mempool.spenders_of(&input.previous_output)
+                    {
+                        if mined_txids.contains(&spender) {
+                            continue;
+                        }
+                        for (removed_txid, _removed_tx) in
+                            inner.mempool.remove_with_descendants(&spender)?
+                        {
+                            tracing::debug!(
+                                %removed_txid,
+                                conflicts_with = %txid,
+                                block_hash = %block.hash,
+                                "removed tx conflicting with confirmed tx",
+                            );
+                            inner.unfiltered_mempool.txs.remove(&removed_txid);
+                        }
+                    }
+                }
                 sync_state.tx_cache.insert(txid, tx);
-                mined_txids.insert(txid);
             }
             for txid in remove_mempool_txs {
                 inner.mempool.remove_with_descendants(&txid)?;
