@@ -1012,4 +1012,130 @@ mod tests {
 
         assert!(result.is_ok(), "insert failed: {result:?}");
     }
+
+    /// Assert that a block template is a valid block order: every tx that spends
+    /// the output of another *in-mempool* (unconfirmed) tx must (a) have that
+    /// parent present in the template, and (b) appear strictly after it.
+    /// A miner that violates either produces a block rejected with
+    /// `bad-txns-inputs-missingorspent`.
+    fn assert_template_topologically_valid(
+        template: &[BlockTemplateTransaction],
+        mempool: &Mempool,
+    ) {
+        let position: HashMap<Txid, usize> = template
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.txid, i))
+            .collect();
+        for (i, t) in template.iter().enumerate() {
+            let tx: Transaction = bitcoin::consensus::deserialize(&t.data)
+                .expect("template tx data did not deserialize");
+            for input in &tx.input {
+                let parent = input.previous_output.txid;
+                // Only in-mempool parents matter; anything else is assumed
+                // confirmed on-chain.
+                if !mempool.txs.0.contains_key(&parent) {
+                    continue;
+                }
+                let parent_pos = position.get(&parent).unwrap_or_else(|| {
+                    panic!(
+                        "template not closed: tx {} (pos {i}) spends in-mempool \
+                         parent {parent}, which is absent from the template",
+                        t.txid
+                    )
+                });
+                assert!(
+                    *parent_pos < i,
+                    "template out of order: tx {} at pos {i} spends parent \
+                     {parent} at pos {parent_pos}",
+                    t.txid
+                );
+            }
+        }
+    }
+
+    /// Regression for the silent invalid-template bug (issue #611). When a child
+    /// tx is inserted BEFORE its parent (out-of-order mempool sync, routine
+    /// under RBF churn / batched-fetch gaps), the child's `depends` set is
+    /// computed once at insert time and never learns about the later-arriving
+    /// parent, and the descendant's `by_ancestor_fee_rate` key is left stale.
+    /// `propose_txs` then either errors with `MissingByAncestorFeeRateKey` or
+    /// emits the child ahead of — or without — its parent, yielding a template
+    /// that mines to a block rejected `bad-txns-inputs-missingorspent`.
+    #[test]
+    fn out_of_order_insert_yields_valid_template() {
+        let mut mempool = test_mempool();
+
+        // parent P (spends a confirmed output), child A (spends P's output 0).
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+
+        // Insert the CHILD first, then the PARENT.
+        let child_weight = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), child_weight)
+            .unwrap();
+        let parent_weight = parent.weight();
+        mempool
+            .insert(
+                parent,
+                Amount::from_sat(1000),
+                OrdSet::new(),
+                parent_weight,
+            )
+            .unwrap();
+
+        let template = mempool
+            .propose_txs(None)
+            .expect("propose_txs returned an error");
+        assert_template_topologically_valid(&template, &mempool);
+    }
+
+    /// Multi-level variant: a 3-tx chain (grandparent -> parent -> child)
+    /// inserted in FULLY REVERSED order (child, then parent, then grandparent).
+    /// Each late-arriving ancestor must re-key every descendant's
+    /// `by_ancestor_fee_rate` entry and backfill its direct child's `depends`,
+    /// so the proposed template still lists all three in a valid block order —
+    /// exercising the fix across more than one dependency level.
+    #[test]
+    fn out_of_order_insert_chain_yields_valid_template() {
+        let mut mempool = test_mempool();
+
+        // chain: grandparent G (confirmed input) <- parent P <- child C.
+        let grandparent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let grandparent_txid = grandparent.compute_txid();
+        let parent = make_tx(&[OutPoint::new(grandparent_txid, 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+
+        // Insert fully reversed: CHILD, then PARENT, then GRANDPARENT.
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = parent.weight();
+        mempool
+            .insert(parent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = grandparent.weight();
+        mempool
+            .insert(grandparent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+
+        let template = mempool
+            .propose_txs(None)
+            .expect("propose_txs returned an error");
+        assert_template_topologically_valid(&template, &mempool);
+        // The whole chain must be proposed — none silently dropped.
+        let ids: std::collections::HashSet<Txid> =
+            template.iter().map(|t| t.txid).collect();
+        assert!(
+            ids.contains(&grandparent_txid)
+                && ids.contains(&parent_txid)
+                && ids.contains(&child_txid),
+            "template is missing part of the chain: {ids:?}"
+        );
+    }
 }
