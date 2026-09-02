@@ -237,6 +237,26 @@ fn check_mempool_seq(
                 *next_mempool_seq =
                     Some(NextMempoolSeq::Equal(mempool_seq + 1));
                 Ok(Some(msg))
+            } else if mempool_seq > next_seq {
+                // A forward jump is NOT evidence of a dropped message: a block
+                // connect removes mined txs, each of which advances the node's
+                // mempool sequence with no message published, and bitcoind
+                // publishes removals that follow the block (e.g. conflict
+                // evictions) BEFORE the block's own `C` message. Waiting for
+                // that `C` to move us into `AtLeast` would be too late — the
+                // jump reaches us first. Dropped messages are detected by the
+                // per-topic zmq sequence in `check_zmq_seq`, which is
+                // contiguous across every published message; so accept the
+                // jump and re-anchor. (bip300301_enforcer#610)
+                tracing::debug!(
+                    expected = next_seq,
+                    received = mempool_seq,
+                    "mempool sequence jumped forward; treating as block-removed \
+                     txs, not a dropped message",
+                );
+                *next_mempool_seq =
+                    Some(NextMempoolSeq::Equal(mempool_seq + 1));
+                Ok(Some(msg))
             } else {
                 let err = SequenceStreamError::MissingMempoolSequence(next_seq);
                 Err(err)
@@ -379,4 +399,117 @@ pub async fn subscribe_sequence<'a>(
     })
     .boxed();
     Ok(SequenceStream(inner))
+}
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::{BlockHash, Txid, hashes::Hash as _};
+
+    use super::*;
+
+    fn tx(
+        event: TxHashEvent,
+        mempool_seq: u64,
+        zmq_seq: u32,
+    ) -> SequenceMessage {
+        SequenceMessage::TxHash(TxHashMessage {
+            txid: Txid::all_zeros(),
+            event,
+            mempool_seq,
+            zmq_seq,
+        })
+    }
+
+    fn block(event: BlockHashEvent, zmq_seq: u32) -> SequenceMessage {
+        SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash: BlockHash::all_zeros(),
+            event,
+            zmq_seq,
+        })
+    }
+
+    /// Replays the exact publish order captured from a live bitcoind at a
+    /// block connect (bip300301_enforcer#610): the removals that follow the
+    /// block are published, numbered past the silently block-removed txs,
+    /// BEFORE the block's own `C` message. The zmq sequence is contiguous —
+    /// nothing was dropped — so the stream must not error.
+    #[test]
+    fn forward_mempool_seq_jump_before_block_connect_is_not_a_drop() {
+        let mut next_mempool = None;
+        let mut next_zmq = None;
+        let msgs = [
+            tx(TxHashEvent::Added, 66956, 34040),
+            tx(TxHashEvent::Removed, 67431, 34041),
+            block(BlockHashEvent::Connected, 34042),
+            tx(TxHashEvent::Added, 67580, 34043),
+            tx(TxHashEvent::Added, 67581, 34044),
+        ];
+        for msg in msgs {
+            let res = check_seq_numbers(&mut next_mempool, &mut next_zmq, msg);
+            assert!(
+                res.is_ok(),
+                "stream must accept the block-removal jump: {res:?}"
+            );
+            assert!(res.unwrap().is_some(), "no message here is a duplicate");
+        }
+    }
+
+    /// A real drop still surfaces through the zmq sequence.
+    #[test]
+    fn zmq_seq_gap_is_still_detected() {
+        let mut next_mempool = None;
+        let mut next_zmq = None;
+        assert!(
+            check_seq_numbers(
+                &mut next_mempool,
+                &mut next_zmq,
+                tx(TxHashEvent::Added, 10, 100)
+            )
+            .is_ok()
+        );
+        let res = check_seq_numbers(
+            &mut next_mempool,
+            &mut next_zmq,
+            tx(TxHashEvent::Added, 11, 102),
+        );
+        assert!(
+            matches!(res, Err(SequenceStreamError::MissingZmqSequence(101))),
+            "{res:?}"
+        );
+    }
+
+    /// Duplicates (same mempool seq re-sent) are still ignored, and a
+    /// backwards mempool sequence is still an error.
+    #[test]
+    fn duplicate_and_backwards_mempool_seq_behaviour_unchanged() {
+        let mut next_mempool = None;
+        let mut next_zmq = None;
+        assert!(
+            check_seq_numbers(
+                &mut next_mempool,
+                &mut next_zmq,
+                tx(TxHashEvent::Added, 10, 1)
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            check_seq_numbers(
+                &mut next_mempool,
+                &mut next_zmq,
+                tx(TxHashEvent::Added, 10, 2)
+            )
+            .unwrap()
+            .is_none()
+        );
+        let res = check_seq_numbers(
+            &mut next_mempool,
+            &mut next_zmq,
+            tx(TxHashEvent::Added, 5, 3),
+        );
+        assert!(
+            matches!(res, Err(SequenceStreamError::MissingMempoolSequence(11))),
+            "{res:?}"
+        );
+    }
 }
