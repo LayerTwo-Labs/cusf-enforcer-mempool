@@ -332,6 +332,7 @@ where
 async fn handle_disconnected_block<Enforcer, BorrowedEnforcer>(
     inner: &mut MempoolSyncInner<Enforcer>,
     blocks_needed: &mut LinkedHashSet<BlockHash>,
+    rejected_txs: &mut HashSet<Txid>,
     request_queue: &RequestQueue,
     block: &bitcoin_jsonrpsee::client::Block<true>,
 ) -> Result<bool, SyncTaskError<BorrowedEnforcer>>
@@ -373,7 +374,19 @@ where
             .await
             .map_err(cusf_enforcer::Error::DisconnectBlock)?;
         for txid in remove_mempool_txs {
-            inner.mempool.remove_with_descendants(&txid)?;
+            let removed = inner.mempool.remove_with_descendants(&txid)?;
+            let rejected: LinkedHashSet<Txid> = std::iter::once(txid)
+                .chain(removed.into_iter().map(|(txid, _tx)| txid))
+                .collect();
+            for txid in rejected {
+                tracing::trace!(
+                    %txid,
+                    block_hash = %block.hash,
+                    "deprioritizing tx removed by disconnected block",
+                );
+                rejected_txs.insert(txid);
+                request_queue.push_front(RequestItem::RejectTx(txid));
+            }
         }
         inner.mempool.chain.tip = prev_blockhash;
         let _prev: BlockHash = inner.tip_watch.send_replace(prev_blockhash);
@@ -572,6 +585,7 @@ where
             if handle_disconnected_block(
                 inner,
                 &mut sync_state.blocks_needed,
+                &mut sync_state.rejected_txs,
                 &sync_state.request_queue,
                 &resp_block,
             )
@@ -934,6 +948,7 @@ where
             let applied = handle_disconnected_block(
                 inner,
                 sync_state.blocks_needed,
+                sync_state.rejected_txs,
                 sync_state.request_queue,
                 &block,
             )

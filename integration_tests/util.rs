@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
@@ -8,9 +8,10 @@ use std::{
 
 use anyhow::anyhow;
 use base64::Engine as _;
-use bitcoin::{Address, BlockHash, Txid};
+use bitcoin::{Address, BlockHash, OutPoint, Transaction, Txid};
 use bitcoin_jsonrpsee::{
     MainClient as _,
+    client::BlockTemplateTransaction,
     jsonrpsee::{
         core::{ClientError, client::ClientT},
         http_client::{HeaderMap, HeaderValue, HttpClient, HttpClientBuilder},
@@ -353,6 +354,220 @@ pub async fn prioritised_txids(
     res.keys()
         .map(|s| s.parse::<Txid>().map_err(anyhow::Error::from))
         .collect()
+}
+
+/// `gettxout` — `true` if the node holds the output, unspent.
+///
+/// Template checks must pass `include_mempool = false`: with the mempool
+/// included an output reads as spent by the very child being checked.
+pub async fn txout_exists(
+    rpc: &RpcClient,
+    outpoint: OutPoint,
+    include_mempool: bool,
+) -> anyhow::Result<bool> {
+    let res: serde_json::Value = rpc
+        .request(
+            "gettxout",
+            rpc_params![
+                outpoint.txid.to_string(),
+                outpoint.vout,
+                include_mempool
+            ],
+        )
+        .await?;
+    Ok(!res.is_null())
+}
+
+/// The test wallet's own spendable outputs of `txid`, as
+/// `(outpoint, amount_sat)`. `minconf = 0`, so an unconfirmed parent counts.
+pub async fn wallet_outputs_of(
+    rpc: &RpcClient,
+    txid: Txid,
+) -> anyhow::Result<Vec<(OutPoint, u64)>> {
+    #[derive(serde::Deserialize)]
+    struct Unspent {
+        txid: String,
+        vout: u32,
+        amount: f64,
+    }
+    let unspent: Vec<Unspent> =
+        rpc.request("listunspent", rpc_params![0]).await?;
+    unspent
+        .into_iter()
+        .filter(|u| u.txid == txid.to_string())
+        .map(|u| {
+            let outpoint = OutPoint { txid, vout: u.vout };
+            let sats = (u.amount * 100_000_000.0).round() as u64;
+            Ok((outpoint, sats))
+        })
+        .collect()
+}
+
+/// Build, sign and broadcast a tx spending exactly `outpoint`, paying the rest
+/// to a fresh wallet address after `fee_sat`.
+///
+/// Not `sendtoaddress`: the wallet picks its own inputs, so it gives no
+/// guarantee the new tx spends the parent under test.
+pub async fn spend_output(
+    rpc: &RpcClient,
+    outpoint: OutPoint,
+    value_sat: u64,
+    fee_sat: u64,
+) -> anyhow::Result<Txid> {
+    anyhow::ensure!(
+        value_sat > fee_sat,
+        "{outpoint} holds {value_sat} sat, too little for a {fee_sat} sat fee"
+    );
+    let dest = get_new_address(rpc).await?;
+    let amount_btc =
+        format!("{:.8}", ((value_sat - fee_sat) as f64) / 100_000_000.0);
+    let inputs = serde_json::json!([{
+        "txid": outpoint.txid.to_string(),
+        "vout": outpoint.vout,
+    }]);
+    let outputs = serde_json::json!([{ dest.to_string(): amount_btc }]);
+    let raw: String = rpc
+        .request("createrawtransaction", rpc_params![inputs, outputs])
+        .await?;
+
+    #[derive(serde::Deserialize)]
+    struct Signed {
+        hex: String,
+        complete: bool,
+    }
+    let signed: Signed = rpc
+        .request("signrawtransactionwithwallet", rpc_params![raw])
+        .await?;
+    anyhow::ensure!(
+        signed.complete,
+        "signrawtransactionwithwallet could not fully sign a spend of \
+         {outpoint}"
+    );
+    let txid: String = rpc
+        .request("sendrawtransaction", rpc_params![signed.hex])
+        .await?;
+    Ok(txid.parse()?)
+}
+
+/// Spend `parent`'s first wallet-owned output, producing a direct child.
+pub async fn submit_child_of(
+    rpc: &RpcClient,
+    parent: Txid,
+    fee_sat: u64,
+) -> anyhow::Result<Txid> {
+    let (outpoint, value_sat) = wallet_outputs_of(rpc, parent)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow!("{parent} has no wallet-owned output to spend")
+        })?;
+    spend_output(rpc, outpoint, value_sat, fee_sat).await
+}
+
+/// Distinct reasons the node would answer `bad-txns-inputs-missingorspent`,
+/// kept apart so a failing test names the shape of corruption it caught.
+#[derive(Clone, Debug)]
+pub enum TemplateViolation {
+    /// Spends an output that neither an earlier template tx creates, nor the
+    /// chain holds unspent.
+    MissingInput { tx: Txid, input: OutPoint },
+    DoubleSpend {
+        tx: Txid,
+        conflicts_with: Txid,
+        input: OutPoint,
+    },
+    /// Mining it again double-spends its own inputs.
+    AlreadyConfirmed { tx: Txid },
+}
+
+impl std::fmt::Display for TemplateViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingInput { tx, input } => write!(
+                f,
+                "{tx} spends {input}, which is neither created earlier in the \
+                 template nor an unspent chain output"
+            ),
+            Self::DoubleSpend {
+                tx,
+                conflicts_with,
+                input,
+            } => write!(
+                f,
+                "{tx} spends {input}, already spent by {conflicts_with}"
+            ),
+            Self::AlreadyConfirmed { tx } => {
+                write!(f, "{tx} is already confirmed on chain")
+            }
+        }
+    }
+}
+
+/// Check a block template the way the node will at `submitblock`: every input
+/// must be created by an earlier template tx, or held unspent by the chain.
+///
+/// Reads prevouts out of each tx's own bytes rather than trusting `depends`,
+/// which a dangling entry never shortens — it fails the whole `propose_txs`
+/// call instead, so a `depends`-based check reads clean when it matters most.
+pub async fn template_violations(
+    rpc: &RpcClient,
+    template: &[BlockTemplateTransaction],
+) -> anyhow::Result<Vec<TemplateViolation>> {
+    let mut violations = Vec::new();
+    let mut created = HashSet::<Txid>::new();
+    let mut spent = HashMap::<OutPoint, Txid>::new();
+    for entry in template {
+        let tx: Transaction = bitcoin::consensus::deserialize(&entry.data)
+            .map_err(|err| {
+                anyhow!("template entry {} is not a tx: {err}", entry.txid)
+            })?;
+        // Needs its own check: a confirmed tx's parents may still be unspent,
+        // so it trips none of the input checks below.
+        if tx_is_confirmed(rpc, entry.txid).await? {
+            violations
+                .push(TemplateViolation::AlreadyConfirmed { tx: entry.txid });
+        }
+        for input in &tx.input {
+            let outpoint = input.previous_output;
+            if let Some(conflicts_with) = spent.insert(outpoint, entry.txid) {
+                violations.push(TemplateViolation::DoubleSpend {
+                    tx: entry.txid,
+                    conflicts_with,
+                    input: outpoint,
+                });
+                continue;
+            }
+            if created.contains(&outpoint.txid) {
+                continue;
+            }
+            if !txout_exists(rpc, outpoint, false).await? {
+                violations.push(TemplateViolation::MissingInput {
+                    tx: entry.txid,
+                    input: outpoint,
+                });
+            }
+        }
+        created.insert(entry.txid);
+    }
+    Ok(violations)
+}
+
+/// Whether the node reports `txid` as confirmed. Relies on `-txindex`, which
+/// the test node runs with.
+async fn tx_is_confirmed(rpc: &RpcClient, txid: Txid) -> anyhow::Result<bool> {
+    let res: serde_json::Value = match rpc
+        .request("getrawtransaction", rpc_params![txid.to_string(), true])
+        .await
+    {
+        Ok(res) => res,
+        // Unknown to the node entirely; not a confirmation claim.
+        Err(_) => return Ok(false),
+    };
+    Ok(res
+        .get("confirmations")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|confirmations| confirmations > 0))
 }
 
 #[derive(Clone, Debug)]
