@@ -5,6 +5,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use bitcoin::{Address, BlockHash, Txid};
+use bitcoin_jsonrpsee::client::BlockTemplateTransaction;
 use cusf_enforcer_mempool::{
     cusf_enforcer::CusfEnforcer,
     mempool::{self, MempoolSync, SyncTaskError},
@@ -388,6 +389,23 @@ impl TestSetup {
 }
 
 // --- Free fns over `&MempoolSync<E>` (used by tests with non-Mock enforcers). ---
+
+/// The block template the local mempool would serve, errors and all.
+///
+/// [`local_mempool_txids`] turns a failed `propose_txs` into an empty set,
+/// which is how "the GBT RPC would answer an internal error" reads as "the
+/// mempool is empty". Tests asserting on contents need to tell them apart.
+pub async fn local_block_template<E>(
+    sync: &MempoolSync<E>,
+) -> anyhow::Result<Vec<BlockTemplateTransaction>>
+where
+    E: CusfEnforcer + Send + Sync + 'static,
+{
+    sync.with(|mempool, _| Box::pin(async move { mempool.propose_txs(None) }))
+        .await
+        .ok_or_else(|| anyhow::anyhow!("mempool sync task is not running"))?
+        .map_err(|err| anyhow::Error::new(err).context("propose_txs"))
+}
 
 pub async fn local_mempool_txids<E>(sync: &MempoolSync<E>) -> HashSet<Txid>
 where
