@@ -1073,12 +1073,25 @@ where
             mempool_seq: _,
             zmq_seq: _,
         }) => {
-            // The node (re-)announced this tx, so any earlier `unavailable`
-            // verdict (a fetch that lost a race with a removal) is stale.
-            // Clearing it lets the tx be fetched and admitted this time;
-            // leaving it would skip the tx forever while its descendants keep
-            // arriving — and being admitted around it. (issue #611)
-            sync_state.unavailable_txs.remove(txid);
+            // Do NOT clear `unavailable_txs` here. The stale-verdict clearing
+            // that issue #611 needs — "the node re-announced this tx, so an
+            // earlier `unavailable` verdict is stale" — already happens exactly
+            // once, at *arrival*, in `handle_tx_hash_msg` (which also queues
+            // the fresh fetch and restores abandoned descendants).
+            //
+            // This apply path is different: the same queued `Added` action is
+            // re-applied on every drive while its fetch is pending
+            // (`try_add_tx_from_caches` returns `Pending` without popping it).
+            // Clearing the mark here re-ran on each of those re-applications,
+            // which removed the only terminal state a genuinely-gone tx has:
+            // when the fetch lost a race with a removal (an ordinary RBF while
+            // `getrawtransaction` was in flight), `handle_resp` marked the tx
+            // unavailable, the re-drive re-applied this action, this line
+            // un-marked it, the tx was re-fetched, the fetch failed the same
+            // way, and round it went — a silent livelock that admitted nothing
+            // and flooded the node with `getrawtransaction`. Leaving the mark
+            // intact lets the re-application terminate on the `unavailable`
+            // branch of `try_add_tx_from_caches` instead.
             try_add_tx_from_caches(inner, sync_state, *txid)
         }
         SequenceMessage::TxHash(TxHashMessage {
@@ -2087,16 +2100,29 @@ mod tests {
         );
     }
 
-    /// A fresh `Added` sequence message must clear a stale `unavailable`
-    /// verdict: the verdict recorded that a fetch lost a race with a removal,
-    /// and the node re-announcing the tx means it is back. Leaving the verdict
-    /// in place skips the tx forever (`try_add_tx_from_caches` short-circuits
-    /// on it) while its descendants keep arriving. (issue #611)
-    #[test]
-    fn added_seq_message_clears_stale_unavailable_verdict() {
+    /// A fresh, freshly-empty `SyncState` past initial sync, so every
+    /// sequence message is processed rather than dropped by the
+    /// `first_mempool_sequence` gate.
+    fn fresh_sync_state() -> SyncState {
+        SyncState {
+            action_queue: SyncActionQueue::default(),
+            blocks_needed: LinkedHashSet::new(),
+            first_mempool_sequence: None,
+            rejected_blocks: HashSet::new(),
+            rejected_txs: HashSet::new(),
+            request_queue: RequestQueue::default(),
+            tx_cache: HashMap::new(),
+            txs_needed: LinkedHashSet::new(),
+            unavailable_txs: HashSet::new(),
+            known_fees: HashMap::new(),
+            mempool_txids: HashSet::new(),
+        }
+    }
+
+    fn fresh_inner() -> MempoolSyncInner<DefaultEnforcer> {
         let genesis = BlockHash::all_zeros();
         let (tip_watch, _) = watch::channel(genesis);
-        let mut inner = MempoolSyncInner {
+        MempoolSyncInner {
             abandoned_pool: AbandonedPool::default(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
@@ -2105,54 +2131,162 @@ mod tests {
                 tip: genesis,
                 txs: HashSet::new(),
             },
-        };
+        }
+    }
 
+    fn is_fetch_queued(sync_state: &SyncState, txid: Txid) -> bool {
+        sync_state
+            .request_queue
+            .inner
+            .queue
+            .lock()
+            .contains(&RequestItem::Tx(txid, true))
+    }
+
+    /// A fresh `Added` sequence message must clear a stale `unavailable`
+    /// verdict: the verdict recorded that a fetch lost a race with a removal,
+    /// and the node re-announcing the tx means it is back. Leaving the verdict
+    /// in place skips the tx forever (`try_add_tx_from_caches` short-circuits
+    /// on it) while its descendants keep arriving. (issue #611)
+    ///
+    /// The clear belongs at *arrival* (`handle_tx_hash_msg`), which runs
+    /// exactly once per message — NOT in the apply path, which re-runs for the
+    /// same queued action on every drive while its fetch is pending. An earlier
+    /// version of this test asserted the apply-path clear directly and drove a
+    /// single round, so it could never observe the livelock that clear caused
+    /// (see `readded_tx_that_loses_fetch_race_terminates_not_livelocks`).
+    #[test]
+    fn added_seq_message_clears_stale_unavailable_verdict() {
+        let mut inner = fresh_inner();
         let parent =
             make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
         let parent_txid = parent.compute_txid();
 
-        let mut tx_cache = HashMap::new();
-        let mut blocks_needed = LinkedHashSet::new();
-        let mut rejected_blocks = HashSet::new();
-        let mut rejected_txs = HashSet::new();
-        let request_queue = RequestQueue::default();
-        let mut txs_needed = LinkedHashSet::new();
+        let mut sync_state = fresh_sync_state();
         // Stale verdict from a fetch that raced the tx's earlier removal.
-        let mut unavailable_txs = HashSet::from([parent_txid]);
+        sync_state.unavailable_txs.insert(parent_txid);
 
-        let seq_msg = SequenceMessage::TxHash(TxHashMessage {
-            txid: parent_txid,
-            event: TxHashEvent::Added,
-            mempool_seq: 1,
-            zmq_seq: 1,
-        });
-        let sync_state = SyncStateBorrowedMut {
-            blocks_needed: &mut blocks_needed,
-            rejected_blocks: &mut rejected_blocks,
-            rejected_txs: &mut rejected_txs,
-            request_queue: &request_queue,
-            tx_cache: &mut tx_cache,
-            txs_needed: &mut txs_needed,
-            unavailable_txs: &mut unavailable_txs,
-            known_fees: &HashMap::new(),
-            mempool_txids: &mut HashSet::new(),
-        };
-        let res = futures::executor::block_on(try_apply_seq_message::<
-            _,
-            DefaultEnforcer,
-        >(
-            &mut inner, sync_state, &seq_msg,
-        ))
-        .expect("applying Added must not error");
+        handle_tx_hash_msg::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            TxHashMessage {
+                txid: parent_txid,
+                event: TxHashEvent::Added,
+                mempool_seq: 1,
+                zmq_seq: 1,
+            },
+        )
+        .expect("an Added arrival must not error");
 
         assert!(
-            !unavailable_txs.contains(&parent_txid),
-            "a fresh `Added` must clear the stale unavailable verdict"
+            !sync_state.unavailable_txs.contains(&parent_txid),
+            "a fresh `Added` arrival must clear the stale unavailable verdict"
         );
-        // Not yet in the tx cache, so the tx is requested for fetch.
         assert!(
-            matches!(res, ApplySyncActionResult::Pending),
-            "the re-announced tx should now be pending its fetch, not skipped"
+            sync_state.txs_needed.contains(&parent_txid),
+            "the re-announced tx is needed again"
+        );
+        assert!(
+            is_fetch_queued(&sync_state, parent_txid),
+            "arrival must queue a fresh fetch so the tx can be admitted"
+        );
+    }
+
+    /// Regression for the livelock found reviewing the #611 fix
+    /// (LayerTwo-Labs/cusf-enforcer-mempool#114): a tx whose fetch loses the
+    /// race with a removal — an ordinary RBF landing while `getrawtransaction`
+    /// is in flight — must reach a terminal state, not be re-fetched forever.
+    ///
+    /// The queued `Added` action parks `Pending` while its fetch is out. When
+    /// the fetch comes back `unavailable`, `handle_resp` marks the tx and
+    /// re-drives the queue, re-applying that same action. Clearing the mark on
+    /// re-application (as the apply path once did) removed the only terminal
+    /// state a gone tx has: the tx was un-marked, re-fetched, failed the same
+    /// way, and round it went — silently, with `task_errors` empty and the
+    /// node under a sustained `getrawtransaction` flood. This drives that
+    /// second round and requires it to terminate.
+    #[test]
+    fn readded_tx_that_loses_fetch_race_terminates_not_livelocks() {
+        let mut inner = fresh_inner();
+        let tx = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let txid = tx.compute_txid();
+        let mut sync_state = fresh_sync_state();
+
+        // 1. The node announces the tx: arrival queues its fetch + the action.
+        handle_seq_message::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            SequenceMessage::TxHash(TxHashMessage {
+                txid,
+                event: TxHashEvent::Added,
+                mempool_seq: 1,
+                zmq_seq: 1,
+            }),
+        )
+        .expect("an Added arrival must not error");
+        assert!(!sync_state.action_queue.is_empty());
+
+        // 2. First drive: not cached yet, so the action parks Pending at the
+        //    head of the queue with its fetch outstanding.
+        let applied =
+            futures::executor::block_on(try_apply_next_sync_action::<
+                _,
+                DefaultEnforcer,
+            >(
+                &mut inner, &mut sync_state
+            ))
+            .expect("the first drive must not error");
+        assert!(
+            !applied,
+            "not yet fetchable: the Added action must park Pending"
+        );
+        assert!(
+            !sync_state.action_queue.is_empty(),
+            "a Pending action stays at the head of the queue"
+        );
+
+        // 3. The fetch loses the race with a removal (RBF'd while in flight).
+        //    This is exactly what `handle_resp` records for a
+        //    `BatchTx { unavailable }` result. The dispatched request has left
+        //    the queue, so a re-queued fetch below would be detectable.
+        sync_state.txs_needed.remove(&txid);
+        sync_state.unavailable_txs.insert(txid);
+        sync_state
+            .request_queue
+            .remove(&RequestItem::Tx(txid, true));
+
+        // 4. Re-drive, as `handle_resp` does after recording the result. With
+        //    the apply-path clear this un-marked the tx, re-queued its fetch,
+        //    and parked Pending again — forever. It must terminate instead.
+        let applied =
+            futures::executor::block_on(try_apply_next_sync_action::<
+                _,
+                DefaultEnforcer,
+            >(
+                &mut inner, &mut sync_state
+            ))
+            .expect("the re-drive must not error");
+        assert!(
+            applied,
+            "the re-applied Added must terminate (Success), not park Pending \
+             again — that is the livelock"
+        );
+        assert!(
+            sync_state.action_queue.is_empty(),
+            "the terminated action must be popped from the queue"
+        );
+        assert!(
+            sync_state.unavailable_txs.contains(&txid),
+            "the unavailable verdict is the terminal state; re-application \
+             must not clear it"
+        );
+        assert!(
+            inner.unfiltered_mempool.txs.contains(&txid),
+            "a gone tx is recorded as handled: not admitted, not re-fetched"
+        );
+        assert!(
+            !is_fetch_queued(&sync_state, txid),
+            "no fresh fetch may be re-queued for a tx the node dropped"
         );
     }
 }
