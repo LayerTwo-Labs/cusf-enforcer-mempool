@@ -294,24 +294,31 @@ where
                 mined_txids.insert(txid);
             }
             for txid in remove_mempool_txs {
-                inner.mempool.remove_with_descendants(&txid)?;
-
-                // Don't remove TXs mined by this very block.
-                // `prioritisetransaction` works even for a tx absent from the
-                // mempool, so deprioritizing a confirmed tx would silently
-                // poison it if a later reorg returned it to the mempool.
-                if mined_txids.contains(&txid) {
-                    continue;
+                let removed = inner.mempool.remove_with_descendants(&txid)?;
+                // Descendants carry the rejection too, as on the `accept_tx`
+                // path.
+                let rejected: LinkedHashSet<Txid> = std::iter::once(txid)
+                    .chain(removed.into_iter().map(|(txid, _tx)| txid))
+                    .collect();
+                for txid in rejected {
+                    // Don't remove TXs mined by this very block.
+                    // `prioritisetransaction` works even for a tx absent from
+                    // the mempool, so deprioritizing a confirmed tx would
+                    // silently poison it if a later reorg returned it to the
+                    // mempool.
+                    if mined_txids.contains(&txid) {
+                        continue;
+                    }
+                    tracing::trace!(
+                        %txid,
+                        block_hash = %block.hash,
+                        "deprioritizing tx removed by connected block",
+                    );
+                    sync_state.rejected_txs.insert(txid);
+                    sync_state
+                        .request_queue
+                        .push_front(RequestItem::RejectTx(txid));
                 }
-                tracing::trace!(
-                    %txid,
-                    block_hash = %block.hash,
-                    "deprioritizing tx removed by connected block",
-                );
-                sync_state.rejected_txs.insert(txid);
-                sync_state
-                    .request_queue
-                    .push_front(RequestItem::RejectTx(txid));
             }
             inner.mempool.chain.tip = block.hash;
             let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
