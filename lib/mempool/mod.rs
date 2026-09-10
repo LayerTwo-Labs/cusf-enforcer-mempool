@@ -304,6 +304,8 @@ pub enum MempoolInsertError {
     #[error(transparent)]
     MissingAncestor(#[from] MissingAncestorError),
     #[error(transparent)]
+    MissingByAncestorFeeRateKey(#[from] MissingByAncestorFeeRateKeyError),
+    #[error(transparent)]
     MissingDescendant(#[from] MissingDescendantError),
     #[error(transparent)]
     MissingDescendantsKey(#[from] MissingDescendantsKeyError),
@@ -615,14 +617,29 @@ impl Mempool {
                 Ok(())
             },
         )?;
+        // Non-empty only for an out-of-order insert: these children are
+        // already in the mempool, so they were inserted before their parent.
+        let direct_children: imbl::HashSet<Txid> =
+            self.tx_childs.0.get(&txid).cloned().unwrap_or_default();
+        // `(txid, stale key, updated key)`. Collected rather than applied in
+        // the walk below, which holds `self.txs` borrowed and can only fail
+        // with `MissingDescendantError`.
+        let mut rekeyed_descendants = Vec::<(Txid, FeeRate, FeeRate)>::new();
         self.txs.descendants_mut(txid).skip(1).for_each(
             |(descendant_tx, descendant_info)| {
+                let descendant_txid = descendant_tx.compute_txid();
                 descendant_vsize += descendant_tx.vsize() as u64;
                 descendant_modified_weight = saturating_add_weight(
                     descendant_modified_weight,
                     descendant_info.modified_weight,
                 );
                 descendant_fees += descendant_info.fees.modified;
+                let stale_ancestor_fee_rate = FeeRate {
+                    fee: descendant_info.fees.ancestor,
+                    vsize: descendant_info
+                        .ancestor_modified_weight
+                        .to_vbytes_ceil(),
+                };
                 descendant_info.ancestor_vsize += vsize;
                 descendant_info.ancestor_modified_weight =
                     saturating_add_weight(
@@ -630,6 +647,22 @@ impl Mempool {
                         modified_weight,
                     );
                 descendant_info.fees.ancestor += modified_fee;
+                rekeyed_descendants.push((
+                    descendant_txid,
+                    stale_ancestor_fee_rate,
+                    FeeRate {
+                        fee: descendant_info.fees.ancestor,
+                        vsize: descendant_info
+                            .ancestor_modified_weight
+                            .to_vbytes_ceil(),
+                    },
+                ));
+                // `depends` was computed at the child's own insert, from the
+                // parents present then. Unfilled, the child is proposed as a
+                // dependency-free root, without the parent it spends.
+                if direct_children.contains(&descendant_txid) {
+                    descendant_info.depends.insert(txid);
+                }
                 descendant_info.conflicts_with = descendant_info
                     .conflicts_with
                     .clone()
@@ -637,6 +670,16 @@ impl Mempool {
                 Ok(())
             },
         )?;
+        // This tx joined each descendant's ancestor set, changing the fee rate
+        // they are keyed by. Mirrors what `remove` does in reverse; left
+        // stale, the next `remove` -- so every `propose_txs` -- fails with
+        // `MissingByAncestorFeeRateKey`.
+        for (descendant_txid, stale, updated) in rekeyed_descendants {
+            if !self.by_ancestor_fee_rate.remove(stale, descendant_txid) {
+                return Err(MissingByAncestorFeeRateKeyError(stale).into());
+            }
+            self.by_ancestor_fee_rate.insert(updated, descendant_txid);
+        }
         for conflict_txid in conflicts_with {
             // The conflicting tx may have already been removed from the
             // mempool (e.g. confirmed in a block). Skip it.

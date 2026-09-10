@@ -9,7 +9,8 @@ use cusf_enforcer_mempool_integration_tests::{
     test_enforcer_rejection_during_reorg, test_gbt_long_poll,
     test_invalid_block_during_initial_sync, test_mempool_dat_fast_path,
     test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
-    test_reorg_re_inserts_tx, test_tx_replaced_during_fetch,
+    test_reorg_re_inserts_tx, test_reorg_reinserts_parent_under_child,
+    test_tx_replaced_during_fetch,
     util::{
         BinPaths, TestFailure, TestFailureCollector, display_timing_summary,
         record_test_timing,
@@ -234,6 +235,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         ("enforcer_rejection_during_reorg", |s| {
             Box::pin(
                 test_enforcer_rejection_during_reorg::test_enforcer_rejection_during_reorg(s),
+            )
+        }),
+        ("reorg_reinserts_parent_under_child", |s| {
+            Box::pin(
+                test_reorg_reinserts_parent_under_child::test_reorg_reinserts_parent_under_child(s),
             )
         }),
         ("rbf_removed_for_absent_tx", |s| {
