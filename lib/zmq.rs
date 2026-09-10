@@ -233,7 +233,12 @@ fn check_mempool_seq(
             if mempool_seq + 1 == next_seq {
                 // Ignore duplicates
                 Ok(None)
-            } else if mempool_seq == next_seq {
+            } else if mempool_seq >= next_seq {
+                // It's OK to jump forward without getting all messages. Core
+                // bumps mempool sequences for every removal, but publishes
+                // nothing the ones a block confirms. Real drops are caught by
+                // `check_zmq_seq`, whose per-topic sequence is contiguous
+                // across every published message.
                 *next_mempool_seq =
                     Some(NextMempoolSeq::Equal(mempool_seq + 1));
                 Ok(Some(msg))
