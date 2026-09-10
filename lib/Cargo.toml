@@ -32,9 +32,6 @@ typewit = { workspace = true }
 ulid = { workspace = true }
 zeromq = { workspace = true }
 
-[dev-dependencies]
-serde_json = { workspace = true }
-
 [lints]
 workspace = true
 
