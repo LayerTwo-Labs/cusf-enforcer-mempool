@@ -661,15 +661,25 @@ where
 /// state that decides whether this tx must be rejected or abandoned with it.
 /// Once Core has given us the fee, the first reason is gone, so a confirmed
 /// parent has nothing left to offer and is not requested.
+///
+/// `unfiltered_txs` is the live mirror of the node's mempool. The
+/// `mempool_txids` snapshot is frozen at initial sync, so on its own it
+/// classifies every parent the node accepted after startup as confirmed and
+/// skips the fetch; the child's resolution then discovers the parent is a
+/// mempool tx and requests it a round trip later. Consulting both sets (as
+/// `try_get_parent_txs_from_caches` does) requests it now.
 fn needs_parent_fetch(
     sync_state: &SyncState,
+    unfiltered_txs: &HashSet<Txid>,
     fee_known: bool,
     input_txid: &Txid,
 ) -> bool {
     if sync_state.tx_cache.contains_key(input_txid) {
         return false;
     }
-    !fee_known || sync_state.mempool_txids.contains(input_txid)
+    !fee_known
+        || sync_state.mempool_txids.contains(input_txid)
+        || unfiltered_txs.contains(input_txid)
 }
 
 fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
@@ -1217,6 +1227,7 @@ where
                     {
                         if !needs_parent_fetch(
                             sync_state,
+                            &inner.unfiltered_mempool.txs,
                             fee_known,
                             &input_txid,
                         ) {
@@ -2288,5 +2299,55 @@ mod tests {
             !is_fetch_queued(&sync_state, txid),
             "no fresh fetch may be re-queued for a tx the node dropped"
         );
+    }
+
+    /// A parent the node accepted AFTER initial sync is absent from the
+    /// `mempool_txids` snapshot. Deciding the parent fetch from the snapshot
+    /// alone classifies it as confirmed and skips it, only for the child's
+    /// resolution to discover it is a mempool parent and request it a round
+    /// trip later. The live unfiltered mirror must be consulted too.
+    #[test]
+    fn needs_parent_fetch_sees_post_startup_mempool_parent() {
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let mut sync_state = fresh_sync_state();
+        let fee_known = true;
+
+        // Confirmed parent, fee known: nothing left to fetch it for.
+        assert!(
+            !needs_parent_fetch(
+                &sync_state,
+                &HashSet::new(),
+                fee_known,
+                &parent_txid
+            ),
+            "a confirmed parent is not fetched once the fee is known"
+        );
+
+        // The same parent, but the node accepted it after startup: it is a
+        // mempool parent (dependency state matters) and must be fetched now.
+        let live = HashSet::from([parent_txid]);
+        assert!(
+            needs_parent_fetch(&sync_state, &live, fee_known, &parent_txid),
+            "a post-startup mempool parent must be fetched, not read as \
+             confirmed from the frozen snapshot"
+        );
+
+        // Snapshot members still count, and a cached parent is never fetched.
+        sync_state.mempool_txids.insert(parent_txid);
+        assert!(needs_parent_fetch(
+            &sync_state,
+            &HashSet::new(),
+            fee_known,
+            &parent_txid
+        ));
+        sync_state.tx_cache.insert(parent_txid, parent);
+        assert!(!needs_parent_fetch(
+            &sync_state,
+            &live,
+            fee_known,
+            &parent_txid
+        ));
     }
 }
