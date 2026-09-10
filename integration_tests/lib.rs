@@ -3,6 +3,7 @@ pub mod setup;
 pub mod stalling_client;
 pub mod test_accept_tx_paths;
 pub mod test_block_connect_smoke;
+pub mod test_conflict_eviction_at_block_connect;
 pub mod test_connect_block_deprioritizes_removed_txs;
 pub mod test_disconnect_through_sync_tip;
 pub mod test_double_insert_after_reorg;
