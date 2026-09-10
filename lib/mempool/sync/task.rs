@@ -2350,4 +2350,304 @@ mod tests {
             &parent_txid
         ));
     }
+
+    /// Build an RPC `Block<true>` (verbose `getblock`) from real txs, for the
+    /// block-connect / block-response tests. Only the fields the sync paths
+    /// read (`hash`, `previousblockhash`, `height`, `tx`) are meaningful; the
+    /// rest are placeholders.
+    fn make_resp_block(
+        hash: BlockHash,
+        prev: BlockHash,
+        height: u32,
+        txs: &[&Transaction],
+    ) -> bitcoin_jsonrpsee::client::Block<true> {
+        bitcoin_jsonrpsee::client::Block {
+            hash,
+            confirmations: 1,
+            strippedsize: 0,
+            size: 0,
+            weight: 0,
+            height,
+            version: bitcoin::block::Version::TWO,
+            version_hex: String::new(),
+            merkleroot: bitcoin::TxMerkleNode::all_zeros(),
+            tx: txs
+                .iter()
+                .map(|tx| bitcoin_jsonrpsee::client::TxInfo {
+                    hex: bitcoin::consensus::serialize(*tx),
+                    txid: tx.compute_txid(),
+                })
+                .collect(),
+            time: 0,
+            mediantime: 0,
+            nonce: 0,
+            compact_target: bitcoin::CompactTarget::from_consensus(0x1d00_ffff),
+            difficulty: 1.0,
+            chainwork: String::new(),
+            previousblockhash: Some(prev),
+            nextblockhash: None,
+        }
+    }
+
+    /// The restore scrub in `handle_tx_hash_msg` (mutation survivor from the
+    /// review of #114): when a re-announced parent restores its abandoned
+    /// descendant, a descendant left recorded in the unfiltered mirror has its
+    /// re-insert silently swallowed by the already-present short-circuit in
+    /// `try_add_tx_from_caches`. It must be scrubbed from the mirror. (#611)
+    #[test]
+    fn readded_parent_scrubs_restored_descendant_from_unfiltered_mirror() {
+        let mut inner = fresh_inner();
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let child_txid = child.compute_txid();
+        let mut sync_state = fresh_sync_state();
+
+        // The child is parked awaiting its (absent) parent, and — the bug's
+        // precondition — is still recorded in the unfiltered mirror.
+        inner
+            .abandoned_pool
+            .insert(child, HashSet::from([parent_txid]));
+        inner.unfiltered_mempool.txs.insert(child_txid);
+        // The parent carried a stale `unavailable` verdict that this Added
+        // arrival clears, triggering the restore.
+        sync_state.unavailable_txs.insert(parent_txid);
+
+        handle_tx_hash_msg::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            TxHashMessage {
+                txid: parent_txid,
+                event: TxHashEvent::Added,
+                mempool_seq: 1,
+                zmq_seq: 1,
+            },
+        )
+        .expect("an Added arrival must not error");
+
+        assert!(
+            !inner.unfiltered_mempool.txs.contains(&child_txid),
+            "the restored descendant must be scrubbed from the unfiltered \
+             mirror so its re-insert is not swallowed"
+        );
+        assert!(
+            sync_state.tx_cache.contains_key(&child_txid),
+            "the restored descendant is cached for re-insertion"
+        );
+    }
+
+    /// The restore scrub in `handle_resp_block` (the second, live restore site;
+    /// the review's mutation testing found it uncovered): a confirmed parent
+    /// arriving as a block response restores an abandoned descendant the block
+    /// did NOT confirm; that descendant must be scrubbed from the unfiltered
+    /// mirror, same swallow bug as the arrival path. (#611)
+    #[test]
+    fn block_response_scrubs_restored_descendant_from_unfiltered_mirror() {
+        let mut inner = fresh_inner();
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let child_txid = child.compute_txid();
+        let mut sync_state = fresh_sync_state();
+
+        inner
+            .abandoned_pool
+            .insert(child, HashSet::from([parent_txid]));
+        inner.unfiltered_mempool.txs.insert(child_txid);
+
+        // A block confirming ONLY the parent; the child is still unconfirmed.
+        let block = make_resp_block(
+            BlockHash::from_byte_array([1; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[&parent],
+        );
+        futures::executor::block_on(handle_resp_block::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            block,
+        ))
+        .expect("handling a block response must not error");
+
+        assert!(
+            !inner.unfiltered_mempool.txs.contains(&child_txid),
+            "the restored descendant must be scrubbed from the unfiltered \
+             mirror"
+        );
+        assert!(
+            sync_state.tx_cache.contains_key(&child_txid),
+            "the restored descendant is cached for re-insertion"
+        );
+    }
+
+    /// The block-confirmed-restore skip in `handle_resp_block` (mutation
+    /// survivor `d3f743f`, previously no test): a descendant restored by a
+    /// block response that is ITSELF confirmed in that same block (parent and
+    /// child mined together) must NOT be re-inserted — that would put an
+    /// already-mined tx into every subsequent template. It is only cached.
+    /// (#611)
+    #[test]
+    fn block_response_does_not_reinsert_a_descendant_mined_in_the_block() {
+        let mut inner = fresh_inner();
+        let parent =
+            make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], &[90_000]);
+        let child_txid = child.compute_txid();
+        let mut sync_state = fresh_sync_state();
+
+        inner
+            .abandoned_pool
+            .insert(child.clone(), HashSet::from([parent_txid]));
+
+        // A block confirming BOTH parent and child.
+        let block = make_resp_block(
+            BlockHash::from_byte_array([2; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[&parent, &child],
+        );
+        futures::executor::block_on(handle_resp_block::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            block,
+        ))
+        .expect("handling a block response must not error");
+
+        assert!(
+            sync_state.tx_cache.contains_key(&child_txid),
+            "a confirmed restored descendant is still cached (its output value \
+             may be needed)"
+        );
+        assert!(
+            sync_state.action_queue.is_empty(),
+            "a descendant mined in this same block must NOT be queued for \
+             re-insertion into the mempool"
+        );
+    }
+
+    /// The snapshot prune on the Removed apply path (mutation survivor
+    /// `22179de`, previously no direct test): a tx removed from the node
+    /// mempool must be pruned from the `mempool_txids` snapshot set, or the
+    /// since-removed member keeps classifying as an unconfirmed mempool tx and
+    /// a later child re-admits it. (#611)
+    #[test]
+    fn removed_tx_is_pruned_from_the_snapshot_set() {
+        let mut inner = fresh_inner();
+        let tx = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], &[100_000]);
+        let txid = tx.compute_txid();
+        let mut sync_state = fresh_sync_state();
+
+        // The tx is a known node-mempool member, mirrored in the unfiltered
+        // set.
+        inner.unfiltered_mempool.txs.insert(txid);
+        sync_state.mempool_txids.insert(txid);
+
+        handle_seq_message::<_, DefaultEnforcer>(
+            &mut inner,
+            &mut sync_state,
+            SequenceMessage::TxHash(TxHashMessage {
+                txid,
+                event: TxHashEvent::Removed,
+                mempool_seq: 1,
+                zmq_seq: 1,
+            }),
+        )
+        .expect("a Removed arrival must not error");
+        let applied =
+            futures::executor::block_on(try_apply_next_sync_action::<
+                _,
+                DefaultEnforcer,
+            >(
+                &mut inner, &mut sync_state
+            ))
+            .expect("applying the Removed action must not error");
+
+        assert!(applied, "the Removed action must apply");
+        assert!(
+            !sync_state.mempool_txids.contains(&txid),
+            "a removed tx must be pruned from the snapshot set"
+        );
+        assert!(!inner.unfiltered_mempool.txs.contains(&txid));
+    }
+
+    /// Two mutation survivors at block connect: (a) the conflict sweep
+    /// (`6d5dc0c`, its test exercised `spenders_of` in isolation) — a mempool
+    /// tx that spends the same outpoint as a block-confirmed tx is evicted even
+    /// though the node emits no removal message for it; (b) the snapshot prune
+    /// (`22179de`, connect-path site) — the confirmed tx is pruned from
+    /// `mempool_txids`. (#611)
+    #[test]
+    fn connect_block_evicts_conflicts_and_prunes_snapshot() {
+        let mut inner = fresh_inner();
+        let spent = OutPoint::new(Txid::all_zeros(), 0);
+        // The RBF winner (confirmed in the block) and loser (in the mempool)
+        // spend the same outpoint. Distinct txids via a different output shape.
+        let winner = make_tx(&[spent], &[100_000]);
+        let winner_txid = winner.compute_txid();
+        let loser = make_tx(&[spent], &[90_000, 5_000]);
+        let loser_txid = loser.compute_txid();
+        assert_ne!(winner_txid, loser_txid);
+        let mut sync_state = fresh_sync_state();
+
+        // The loser sits in the enforced mempool and the unfiltered mirror.
+        let loser_weight = loser.weight();
+        inner
+            .mempool
+            .insert(
+                loser,
+                Amount::from_sat(1000),
+                imbl::OrdSet::new(),
+                loser_weight,
+            )
+            .expect("inserting the loser must succeed");
+        inner.unfiltered_mempool.txs.insert(loser_txid);
+        // The winner is a live snapshot member about to be confirmed.
+        sync_state.mempool_txids.insert(winner_txid);
+        assert!(
+            inner.mempool.spenders_of(&spent).contains(&loser_txid),
+            "precondition: the loser spends the contested outpoint"
+        );
+
+        // Both mempool tips start at genesis (fresh_inner); a block whose
+        // parent is genesis connects cleanly.
+        let block = make_resp_block(
+            BlockHash::from_byte_array([3; 32]),
+            BlockHash::all_zeros(),
+            1,
+            &[&winner],
+        );
+        {
+            let ss = SyncStateBorrowedMut {
+                blocks_needed: &mut sync_state.blocks_needed,
+                rejected_blocks: &mut sync_state.rejected_blocks,
+                rejected_txs: &mut sync_state.rejected_txs,
+                request_queue: &sync_state.request_queue,
+                tx_cache: &mut sync_state.tx_cache,
+                txs_needed: &mut sync_state.txs_needed,
+                unavailable_txs: &mut sync_state.unavailable_txs,
+                known_fees: &sync_state.known_fees,
+                mempool_txids: &mut sync_state.mempool_txids,
+            };
+            futures::executor::block_on(connect_block::<_, DefaultEnforcer>(
+                &mut inner, ss, &block,
+            ))
+            .expect("connecting the block must not error");
+        }
+
+        assert!(
+            !inner.mempool.spenders_of(&spent).contains(&loser_txid),
+            "a mempool tx conflicting with a block-confirmed tx must be evicted"
+        );
+        assert!(
+            !inner.unfiltered_mempool.txs.contains(&loser_txid),
+            "the evicted conflict is scrubbed from the unfiltered mirror"
+        );
+        assert!(
+            !sync_state.mempool_txids.contains(&winner_txid),
+            "the block-confirmed tx must be pruned from the snapshot set"
+        );
+    }
 }

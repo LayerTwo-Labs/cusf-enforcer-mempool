@@ -1240,4 +1240,39 @@ mod tests {
             "template is missing part of the chain: {ids:?}"
         );
     }
+
+    /// Killing the mutation the review found surviving in the descendant
+    /// fee-rate re-key of the out-of-order insert fix: `out_of_order_insert_*`
+    /// only proposes a template, which never consults a descendant's
+    /// `by_ancestor_fee_rate` key. A later `remove` does — and fails with
+    /// `MissingByAncestorFeeRateKey` if the descendant was left under its stale
+    /// pre-parent key. (issue #611)
+    #[test]
+    fn out_of_order_insert_then_remove_rekeys_descendant_fee_rate() {
+        let mut mempool = test_mempool();
+        let parent = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let parent_txid = parent.compute_txid();
+        let child = make_tx(&[OutPoint::new(parent_txid, 0)], 1);
+        let child_txid = child.compute_txid();
+
+        // Out-of-order: child before parent. Inserting the parent must re-key
+        // the child's ancestor-fee-rate entry (its ancestor set gained the
+        // parent) — otherwise the child sits under a stale key.
+        let w = child.weight();
+        mempool
+            .insert(child, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+        let w = parent.weight();
+        mempool
+            .insert(parent, Amount::from_sat(1000), OrdSet::new(), w)
+            .unwrap();
+
+        // `remove` looks the child up by its CURRENT ancestor fee rate; without
+        // the re-key that key is absent and removal fails.
+        mempool.remove_with_descendants(&child_txid).expect(
+            "removing an out-of-order-inserted descendant must not fail with a \
+             stale ancestor-fee-rate key",
+        );
+        assert!(!mempool.txs.0.contains_key(&child_txid));
+    }
 }
