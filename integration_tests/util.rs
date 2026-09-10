@@ -277,9 +277,20 @@ pub async fn generate_block(
     addr: &Address,
     txs: &[Txid],
 ) -> anyhow::Result<BlockHash> {
-    let tx_strs: Vec<String> = txs.iter().map(|t| t.to_string()).collect();
+    let entries: Vec<String> = txs.iter().map(|t| t.to_string()).collect();
+    generate_block_entries(rpc, addr, &entries).await
+}
+
+/// `generateblock` over entries that may each be a txid or a raw tx hex. A raw
+/// tx need not be in the mempool, which is the only way to mine one that
+/// conflicts with a tx that is.
+pub async fn generate_block_entries(
+    rpc: &RpcClient,
+    addr: &Address,
+    entries: &[String],
+) -> anyhow::Result<BlockHash> {
     let res: serde_json::Value = rpc
-        .request("generateblock", rpc_params![addr.to_string(), tx_strs])
+        .request("generateblock", rpc_params![addr.to_string(), entries])
         .await?;
     let hash = res["hash"]
         .as_str()
@@ -414,6 +425,20 @@ pub async fn spend_output(
     value_sat: u64,
     fee_sat: u64,
 ) -> anyhow::Result<Txid> {
+    let hex = signed_spend_hex(rpc, outpoint, value_sat, fee_sat).await?;
+    let txid: String =
+        rpc.request("sendrawtransaction", rpc_params![hex]).await?;
+    Ok(txid.parse()?)
+}
+
+/// As [`spend_output`], but returns the signed hex without broadcasting — for
+/// a tx that must reach the chain without ever entering the mempool.
+pub async fn signed_spend_hex(
+    rpc: &RpcClient,
+    outpoint: OutPoint,
+    value_sat: u64,
+    fee_sat: u64,
+) -> anyhow::Result<String> {
     anyhow::ensure!(
         value_sat > fee_sat,
         "{outpoint} holds {value_sat} sat, too little for a {fee_sat} sat fee"
@@ -443,10 +468,7 @@ pub async fn spend_output(
         "signrawtransactionwithwallet could not fully sign a spend of \
          {outpoint}"
     );
-    let txid: String = rpc
-        .request("sendrawtransaction", rpc_params![signed.hex])
-        .await?;
-    Ok(txid.parse()?)
+    Ok(signed.hex)
 }
 
 /// Spend `parent`'s first wallet-owned output, producing a direct child.
