@@ -10,7 +10,8 @@ use cusf_enforcer_mempool_integration_tests::{
     test_invalid_block_during_initial_sync, test_mempool_dat_fast_path,
     test_orphan_admitted_after_disconnect_removal,
     test_rbf_removed_for_absent_tx, test_rejected_block_disconnect,
-    test_reorg_re_inserts_tx, test_tx_replaced_during_fetch,
+    test_reorg_re_inserts_tx, test_reorg_reinserts_parent_under_child,
+    test_tx_replaced_during_fetch,
     util::{
         BinPaths, TestFailure, TestFailureCollector, display_timing_summary,
         record_test_timing,
@@ -240,6 +241,11 @@ fn run() -> anyhow::Result<std::process::ExitCode> {
         ("orphan_admitted_after_disconnect_removal", |s| {
             Box::pin(
                 test_orphan_admitted_after_disconnect_removal::test_orphan_admitted_after_disconnect_removal(s),
+            )
+        }),
+        ("reorg_reinserts_parent_under_child", |s| {
+            Box::pin(
+                test_reorg_reinserts_parent_under_child::test_reorg_reinserts_parent_under_child(s),
             )
         }),
         ("rbf_removed_for_absent_tx", |s| {
