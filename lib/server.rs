@@ -7,13 +7,14 @@ use std::{
 
 use async_trait::async_trait;
 use bitcoin::{
-    Amount, Block, BlockHash, Network, ScriptBuf, Transaction, TxOut, Txid,
-    Weight, WitnessMerkleNode, Wtxid, amount::CheckedSum, hashes::Hash as _,
-    merkle_tree, script::PushBytesBuf,
+    Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxIn,
+    TxMerkleNode, TxOut, Txid, Weight, WitnessMerkleNode, Wtxid,
+    amount::CheckedSum, hashes::Hash as _, merkle_tree, script::PushBytesBuf,
 };
 use bitcoin_jsonrpsee::client::{
     BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
-    CoinbaseTxnOrValue, MODE_PROPOSAL, MODE_TEMPLATE, NetworkInfo,
+    CoinbaseTxnOrValue, GetRawTransactionClient as _, GetRawTransactionVerbose,
+    MODE_PROPOSAL, MODE_TEMPLATE, NetworkInfo,
 };
 use chrono::{DateTime, Utc};
 use educe::Educe;
@@ -27,7 +28,10 @@ use crate::{
         self, CusfBlockProducer, FilledBlockTemplate, InitialBlockTemplate,
         initial_block_template::SuffixTxsItem,
     },
-    mempool::{self, Mempool, MempoolSync},
+    mempool::{
+        self, InsertSlipstreamTx, InsertSlipstreamTxError, Mempool,
+        MempoolSync, SlipstreamTxInfo, SlipstreamTxStatus,
+    },
 };
 
 /// `getblocktemplate` result, which BIP22/BIP23 overload by request mode.
@@ -121,6 +125,70 @@ const RPC_TYPE_ERROR: i32 = -3;
 const RPC_INVALID_PARAMETER: i32 = -8;
 // https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/protocol.h#L46
 const RPC_DESERIALIZATION_ERROR: i32 = -22;
+// https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/protocol.h#L36
+const RPC_METHOD_NOT_FOUND: i32 = -32601;
+// https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/protocol.h#L43
+const RPC_INVALID_ADDRESS_OR_KEY: i32 = -5;
+
+/// Limits on slipstream txs. Slipstream is off unless a config is given, see
+/// [`Server::with_slipstream`].
+#[derive(Clone, Copy, Debug)]
+pub struct SlipstreamConfig {
+    /// Most slipstream txs held at once
+    pub max_txs: usize,
+    /// Heaviest slipstream tx accepted
+    pub max_tx_weight: Weight,
+    /// Most sigop cost accepted in one slipstream tx
+    pub max_tx_sigop_cost: usize,
+    /// Most sigop cost held across all slipstream txs.
+    ///
+    /// Template tx selection does not count sigops, which the node's relay
+    /// policy keeps safe for its own txs. Nothing bounds slipstream txs but
+    /// this. Without a pool-wide budget, a handful of txs at the per-tx limit
+    /// would take a template past the block's 80k, and cost their sender
+    /// nothing: an invalid block pays no fees.
+    pub max_total_sigop_cost: usize,
+}
+
+impl Default for SlipstreamConfig {
+    fn default() -> Self {
+        Self {
+            max_txs: 1_000,
+            // A quarter of a block. Past Core's 400k wu standardness limit,
+            // because txs that do not relay are what slipstream is for.
+            max_tx_weight: Weight::from_wu(1_000_000),
+            // Core's standardness limit, a fifth of the block's
+            max_tx_sigop_cost: 16_000,
+            // The same fifth, for all of them together
+            max_total_sigop_cost: 16_000,
+        }
+    }
+}
+
+/// `submitslipstreamtx` result. A tx refused for what it is comes back with
+/// `accepted: false` and a reason, in the style of `testmempoolaccept`; RPC
+/// errors are for a request that could not be answered at all.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SubmitSlipstreamTxResponse {
+    pub txid: Txid,
+    pub wtxid: Wtxid,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reject_reason: Option<String>,
+    /// Already in the mempool, from an earlier submission or from the node
+    #[serde(default)]
+    pub already_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_sat: Option<u64>,
+    pub vsize: u64,
+    pub weight: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sigop_cost: Option<u64>,
+    /// Mempool txs it competes with. At most one of a conflicting set is
+    /// mined; which, is decided by fee rate like any other.
+    #[serde(default)]
+    pub conflicts_with: Vec<Txid>,
+}
 
 #[rpc(client, server)]
 pub trait Rpc {
@@ -142,6 +210,34 @@ pub trait Rpc {
         &self,
         block_hex: String,
     ) -> RpcResult<Option<String>>;
+
+    /// Add a tx to this mempool, without relaying it or handing it to the
+    /// node's mempool. It then competes for inclusion in templates by fee
+    /// rate, like any other.
+    ///
+    /// The tx must be consensus-valid; the node's relay policy does not
+    /// apply. Validity is checked by having the node check a block containing
+    /// the tx, as a `getblocktemplate` proposal.
+    #[method(name = "submitslipstreamtx")]
+    async fn submit_slipstream_tx(
+        &self,
+        tx_hex: String,
+    ) -> RpcResult<SubmitSlipstreamTxResponse>;
+
+    #[method(name = "getslipstreamtx")]
+    async fn get_slipstream_tx(
+        &self,
+        txid: Txid,
+    ) -> RpcResult<SlipstreamTxStatus>;
+
+    /// Slipstream txs currently in the mempool, oldest first
+    #[method(name = "listslipstreamtxs")]
+    async fn list_slipstream_txs(&self) -> RpcResult<Vec<SlipstreamTxInfo>>;
+
+    /// Withdraw a slipstream tx, and any slipstream txs spending it.
+    /// Returns the txids that left the mempool.
+    #[method(name = "removeslipstreamtx")]
+    async fn remove_slipstream_tx(&self, txid: Txid) -> RpcResult<Vec<Txid>>;
 }
 
 // cached block templates, with their generation timestamp
@@ -233,6 +329,8 @@ pub struct Server<Enforcer, RpcClient> {
     tip_rx: tokio::sync::watch::Receiver<BlockHash>,
     /// Uniquifying suffix for `longpollid`s, see [`parse_long_poll_tip`].
     long_poll_seq: AtomicU64,
+    /// `None` when slipstream is disabled
+    slipstream: Option<SlipstreamConfig>,
 }
 
 impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
@@ -273,7 +371,14 @@ impl<Enforcer, RpcClient> Server<Enforcer, RpcClient> {
             known_targets: parking_lot::RwLock::new(HashMap::new()),
             tip_rx,
             long_poll_seq: AtomicU64::new(0),
+            slipstream: None,
         })
+    }
+
+    /// Accept slipstream txs, within `config`'s limits
+    pub fn with_slipstream(mut self, config: SlipstreamConfig) -> Self {
+        self.slipstream = Some(config);
+        self
     }
 }
 
@@ -359,6 +464,21 @@ fn get_block_reward(height: u32, fees: Amount, network: Network) -> Amount {
 
 const WITNESS_RESERVED_VALUE: [u8; 32] = [0; 32];
 
+/// The coinbase output committing to `witness_root`
+fn witness_commitment_spk(witness_root: &WitnessMerkleNode) -> ScriptBuf {
+    let witness_commitment = Block::compute_witness_commitment(
+        witness_root,
+        &WITNESS_RESERVED_VALUE,
+    );
+    // https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#commitment-structure
+    const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+    let mut push_bytes = PushBytesBuf::from(WITNESS_COMMITMENT_HEADER);
+    let () = push_bytes
+        .extend_from_slice(witness_commitment.as_byte_array())
+        .unwrap();
+    ScriptBuf::new_op_return(push_bytes)
+}
+
 /// Add witness commitment output to the coinbase tx, and return a copy of the
 /// witness commitment spk.
 /// The coinbase tx should not include the witness commitment txout.
@@ -374,19 +494,7 @@ fn add_witness_commitment_output(
             .map(WitnessMerkleNode::from_raw_hash)
             .unwrap()
     };
-    let witness_commitment = Block::compute_witness_commitment(
-        &witness_root,
-        &WITNESS_RESERVED_VALUE,
-    );
-    // https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki#commitment-structure
-    let witness_commitment_spk = {
-        const WITNESS_COMMITMENT_HEADER: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
-        let mut push_bytes = PushBytesBuf::from(WITNESS_COMMITMENT_HEADER);
-        let () = push_bytes
-            .extend_from_slice(witness_commitment.as_byte_array())
-            .unwrap();
-        ScriptBuf::new_op_return(push_bytes)
-    };
+    let witness_commitment_spk = witness_commitment_spk(&witness_root);
     coinbase_tx.output.push(TxOut {
         value: Amount::ZERO,
         script_pubkey: witness_commitment_spk.clone(),
@@ -419,6 +527,49 @@ fn bip34_height_script(height: u32) -> ScriptBuf {
         builder = builder.push_opcode(bitcoin::opcodes::OP_0);
     }
     builder.into_script()
+}
+
+/// A block for the node to check a slipstream tx with: the tx, after the
+/// in-mempool txs it spends, on top of `header`'s parent.
+///
+/// The coinbase claims nothing. Paying less than the reward is always valid,
+/// so the chain's reward schedule never enters into the check. It always
+/// commits to witnesses, which is valid on every network and required as soon
+/// as any tx carries a witness.
+fn slipstream_proposal_block(
+    mut header: bitcoin::block::Header,
+    height: u32,
+    package: &[(Transaction, Amount)],
+    tx: &Transaction,
+) -> Block {
+    let coinbase_tx = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::from_slice(&[WITNESS_RESERVED_VALUE]),
+            script_sig: bip34_height_script(height),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return([]),
+        }],
+    };
+    let txdata = std::iter::once(coinbase_tx)
+        .chain(package.iter().map(|(tx, _fee)| tx.clone()))
+        .chain(std::iter::once(tx.clone()))
+        .collect();
+    header.merkle_root = TxMerkleNode::all_zeros();
+    let mut block = Block { header, txdata };
+    // Never `None`: the block has a coinbase.
+    let witness_root = block.witness_root().unwrap();
+    block.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: witness_commitment_spk(&witness_root),
+    });
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    block
 }
 
 /// Finalize coinbase tx.
@@ -796,6 +947,40 @@ where
     })
 }
 
+fn slipstream_disabled() -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObjectOwned::owned(
+        RPC_METHOD_NOT_FOUND,
+        "slipstream is disabled",
+        None::<()>,
+    )
+}
+
+fn mempool_unavailable() -> jsonrpsee::types::ErrorObjectOwned {
+    let err = anyhow::anyhow!("Mempool unavailable");
+    let err = log_error(err);
+    internal_error(err)
+}
+
+/// What the mempool held for a slipstream tx, when it was read
+struct SlipstreamSnapshot {
+    tip: BlockHash,
+    tip_height: u32,
+    tip_mediantime: u32,
+    /// Fee, if the tx is already a slipstream tx
+    already_slipstream: Option<Amount>,
+    /// Distinct in-mempool txs the tx spends, with the txs themselves
+    mempool_parents: Vec<(Txid, Transaction)>,
+    /// `mempool_parents` and their in-mempool ancestors, in block order
+    package: Vec<(Transaction, Amount)>,
+}
+
+/// Outcome of one attempt to submit a slipstream tx
+enum SlipstreamAttempt {
+    Done(SubmitSlipstreamTxResponse),
+    /// The mempool moved under the attempt. Nothing is wrong with the tx.
+    Retry(String),
+}
+
 enum CachedMempoolQueryOutput {
     Cached(Box<BlockTemplate>),
     Queried(Box<MempoolQueryOutput>),
@@ -810,6 +995,361 @@ where
         + Sync
         + 'static,
 {
+    /// The node's verdict on a block proposal: `None` if valid, otherwise
+    /// its reject reason.
+    ///
+    /// A failure to reach the node must never read as acceptance, so the only
+    /// non-error outcome here is an answer the node actually gave.
+    async fn node_proposal_verdict(
+        &self,
+        block_hex: String,
+        rules: Vec<String>,
+    ) -> RpcResult<Option<String>> {
+        self.rpc_client
+            .request(
+                "getblocktemplate",
+                jsonrpsee::rpc_params![BlockTemplateRequest {
+                    mode: Some(MODE_PROPOSAL.into()),
+                    data: Some(block_hex.into()),
+                    rules,
+                    capabilities: Default::default(),
+                    long_poll_id: None,
+                }],
+            )
+            .await
+            .map_err(|err| match err {
+                // The node's own -8/-22 and friends are more precise than
+                // anything restated here, so pass them through unchanged.
+                jsonrpsee::core::ClientError::Call(err) => err,
+                err => {
+                    let err = log_error(err);
+                    internal_error(err)
+                }
+            })
+    }
+
+    /// Target for the block after `prev_blockhash`
+    async fn next_target(
+        &self,
+        prev_blockhash: BlockHash,
+    ) -> RpcResult<bitcoin::Target> {
+        let known_target =
+            self.known_targets.read().get(&prev_blockhash).copied();
+        if let Some(target) = known_target {
+            return Ok(target);
+        }
+        // We used to calculate the next block's target here. This didn't
+        // work with signets with custom block times. Instead we always
+        // read directly from Core. This only happens 1 time per chain tip,
+        // so the performance impact is negligible.
+        let mining_info = self
+            .rpc_client
+            .get_mining_info()
+            .await
+            .map_err(internal_error)?;
+        let target = mining_info.next.target;
+        self.known_targets.write().insert(prev_blockhash, target);
+        Ok(target)
+    }
+
+    async fn submit_slipstream(
+        &self,
+        tx_hex: String,
+    ) -> RpcResult<SubmitSlipstreamTxResponse> {
+        let Some(config) = self.slipstream else {
+            return Err(slipstream_disabled());
+        };
+        // https://github.com/bitcoin/bitcoin/blob/6c4fe401e908cff1b67d80035b117aae15fe7db6/src/rpc/mempool.cpp#L73
+        let tx: Transaction = bitcoin::consensus::encode::deserialize_hex(
+            &tx_hex,
+        )
+        .map_err(|_| {
+            jsonrpsee::types::ErrorObjectOwned::owned(
+                RPC_DESERIALIZATION_ERROR,
+                "TX decode failed",
+                None::<()>,
+            )
+        })?;
+        let rejected =
+            |tx: &Transaction, reason: &str| SubmitSlipstreamTxResponse {
+                txid: tx.compute_txid(),
+                wtxid: tx.compute_wtxid(),
+                accepted: false,
+                reject_reason: Some(reason.to_owned()),
+                already_present: false,
+                fee_sat: None,
+                vsize: tx.vsize() as u64,
+                weight: tx.weight().to_wu(),
+                sigop_cost: None,
+                conflicts_with: Vec::new(),
+            };
+        // Core's reject reasons where there is one to borrow
+        if tx.is_coinbase() {
+            return Ok(rejected(&tx, "coinbase"));
+        }
+        if tx.weight() > config.max_tx_weight {
+            return Ok(rejected(&tx, "tx-size"));
+        }
+        // Each retry follows the mempool moving under the previous attempt,
+        // i.e. a new block or a parent leaving. That settles in one or two.
+        const MAX_ATTEMPTS: usize = 3;
+        let mut last_retry = String::new();
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.try_submit_slipstream(&config, &tx).await? {
+                SlipstreamAttempt::Done(response) => return Ok(response),
+                SlipstreamAttempt::Retry(reason) => {
+                    tracing::debug!(
+                        txid = %tx.compute_txid(),
+                        attempt,
+                        %reason,
+                        "retrying slipstream tx",
+                    );
+                    last_retry = reason;
+                }
+            }
+        }
+        tracing::warn!(
+            txid = %tx.compute_txid(),
+            reason = %last_retry,
+            "gave up on slipstream tx after {MAX_ATTEMPTS} attempts",
+        );
+        Ok(rejected(&tx, "mempool-busy"))
+    }
+
+    async fn try_submit_slipstream(
+        &self,
+        config: &SlipstreamConfig,
+        tx: &Transaction,
+    ) -> RpcResult<SlipstreamAttempt> {
+        let txid = tx.compute_txid();
+        let rejected = |reason: &str, fee: Option<Amount>| {
+            SlipstreamAttempt::Done(SubmitSlipstreamTxResponse {
+                txid,
+                wtxid: tx.compute_wtxid(),
+                accepted: false,
+                reject_reason: Some(reason.to_owned()),
+                already_present: false,
+                fee_sat: fee.map(Amount::to_sat),
+                vsize: tx.vsize() as u64,
+                weight: tx.weight().to_wu(),
+                sigop_cost: None,
+                conflicts_with: Vec::new(),
+            })
+        };
+        let snapshot = self
+            .mempool
+            .with_slipstream(|mempool, pool| {
+                let tip = mempool.tip();
+                let already_slipstream = match pool.status(txid) {
+                    SlipstreamTxStatus::Pending(info) => {
+                        Some(Amount::from_sat(info.fee_sat))
+                    }
+                    SlipstreamTxStatus::Removed { .. }
+                    | SlipstreamTxStatus::Unknown { .. } => None,
+                };
+                let mut mempool_parents = Vec::<(Txid, Transaction)>::new();
+                for input in &tx.input {
+                    let parent = input.previous_output.txid;
+                    if mempool_parents.iter().any(|(txid, _)| *txid == parent) {
+                        continue;
+                    }
+                    if let Some(parent_tx) = mempool.get(&parent) {
+                        mempool_parents.push((parent, parent_tx.clone()));
+                    }
+                }
+                let parent_txids: Vec<Txid> =
+                    mempool_parents.iter().map(|(txid, _)| *txid).collect();
+                mempool.package_of(&parent_txids).map(|package| {
+                    SlipstreamSnapshot {
+                        tip: tip.hash,
+                        tip_height: tip.height,
+                        tip_mediantime: tip.mediantime,
+                        already_slipstream,
+                        mempool_parents,
+                        package,
+                    }
+                })
+            })
+            .await
+            .ok_or_else(mempool_unavailable)?
+            .map_err(|err| internal_error(log_error(err)))?;
+        if let Some(fee) = snapshot.already_slipstream {
+            return Ok(SlipstreamAttempt::Done(SubmitSlipstreamTxResponse {
+                txid,
+                wtxid: tx.compute_wtxid(),
+                accepted: true,
+                reject_reason: None,
+                already_present: true,
+                fee_sat: Some(fee.to_sat()),
+                vsize: tx.vsize() as u64,
+                weight: tx.weight().to_wu(),
+                sigop_cost: None,
+                conflicts_with: Vec::new(),
+            }));
+        }
+
+        // Every output this tx spends, for the fee and the sigop count. A
+        // parent that is not in this mempool must be confirmed, or in the
+        // node's mempool but not this one; either way the node has it, and
+        // the proposal below decides whether it is spendable.
+        let mut parent_txs: HashMap<Txid, Transaction> =
+            snapshot.mempool_parents.iter().cloned().collect();
+        for input in &tx.input {
+            let parent = input.previous_output.txid;
+            if parent_txs.contains_key(&parent) {
+                continue;
+            }
+            let parent_hex = match self
+                .rpc_client
+                .get_raw_transaction(
+                    parent,
+                    GetRawTransactionVerbose::<false>,
+                    None,
+                )
+                .await
+            {
+                Ok(parent_hex) => parent_hex,
+                Err(jsonrpsee::core::ClientError::Call(err))
+                    if err.code() == RPC_INVALID_ADDRESS_OR_KEY =>
+                {
+                    return Ok(rejected("missing-inputs", None));
+                }
+                Err(err) => return Err(internal_error(log_error(err))),
+            };
+            let parent_tx: Transaction =
+                bitcoin::consensus::encode::deserialize_hex(&parent_hex)
+                    .map_err(|err| internal_error(log_error(err)))?;
+            parent_txs.insert(parent, parent_tx);
+        }
+        let prevout = |outpoint: &OutPoint| {
+            parent_txs
+                .get(&outpoint.txid)?
+                .output
+                .get(outpoint.vout as usize)
+                .cloned()
+        };
+        let Some(value_in) = tx
+            .input
+            .iter()
+            .map(|input| {
+                prevout(&input.previous_output).map(|txout| txout.value)
+            })
+            .collect::<Option<Vec<Amount>>>()
+            .and_then(|values| values.into_iter().checked_sum())
+        else {
+            return Ok(rejected("bad-txns-inputs-missingorspent", None));
+        };
+        let Some(value_out) =
+            tx.output.iter().map(|txout| txout.value).checked_sum()
+        else {
+            return Ok(rejected("bad-txns-txouttotal-toolarge", None));
+        };
+        let Some(fee) = value_in.checked_sub(value_out) else {
+            return Ok(rejected("bad-txns-in-belowout", None));
+        };
+        let sigop_cost = tx.total_sigop_cost(prevout);
+        if sigop_cost > config.max_tx_sigop_cost {
+            return Ok(rejected("bad-txns-too-many-sigops", Some(fee)));
+        }
+
+        let header = bitcoin::block::Header {
+            version: self.sample_block_template.version,
+            prev_blockhash: snapshot.tip,
+            merkle_root: TxMerkleNode::all_zeros(),
+            time: std::cmp::max(
+                (Utc::now().timestamp() + self.network_info.time_offset_s)
+                    as u32,
+                snapshot.tip_mediantime + 1,
+            ),
+            bits: self.next_target(snapshot.tip).await?.to_compact_lossy(),
+            nonce: 0,
+        };
+        let block = slipstream_proposal_block(
+            header,
+            snapshot.tip_height + 1,
+            &snapshot.package,
+            tx,
+        );
+        let verdict = self
+            .node_proposal_verdict(
+                bitcoin::consensus::encode::serialize_hex(&block),
+                Vec::new(),
+            )
+            .await?;
+        match verdict.as_deref() {
+            None => (),
+            // The node moved to a new tip since the snapshot
+            Some("inconclusive-not-best-prevblk") => {
+                return Ok(SlipstreamAttempt::Retry(
+                    "node tip moved".to_owned(),
+                ));
+            }
+            Some(reason) => {
+                tracing::debug!(%txid, %reason, "node rejected slipstream tx");
+                return Ok(rejected(reason, Some(fee)));
+            }
+        }
+
+        let submitted_at = Utc::now().timestamp().try_into().unwrap_or(0);
+        let inserted = self
+            .mempool
+            .insert_slipstream_tx(InsertSlipstreamTx {
+                tx: tx.clone(),
+                fee,
+                tip: snapshot.tip,
+                mempool_parents: snapshot
+                    .mempool_parents
+                    .iter()
+                    .map(|(txid, _)| *txid)
+                    .collect(),
+                sigop_cost,
+                submitted_at,
+                max_txs: config.max_txs,
+                max_total_sigop_cost: config.max_total_sigop_cost,
+            })
+            .await
+            .ok_or_else(mempool_unavailable)?;
+        match inserted {
+            Ok(inserted) => {
+                tracing::info!(
+                    %txid,
+                    fee = %fee.display_dynamic(),
+                    already_present = inserted.already_present,
+                    "accepted slipstream tx",
+                );
+                Ok(SlipstreamAttempt::Done(SubmitSlipstreamTxResponse {
+                    txid,
+                    wtxid: tx.compute_wtxid(),
+                    accepted: true,
+                    reject_reason: None,
+                    already_present: inserted.already_present,
+                    fee_sat: Some(fee.to_sat()),
+                    vsize: tx.vsize() as u64,
+                    weight: tx.weight().to_wu(),
+                    sigop_cost: Some(sigop_cost as u64),
+                    conflicts_with: inserted.conflicts_with,
+                }))
+            }
+            Err(
+                err @ (InsertSlipstreamTxError::TipChanged { .. }
+                | InsertSlipstreamTxError::ParentGone(_)),
+            ) => Ok(SlipstreamAttempt::Retry(err.to_string())),
+            Err(InsertSlipstreamTxError::Full(_)) => {
+                Ok(rejected("slipstream-full", Some(fee)))
+            }
+            Err(InsertSlipstreamTxError::SigopBudget(_)) => {
+                Ok(rejected("slipstream-sigops-full", Some(fee)))
+            }
+            Err(InsertSlipstreamTxError::RejectedByEnforcer) => {
+                Ok(rejected("rejected-by-enforcer", Some(fee)))
+            }
+            Err(
+                err @ (InsertSlipstreamTxError::CusfEnforcer(_)
+                | InsertSlipstreamTxError::MempoolInsert(_)),
+            ) => Err(internal_error(log_error(err))),
+        }
+    }
+
     async fn validate_proposal(
         &self,
         request: BlockTemplateRequest,
@@ -835,31 +1375,8 @@ where
         // Consensus validity is the node's question, so ask the node rather
         // than reimplementing `CheckBlock` here. This covers the `bad-*`
         // reject reasons and the `duplicate*` family.
-        //
-        // A failure to reach the node must never read as acceptance, so the
-        // only non-error outcome here is an answer the node actually gave.
-        let core_verdict: Option<String> = self
-            .rpc_client
-            .request(
-                "getblocktemplate",
-                jsonrpsee::rpc_params![BlockTemplateRequest {
-                    mode: Some(MODE_PROPOSAL.into()),
-                    data: Some(data.into()),
-                    rules: request.rules,
-                    capabilities: Default::default(),
-                    long_poll_id: None,
-                }],
-            )
-            .await
-            .map_err(|err| match err {
-                // The node's own -8/-22 and friends are more precise than
-                // anything restated here, so pass them through unchanged.
-                jsonrpsee::core::ClientError::Call(err) => err,
-                err => {
-                    let err = log_error(err);
-                    internal_error(err)
-                }
-            })?;
+        let core_verdict =
+            self.node_proposal_verdict(data, request.rules).await?;
         if core_verdict.is_some() {
             return Ok(core_verdict);
         }
@@ -1002,26 +1519,7 @@ where
             }
             CachedMempoolQueryOutput::Queried(query_output) => *query_output,
         };
-        let target = {
-            let known_target =
-                self.known_targets.read().get(&prev_blockhash).copied();
-            if let Some(target) = known_target {
-                target
-            } else {
-                // We used to calculate the next block's target here. This didn't
-                // work with signets with custom block times. Instead we always
-                // read directly from Core. This only happens 1 time per chain tip,
-                // so the performance impact is negligible.
-                let mining_info = self
-                    .rpc_client
-                    .get_mining_info()
-                    .await
-                    .map_err(internal_error)?;
-                let target = mining_info.next.target;
-                self.known_targets.write().insert(prev_blockhash, target);
-                target
-            }
-        };
+        let target = self.next_target(prev_blockhash).await?;
         let coinbase_txn_or_value = if let Some(coinbase_txn) = coinbase_txn {
             let fee = coinbase_txn
                 .output
@@ -1147,6 +1645,52 @@ where
                 jsonrpsee::core::ClientError::Call(err) => err,
                 err => internal_error(err),
             })
+    }
+
+    async fn submit_slipstream_tx(
+        &self,
+        tx_hex: String,
+    ) -> RpcResult<SubmitSlipstreamTxResponse> {
+        self.submit_slipstream(tx_hex).await
+    }
+
+    async fn get_slipstream_tx(
+        &self,
+        txid: Txid,
+    ) -> RpcResult<SlipstreamTxStatus> {
+        if self.slipstream.is_none() {
+            return Err(slipstream_disabled());
+        }
+        self.mempool
+            .with_slipstream(|_mempool, pool| pool.status(txid))
+            .await
+            .ok_or_else(mempool_unavailable)
+    }
+
+    async fn list_slipstream_txs(&self) -> RpcResult<Vec<SlipstreamTxInfo>> {
+        if self.slipstream.is_none() {
+            return Err(slipstream_disabled());
+        }
+        self.mempool
+            .with_slipstream(|_mempool, pool| {
+                let mut txs: Vec<SlipstreamTxInfo> =
+                    pool.iter().map(SlipstreamTxInfo::from).collect();
+                txs.sort_by_key(|info| (info.submitted_at, info.txid));
+                txs
+            })
+            .await
+            .ok_or_else(mempool_unavailable)
+    }
+
+    async fn remove_slipstream_tx(&self, txid: Txid) -> RpcResult<Vec<Txid>> {
+        if self.slipstream.is_none() {
+            return Err(slipstream_disabled());
+        }
+        self.mempool
+            .remove_slipstream_tx(txid)
+            .await
+            .ok_or_else(mempool_unavailable)?
+            .map_err(|err| internal_error(log_error(err)))
     }
 }
 

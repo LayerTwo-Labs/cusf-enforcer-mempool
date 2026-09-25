@@ -123,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
         None,
         sample_block_template,
     )?;
+    let server = if cli.enable_slipstream {
+        server.with_slipstream(server::SlipstreamConfig::default())
+    } else {
+        server
+    };
     let rpc_server_handle =
         spawn_rpc_server(server, cli.serve_rpc_addr).await?;
     let () = rpc_server_handle.stopped().await;

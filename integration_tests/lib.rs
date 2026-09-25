@@ -17,5 +17,6 @@ pub mod test_rbf_removed_for_absent_tx;
 pub mod test_rejected_block_disconnect;
 pub mod test_reorg_re_inserts_tx;
 pub mod test_reorg_reinserts_parent_under_child;
+pub mod test_slipstream;
 pub mod test_tx_replaced_during_fetch;
 pub mod util;
