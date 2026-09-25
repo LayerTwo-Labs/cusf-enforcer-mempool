@@ -26,6 +26,9 @@ pub struct Cli {
     /// Bitcoin node ZMQ endpoint for `sequence`
     #[arg(long)]
     pub node_zmq_addr_sequence: String,
+    /// Accept slipstream txs (`submitslipstreamtx`), with the default limits
+    #[arg(long)]
+    pub enable_slipstream: bool,
     /// Serve `getblocktemplate` RPC from this address
     #[arg(default_value_t = DEFAULT_SERVE_RPC_ADDR, long)]
     pub serve_rpc_addr: SocketAddr,

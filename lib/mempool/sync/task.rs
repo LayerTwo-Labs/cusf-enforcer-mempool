@@ -37,6 +37,7 @@ use crate::{
     },
     mempool::{
         Mempool, MempoolInsertError, MempoolRemoveError, MempoolUpdateError,
+        slipstream::{SlipstreamPool, SlipstreamRemoval, SlipstreamTx},
         sync::{
             ApplySyncActionResult, ApplySyncActionTimeoutError,
             BatchedResponseItem, CombinedStream, CombinedStreamItem,
@@ -125,6 +126,9 @@ struct MempoolSyncInner<Enforcer> {
     abandoned_pool: AbandonedPool,
     enforcer: Enforcer,
     mempool: Mempool,
+    /// Txs submitted directly rather than mirrored from the node. Each is also
+    /// in `mempool`, but never in `unfiltered_mempool` on its own account.
+    slipstream: SlipstreamPool,
     /// Publishes `mempool.chain.tip` whenever it changes, so observers (e.g.
     /// the GBT server's BIP22 long polling) can wait on tip changes without
     /// polling. Receivers come from [`MempoolSync::subscribe_tip`].
@@ -190,6 +194,87 @@ impl<Enforcer> MempoolSyncingBorrowed<'_, Enforcer> {
             && self.sync_state.txs_needed.is_empty()
             && self.sync_state.action_queue.is_empty()
             && self.inner.mempool.chain.tip == self.inner.unfiltered_mempool.tip
+    }
+}
+
+/// Remove a slipstream tx, and its descendants, from the mempool and the pool.
+///
+/// Descendants are slipstream txs, unless the node also had the tx and txs of
+/// its own spend it. Those the node drops and announces itself, and removing
+/// them again then is a no-op.
+fn evict_slipstream_tx<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    txid: &Txid,
+    reason: SlipstreamRemoval,
+) -> Result<(), MempoolRemoveError> {
+    let removed = inner.mempool.remove_with_descendants(txid)?;
+    for removed_txid in removed.keys() {
+        let _removed: Option<_> =
+            inner.slipstream.remove(removed_txid, reason.clone());
+    }
+    let _removed: Option<_> = inner.slipstream.remove(txid, reason);
+    Ok(())
+}
+
+/// Evict the slipstream txs spending `parent`, which has left the mempool
+/// without being mined.
+///
+/// The node drops the descendants of every tx it removes, and announces each
+/// one. It never had the slipstream descendants, so it cannot announce them.
+fn evict_slipstream_children_of<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    parent: &Txid,
+) -> Result<(), MempoolRemoveError> {
+    for child in inner.slipstream.children_of(parent) {
+        tracing::debug!(%child, %parent, "evicting slipstream tx: parent removed");
+        let () = evict_slipstream_tx(
+            inner,
+            &child,
+            SlipstreamRemoval::ParentRemoved { parent: *parent },
+        )?;
+    }
+    Ok(())
+}
+
+/// Evict every slipstream tx when a block disconnects.
+///
+/// A reorg can leave a tx invalid: a parent that does not return, a coinbase
+/// no longer mature, a timelock no longer met. The node re-checks its own txs
+/// and announces the ones it drops, but it never had these. Evicting them all
+/// is blunt, but reorgs are rare and it cannot put an invalid tx in a
+/// template. A tx the node also has is only released back to the node.
+fn evict_slipstream_on_disconnect<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    block_hash: BlockHash,
+) -> Result<(), MempoolRemoveError> {
+    let reason = SlipstreamRemoval::Reorged { block_hash };
+    let txids: Vec<Txid> = inner.slipstream.txids().copied().collect();
+    for txid in txids {
+        if !inner.slipstream.contains(&txid) {
+            // Went as a descendant of an earlier one
+            continue;
+        }
+        if inner.unfiltered_mempool.txs.contains(&txid) {
+            let _removed: Option<_> =
+                inner.slipstream.remove(&txid, reason.clone());
+        } else {
+            tracing::debug!(%txid, %block_hash, "evicting slipstream tx: reorg");
+            let () = evict_slipstream_tx(inner, &txid, reason.clone())?;
+        }
+    }
+    Ok(())
+}
+
+/// Forget pool entries whose tx another path has already removed from the
+/// mempool, so that the pool never holds a tx the mempool does not.
+fn prune_slipstream<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    reason: SlipstreamRemoval,
+) {
+    for txid in inner.slipstream.missing_from(&inner.mempool) {
+        tracing::debug!(%txid, ?reason, "slipstream tx left the mempool");
+        let _removed: Option<_> =
+            inner.slipstream.remove(&txid, reason.clone());
     }
 }
 
@@ -282,16 +367,65 @@ where
         .map_err(cusf_enforcer::Error::ConnectBlock)?
     {
         ConnectBlockAction::Accept { remove_mempool_txs } => {
+            // The node evicts its own txs that this block conflicts with, and
+            // announces each eviction. No one announces a slipstream tx the
+            // block has made invalid, so find those here, before the loop
+            // below consumes the block.
+            let slipstream_conflicts: Vec<(Txid, Txid)> =
+                if inner.slipstream.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut conflicts = Vec::new();
+                    for tx in &block_decoded.txdata {
+                        let txid = tx.compute_txid();
+                        for input in &tx.input {
+                            if let Some(spender) =
+                                inner.slipstream.spender(&input.previous_output)
+                                && spender != txid
+                            {
+                                conflicts.push((spender, txid));
+                            }
+                        }
+                    }
+                    conflicts
+                };
             let mut mined_txids = HashSet::new();
             for tx in block_decoded.txdata {
                 let txid = tx.compute_txid();
                 let _removed: Option<_> = inner.mempool.remove(&txid)?;
+                let _mined: Option<_> = inner.slipstream.remove(
+                    &txid,
+                    SlipstreamRemoval::Mined {
+                        block_hash: block.hash,
+                    },
+                );
                 sync_state.txs_needed.remove(&txid);
                 sync_state
                     .request_queue
                     .remove(&RequestItem::Tx(txid, true));
                 sync_state.tx_cache.insert(txid, tx);
                 mined_txids.insert(txid);
+            }
+            for (slipstream_txid, spent_by) in slipstream_conflicts {
+                if !inner.slipstream.contains(&slipstream_txid) {
+                    // Already evicted, through another input it shares with
+                    // this block
+                    continue;
+                }
+                tracing::debug!(
+                    %slipstream_txid,
+                    %spent_by,
+                    block_hash = %block.hash,
+                    "evicting slipstream tx: block spent one of its inputs",
+                );
+                let () = evict_slipstream_tx(
+                    inner,
+                    &slipstream_txid,
+                    SlipstreamRemoval::ConflictMined {
+                        block_hash: block.hash,
+                        spent_by,
+                    },
+                )?;
             }
             for txid in remove_mempool_txs {
                 let removed = inner.mempool.remove_with_descendants(&txid)?;
@@ -320,6 +454,8 @@ where
                         .push_front(RequestItem::RejectTx(txid));
                 }
             }
+            let () =
+                prune_slipstream(inner, SlipstreamRemoval::RejectedByEnforcer);
             inner.mempool.chain.tip = block.hash;
             let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
         }
@@ -395,6 +531,8 @@ where
                 request_queue.push_front(RequestItem::RejectTx(txid));
             }
         }
+        let () = prune_slipstream(inner, SlipstreamRemoval::RejectedByEnforcer);
+        let () = evict_slipstream_on_disconnect(inner, block.hash)?;
         inner.mempool.chain.tip = prev_blockhash;
         let _prev: BlockHash = inner.tip_watch.send_replace(prev_blockhash);
     }
@@ -855,10 +993,17 @@ where
                     let modified_weight_wu =
                         tx.weight().to_wu().saturating_add_signed(weight_tweak);
                     let modified_weight = Weight::from_wu(modified_weight_wu);
+                    // The node has refused any double spend of its own txs
+                    // already, but it has never seen a slipstream tx, so a
+                    // double spend of one has to be declared here.
+                    let conflicts_with: imbl::OrdSet<Txid> = conflicts_with
+                        .into_iter()
+                        .chain(inner.slipstream.conflicts(tx))
+                        .collect();
                     match inner.mempool.insert(
                         tx.clone(),
                         fee_delta,
-                        conflicts_with.into(),
+                        conflicts_with,
                         modified_weight,
                     ) {
                         Ok(_) => (),
@@ -904,6 +1049,10 @@ where
                             .request_queue
                             .push_front(RequestItem::RejectTx(rejected_tx));
                     }
+                    let () = prune_slipstream(
+                        inner,
+                        SlipstreamRemoval::ParentRemoved { parent: txid },
+                    );
                     inner.unfiltered_mempool.txs.insert(txid);
                     Ok(true)
                 }
@@ -978,8 +1127,13 @@ where
             zmq_seq: _,
         }) => {
             if inner.unfiltered_mempool.txs.remove(txid) {
-                inner.mempool.remove(txid)?;
-                inner.abandoned_pool.remove(txid);
+                // The node had a copy of a slipstream tx -- someone relayed
+                // it -- and has dropped it. Ours was never the node's to drop.
+                if !inner.slipstream.contains(txid) {
+                    inner.mempool.remove(txid)?;
+                    inner.abandoned_pool.remove(txid);
+                    let () = evict_slipstream_children_of(inner, txid)?;
+                }
                 Ok(ApplySyncActionResult::from(true))
             } else {
                 Err(SyncTaskError::UnfilteredMempoolMissingTx(*txid))
@@ -1396,6 +1550,7 @@ where
         abandoned_pool: AbandonedPool::default(),
         enforcer,
         mempool: Mempool::new(best_block_hash),
+        slipstream: SlipstreamPool::default(),
         tip_watch,
         unfiltered_mempool: UnfilteredMempool {
             tip: best_block_hash,
@@ -1472,6 +1627,7 @@ where
                 abandoned_pool,
                 enforcer: _,
                 mempool,
+                slipstream,
                 tip_watch,
                 unfiltered_mempool,
             } = inner.into_inner();
@@ -1480,6 +1636,7 @@ where
                     abandoned_pool,
                     enforcer: (),
                     mempool,
+                    slipstream,
                     tip_watch,
                     unfiltered_mempool,
                 },
@@ -1535,6 +1692,7 @@ where
                         abandoned_pool,
                         enforcer: (),
                         mempool,
+                        slipstream,
                         tip_watch,
                         unfiltered_mempool,
                     },
@@ -1545,6 +1703,7 @@ where
                 abandoned_pool,
                 enforcer,
                 mempool,
+                slipstream,
                 tip_watch,
                 unfiltered_mempool,
             };
@@ -1582,6 +1741,221 @@ where
         let res = f(&inner_read.mempool, &inner_read.enforcer).await;
         Some(res)
     }
+
+    /// Apply a function over the mempool and the slipstream pool.
+    /// Returns `None` if the mempool is unavailable due to an error.
+    pub async fn with_slipstream<F, Output>(&self, f: F) -> Option<Output>
+    where
+        F: FnOnce(&Mempool, &SlipstreamPool) -> Output,
+    {
+        let inner = self.inner.upgrade()?;
+        let inner_read = inner.read().await;
+        Some(f(&inner_read.mempool, &inner_read.slipstream))
+    }
+
+    /// Insert a slipstream tx that the caller has already checked against the
+    /// node. See [`InsertSlipstreamTx`] for what the caller must establish.
+    /// Returns `None` if the mempool is unavailable due to an error.
+    pub async fn insert_slipstream_tx(
+        &self,
+        insert: InsertSlipstreamTx,
+    ) -> Option<Result<SlipstreamInserted, InsertSlipstreamTxError<Enforcer>>>
+    {
+        let inner = self.inner.upgrade()?;
+        let mut inner_write = inner.write().await;
+        Some(insert_slipstream_tx(&mut inner_write, insert))
+    }
+
+    /// Withdraw a slipstream tx, and any slipstream txs spending it.
+    /// Returns the txids that left the mempool, which is empty if the tx was
+    /// not a slipstream tx, and also empty if the node holds its own copy: then
+    /// it is only no longer kept once the node drops it.
+    /// Returns `None` if the mempool is unavailable due to an error.
+    pub async fn remove_slipstream_tx(
+        &self,
+        txid: Txid,
+    ) -> Option<Result<Vec<Txid>, MempoolRemoveError>> {
+        let inner = self.inner.upgrade()?;
+        let mut inner_write = inner.write().await;
+        let inner = &mut *inner_write;
+        if !inner.slipstream.contains(&txid) {
+            return Some(Ok(Vec::new()));
+        }
+        if inner.unfiltered_mempool.txs.contains(&txid) {
+            let _removed: Option<_> =
+                inner.slipstream.remove(&txid, SlipstreamRemoval::Withdrawn);
+            return Some(Ok(Vec::new()));
+        }
+        let res = inner.mempool.remove_with_descendants(&txid).map(|removed| {
+            let removed: Vec<Txid> = removed.keys().copied().collect();
+            for removed_txid in &removed {
+                let _removed: Option<_> = inner
+                    .slipstream
+                    .remove(removed_txid, SlipstreamRemoval::Withdrawn);
+            }
+            removed
+        });
+        Some(res)
+    }
+}
+
+/// A slipstream tx, validated by the caller, to insert into the mempool.
+///
+/// Consensus validity is the node's question, so the caller must have had the
+/// node check a block containing `tx` and its in-mempool ancestors on top of
+/// `tip`. The insert re-checks, under the mempool lock, that nothing that
+/// check depended on has moved since.
+#[derive(Clone, Debug)]
+pub struct InsertSlipstreamTx {
+    pub tx: Transaction,
+    pub fee: Amount,
+    /// Tip the tx was validated against
+    pub tip: BlockHash,
+    /// In-mempool parents the tx was validated with
+    pub mempool_parents: Vec<Txid>,
+    pub sigop_cost: usize,
+    /// Unix time, in seconds
+    pub submitted_at: u64,
+    /// Refuse the insert if the pool already holds this many txs
+    pub max_txs: usize,
+    /// Refuse the insert if it would take the pool's sigop cost past this
+    pub max_total_sigop_cost: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SlipstreamInserted {
+    /// The tx was already in the mempool. If the node had it rather than the
+    /// pool, it is now kept even if the node drops it.
+    pub already_present: bool,
+    /// Mempool txs it competes with for the same inputs, or that the enforcer
+    /// declared a conflict with. At most one of each set is mined.
+    pub conflicts_with: Vec<Txid>,
+}
+
+#[derive(Educe)]
+#[educe(Debug(bound(cusf_enforcer::Error<Enforcer>: std::fmt::Debug)))]
+#[derive(Error)]
+pub enum InsertSlipstreamTxError<Enforcer>
+where
+    Enforcer: CusfEnforcer,
+{
+    #[error(transparent)]
+    CusfEnforcer(#[from] cusf_enforcer::Error<Enforcer>),
+    #[error("slipstream pool is full ({0} txs)")]
+    Full(usize),
+    #[error("slipstream pool sigop budget exceeded ({0} in use)")]
+    SigopBudget(usize),
+    #[error(transparent)]
+    MempoolInsert(#[from] MempoolInsertError),
+    #[error("parent tx `{0}` left the mempool")]
+    ParentGone(Txid),
+    #[error("rejected by the enforcer")]
+    RejectedByEnforcer,
+    #[error("tip moved from `{expected}` to `{tip}`")]
+    TipChanged { expected: BlockHash, tip: BlockHash },
+}
+
+fn insert_slipstream_tx<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    insert: InsertSlipstreamTx,
+) -> Result<SlipstreamInserted, InsertSlipstreamTxError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    let InsertSlipstreamTx {
+        tx,
+        fee,
+        tip,
+        mempool_parents,
+        sigop_cost,
+        submitted_at,
+        max_txs,
+        max_total_sigop_cost,
+    } = insert;
+    let txid = tx.compute_txid();
+    if inner.mempool.chain.tip != tip {
+        return Err(InsertSlipstreamTxError::TipChanged {
+            expected: tip,
+            tip: inner.mempool.chain.tip,
+        });
+    }
+    if inner.slipstream.contains(&txid) {
+        return Ok(SlipstreamInserted {
+            already_present: true,
+            conflicts_with: Vec::new(),
+        });
+    }
+    if inner.slipstream.len() >= max_txs {
+        return Err(InsertSlipstreamTxError::Full(inner.slipstream.len()));
+    }
+    if inner.slipstream.total_sigop_cost() + sigop_cost > max_total_sigop_cost {
+        return Err(InsertSlipstreamTxError::SigopBudget(
+            inner.slipstream.total_sigop_cost(),
+        ));
+    }
+    if inner.mempool.contains(&txid) {
+        // The node already has it. Keep it past the node dropping it.
+        inner.slipstream.insert(SlipstreamTx {
+            tx,
+            fee,
+            sigop_cost,
+            submitted_at,
+        });
+        return Ok(SlipstreamInserted {
+            already_present: true,
+            conflicts_with: Vec::new(),
+        });
+    }
+    if let Some(parent) = mempool_parents
+        .iter()
+        .find(|parent| !inner.mempool.contains(parent))
+    {
+        return Err(InsertSlipstreamTxError::ParentGone(*parent));
+    }
+    let cusf_enforcer::TxAcceptAction::Accept {
+        conflicts_with,
+        weight_tweak,
+    } = inner
+        .enforcer
+        .accept_tx(&tx)
+        .map_err(cusf_enforcer::Error::AcceptTx)?
+    else {
+        return Err(InsertSlipstreamTxError::RejectedByEnforcer);
+    };
+    // The mempool only tracks conflicts it is told about, because everything
+    // else in it is the node's and the node refuses double spends. This tx
+    // never went past the node, so its double spends have to be declared.
+    let conflicts_with: imbl::OrdSet<Txid> = conflicts_with
+        .into_iter()
+        .chain(tx.input.iter().flat_map(|input| {
+            inner.mempool.spenders_of(&input.previous_output)
+        }))
+        .collect();
+    let modified_weight = Weight::from_wu(
+        tx.weight().to_wu().saturating_add_signed(weight_tweak),
+    );
+    let _replaced: Option<_> = inner.mempool.insert(
+        tx.clone(),
+        fee,
+        conflicts_with.clone(),
+        modified_weight,
+    )?;
+    inner.slipstream.insert(SlipstreamTx {
+        tx,
+        fee,
+        sigop_cost,
+        submitted_at,
+    });
+    tracing::debug!(
+        %txid,
+        fee = %fee.display_dynamic(),
+        conflicts = conflicts_with.len(),
+        "inserted slipstream tx",
+    );
+    Ok(SlipstreamInserted {
+        already_present: false,
+        conflicts_with: conflicts_with.into_iter().collect(),
+    })
 }
 
 #[cfg(test)]
@@ -1636,6 +2010,7 @@ mod tests {
             abandoned_pool: AbandonedPool::default(),
             enforcer: DefaultEnforcer,
             mempool: Mempool::new(genesis),
+            slipstream: SlipstreamPool::default(),
             tip_watch,
             unfiltered_mempool: UnfilteredMempool {
                 tip: genesis,

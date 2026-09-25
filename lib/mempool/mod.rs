@@ -11,12 +11,20 @@ use thiserror::Error;
 pub mod dat;
 pub mod iter;
 pub mod iter_mut;
+pub mod slipstream;
 mod sync;
 
 pub use dat::{MempoolDat, ReadMempoolDatError, read_mempool_dat};
+pub use slipstream::{
+    SlipstreamPool, SlipstreamRemoval, SlipstreamTx, SlipstreamTxInfo,
+    SlipstreamTxStatus,
+};
 pub use sync::{
     InitialSyncMempoolError, MempoolSync, init_sync_mempool,
-    task::SyncTaskError,
+    task::{
+        InsertSlipstreamTx, InsertSlipstreamTxError, SlipstreamInserted,
+        SyncTaskError,
+    },
 };
 
 mod refinement_cmp {
@@ -517,6 +525,14 @@ impl Mempool {
 
     pub fn tip(&self) -> &bitcoin_jsonrpsee::client::Block<true> {
         &self.chain.blocks[&self.chain.tip]
+    }
+
+    pub fn contains(&self, txid: &Txid) -> bool {
+        self.txs.0.contains_key(txid)
+    }
+
+    pub fn get(&self, txid: &Txid) -> Option<&Transaction> {
+        self.txs.0.get(txid).map(|(tx, _info)| tx)
     }
 
     /// Insert a tx into the mempool,
