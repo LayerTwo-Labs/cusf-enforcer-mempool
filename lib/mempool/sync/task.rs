@@ -322,6 +322,7 @@ where
             }
             inner.mempool.chain.tip = block.hash;
             let _prev: BlockHash = inner.tip_watch.send_replace(block.hash);
+            prune_below_depth(inner, sync_state.tx_cache, block.height);
         }
         ConnectBlockAction::Reject => {
             sync_state.rejected_blocks.insert(block.hash);
@@ -331,6 +332,42 @@ where
         }
     };
     Ok(())
+}
+
+/// Confirmed blocks (and their txs in `tx_cache`) kept for reorg handling
+/// and fee lookups. Anything older is refetched on demand, exactly as after
+/// a restart (initial sync seeds only the tip).
+const RETAIN_BLOCK_DEPTH: u32 = 12;
+
+/// Drop `chain.blocks` entries, and the `tx_cache` entries of their txs,
+/// more than `RETAIN_BLOCK_DEPTH` below `tip_height`. Without this both maps
+/// grow by every connected block's full tx set and are never freed.
+fn prune_below_depth<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
+    tx_cache: &mut HashMap<Txid, Transaction>,
+    tip_height: u32,
+) {
+    let Some(min_height) = tip_height.checked_sub(RETAIN_BLOCK_DEPTH) else {
+        return;
+    };
+    let tip = inner.mempool.chain.tip;
+    let stale: Vec<BlockHash> = inner
+        .mempool
+        .chain
+        .blocks
+        .iter()
+        .filter(|(hash, b)| b.height < min_height && **hash != tip)
+        .map(|(hash, _)| *hash)
+        .collect();
+    for hash in stale {
+        if let Some(b) = inner.mempool.chain.blocks.remove(&hash) {
+            for tx_info in &b.tx {
+                if !inner.unfiltered_mempool.txs.contains(&tx_info.txid) {
+                    tx_cache.remove(&tx_info.txid);
+                }
+            }
+        }
+    }
 }
 
 /// Returns `false` without applying the disconnect if the parent block must
