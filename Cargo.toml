@@ -38,7 +38,7 @@ zeromq = "0.6.0"
 
 [workspace.dependencies.bitcoin-jsonrpsee]
 git = "https://github.com/LayerTwo-Labs/bitcoin-jsonrpsee.git"
-rev = "3ca15900bef3c9a2fd83003f71480a738411f35e"
+rev = "2ec731f3edcbc8fe290060bb9bac760256e03306"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
