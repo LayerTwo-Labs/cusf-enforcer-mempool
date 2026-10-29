@@ -490,6 +490,11 @@ fn saturating_sub_weight(lhs: Weight, rhs: Weight) -> Weight {
     Weight::from_wu(res_wu)
 }
 
+#[inline(always)]
+fn saturating_sub_fee(lhs: Amount, rhs: Amount) -> Amount {
+    lhs.checked_sub(rhs).unwrap_or(Amount::ZERO)
+}
+
 // MUST be cheap to clone so that constructing block templates is cheap
 #[derive(Clone, Debug)]
 pub struct Mempool {
@@ -748,7 +753,14 @@ impl Mempool {
                     modified_weight,
                 );
                 desc_info.ancestor_vsize -= vsize;
-                desc_info.fees.ancestor -= fees.modified;
+                // Saturating, like `ancestor_modified_weight` just above. An
+                // out-of-order insert (a middle tx added after its own child
+                // but under an already-present parent) adds only the middle
+                // tx's own `modified` fee to a pre-existing descendant's
+                // ancestor total, never re-propagating the grandparent's fee,
+                // so that total can be short of what is subtracted here.
+                desc_info.fees.ancestor =
+                    saturating_sub_fee(desc_info.fees.ancestor, fees.modified);
                 let ancestor_fee_rate = FeeRate {
                     fee: desc_info.fees.ancestor,
                     vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
@@ -770,7 +782,10 @@ impl Mempool {
                         modified_weight,
                     );
                     anc_info.descendant_vsize -= vsize;
-                    anc_info.fees.descendant -= fees.modified;
+                    anc_info.fees.descendant = saturating_sub_fee(
+                        anc_info.fees.descendant,
+                        fees.modified,
+                    );
                     anc_info.spent_by.remove(txid);
                     Ok(())
                 })?;
@@ -1054,5 +1069,42 @@ mod tests {
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    /// A 3-tx chain X -> M -> D inserted out of order as [X, D, M]: the middle
+    /// tx M arrives after its own child D but while its parent X is already
+    /// present. `insert` adds only M's own `modified` fee to D's ancestor
+    /// total and never re-propagates X's fee, so D.fees.ancestor is left short
+    /// of X's fee. A later `remove(X)` (X confirmed, or dry-run-dropped while
+    /// building a template) still walks D as a descendant and subtracts X's
+    /// fee from D's short total. Before this fix the plain `-=` underflowed and
+    /// `getblocktemplate` panicked with "Amount subtraction error"; it must
+    /// saturate instead.
+    #[test]
+    fn remove_ancestor_does_not_underflow_out_of_order_descendant_fee() {
+        let mut mempool = test_mempool();
+        let x = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let x_txid = x.compute_txid();
+        let m = make_tx(&[OutPoint::new(x_txid, 0)], 1);
+        let m_txid = m.compute_txid();
+        let d = make_tx(&[OutPoint::new(m_txid, 0)], 1);
+
+        // X's fee exceeds D's + M's, so the short descendant total underflows.
+        let xw = x.weight();
+        mempool
+            .insert(x, Amount::from_sat(10_000), OrdSet::new(), xw)
+            .unwrap();
+        let dw = d.weight();
+        mempool
+            .insert(d, Amount::from_sat(100), OrdSet::new(), dw)
+            .unwrap();
+        let mw = m.weight();
+        mempool
+            .insert(m, Amount::from_sat(100), OrdSet::new(), mw)
+            .unwrap();
+
+        mempool.remove_with_descendants(&x_txid).expect(
+            "removing an ancestor must not underflow a descendant's fee total",
+        );
     }
 }
