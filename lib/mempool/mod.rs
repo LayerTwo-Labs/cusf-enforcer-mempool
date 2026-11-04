@@ -1244,4 +1244,236 @@ mod tests {
         mempool.remove(&x.compute_txid()).unwrap();
         assert_eq!(info(&mempool, &d).fees.ancestor, Amount::from_sat(300));
     }
+
+    /// A tx spending each of `parents`' output 0 (or a unique
+    /// out-of-mempool outpoint, for a root), with one output.
+    fn spend(parents: &[&Transaction], root_tag: u8) -> Transaction {
+        let inputs: Vec<OutPoint> = if parents.is_empty() {
+            vec![OutPoint::new(Txid::from_byte_array([root_tag; 32]), 0)]
+        } else {
+            parents
+                .iter()
+                .map(|parent| OutPoint::new(parent.compute_txid(), 0))
+                .collect()
+        };
+        make_tx(&inputs, 1)
+    }
+
+    /// Recompute every tx's ancestor/descendant aggregates from the tx
+    /// graph (inputs), independently of `depends`/`spent_by`, and assert
+    /// that the incrementally maintained values, the graph links and the
+    /// `by_ancestor_fee_rate` index all match.
+    fn assert_consistent(mempool: &Mempool) {
+        let txs = &mempool.txs.0;
+        let parents = |txid: &Txid| -> std::collections::BTreeSet<Txid> {
+            txs[txid]
+                .0
+                .input
+                .iter()
+                .map(|input| input.previous_output.txid)
+                .filter(|parent| txs.contains_key(parent))
+                .collect()
+        };
+        let closure = |start: Txid,
+                       step: &dyn Fn(&Txid) -> Vec<Txid>|
+         -> std::collections::BTreeSet<Txid> {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut stack = step(&start);
+            while let Some(next) = stack.pop() {
+                if seen.insert(next) {
+                    stack.extend(step(&next));
+                }
+            }
+            seen
+        };
+        let children = |txid: &Txid| -> Vec<Txid> {
+            txs.keys()
+                .filter(|other| parents(other).contains(txid))
+                .copied()
+                .collect()
+        };
+        let mut index_len = 0;
+        for (_, txids) in mempool.by_ancestor_fee_rate.0.iter() {
+            index_len += txids.len();
+        }
+        assert_eq!(index_len, txs.len(), "by_ancestor_fee_rate size");
+        for (txid, (tx, info)) in txs.iter() {
+            let ancestors =
+                closure(*txid, &|t: &Txid| parents(t).into_iter().collect());
+            let descendants = closure(*txid, &children);
+            let sum = |set: &std::collections::BTreeSet<Txid>| {
+                let mut fee = info.fees.modified;
+                let mut vsize = tx.vsize() as u64;
+                let mut weight = info.modified_weight;
+                for other in set {
+                    let (other_tx, other_info) = &txs[other];
+                    fee += other_info.fees.modified;
+                    vsize += other_tx.vsize() as u64;
+                    weight += other_info.modified_weight;
+                }
+                (fee, vsize, weight)
+            };
+            let (anc_fee, anc_vsize, anc_weight) = sum(&ancestors);
+            let (desc_fee, desc_vsize, desc_weight) = sum(&descendants);
+            assert_eq!(info.fees.ancestor, anc_fee, "{txid} ancestor fee");
+            assert_eq!(info.ancestor_vsize, anc_vsize, "{txid} ancestor vsize");
+            assert_eq!(
+                info.ancestor_modified_weight, anc_weight,
+                "{txid} ancestor weight"
+            );
+            assert_eq!(info.fees.descendant, desc_fee, "{txid} desc fee");
+            assert_eq!(info.descendant_vsize, desc_vsize, "{txid} desc vsize");
+            assert_eq!(
+                info.descendant_modified_weight, desc_weight,
+                "{txid} desc weight"
+            );
+            let depends: std::collections::BTreeSet<Txid> =
+                info.depends.iter().copied().collect();
+            assert_eq!(depends, parents(txid), "{txid} depends");
+            let spent_by: std::collections::BTreeSet<Txid> =
+                info.spent_by.iter().copied().collect();
+            let expected_spent_by: std::collections::BTreeSet<Txid> =
+                children(txid).into_iter().collect();
+            assert_eq!(spent_by, expected_spent_by, "{txid} spent_by");
+            let key = refinement_cmp::RefinementCmp(FeeRate {
+                fee: anc_fee,
+                vsize: anc_weight.to_vbytes_ceil(),
+            });
+            assert!(
+                mempool
+                    .by_ancestor_fee_rate
+                    .0
+                    .get(&key)
+                    .is_some_and(|keyed| keyed.contains(txid)),
+                "{txid} not keyed at its ancestor fee rate"
+            );
+        }
+    }
+
+    /// Insert `txs` (with fees) in the given order, checking consistency
+    /// after every insert.
+    fn build(txs: &[(&Transaction, u64)]) -> Mempool {
+        let mut mempool = test_mempool();
+        for (tx, fee) in txs {
+            insert_tx(&mut mempool, tx, *fee);
+            assert_consistent(&mempool);
+        }
+        mempool
+    }
+
+    /// Insert `txs` (with fees) in the given order, without checking
+    /// consistency, so a later operation hits whatever was stored.
+    fn build_unchecked(txs: &[(&Transaction, u64)]) -> Mempool {
+        let mut mempool = test_mempool();
+        for (tx, fee) in txs {
+            insert_tx(&mut mempool, tx, *fee);
+        }
+        mempool
+    }
+
+    /// Remove `order` one at a time via `remove` (the block-connect path,
+    /// which removes a block's txs in block order), checking consistency
+    /// after every removal.
+    fn remove_all(mut mempool: Mempool, order: &[&Transaction]) {
+        for tx in order {
+            let txid = tx.compute_txid();
+            let removed = mempool.remove(&txid).expect("remove failed");
+            assert!(removed.is_some(), "{txid} missing");
+            assert_consistent(&mempool);
+        }
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    /// G -> P -> C, inserted C, G, P (as a reorg can return them).
+    fn chain3() -> (Transaction, Transaction, Transaction) {
+        let g = spend(&[], 1);
+        let p = spend(&[&g], 0);
+        let c = spend(&[&p], 0);
+        (g, p, c)
+    }
+
+    #[test]
+    fn late_middle_chain3_remove_grandparent_first() {
+        // High-fee grandparent: removing G subtracts more from C's stored
+        // ancestor fee (which never included G) than C holds.
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&c, 100), (&g, 10_000), (&p, 100)]);
+        remove_all(mempool, &[&g, &p, &c]);
+    }
+
+    #[test]
+    fn late_middle_chain3_remove_child_first() {
+        // High-fee child over low-fee parents: removing C subtracts more
+        // from G's stored descendant fee (which never included C) than G
+        // holds.
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&c, 10_000), (&g, 100), (&p, 100)]);
+        remove_all(mempool, &[&c, &p, &g]);
+    }
+
+    /// The prod panic: block connect removes a block's txs in block order
+    /// (parents first) via `remove`.
+    #[test]
+    fn late_middle_chain3_block_connect_grandparent_first_no_panic() {
+        let (g, p, c) = chain3();
+        let mut mempool =
+            build_unchecked(&[(&c, 100), (&g, 10_000), (&p, 100)]);
+        for tx in [&g, &p, &c] {
+            mempool.remove(&tx.compute_txid()).expect("remove failed");
+        }
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    #[test]
+    fn late_middle_chain3_child_first_no_panic() {
+        let (g, p, c) = chain3();
+        let mut mempool =
+            build_unchecked(&[(&c, 10_000), (&g, 100), (&p, 100)]);
+        for tx in [&c, &p, &g] {
+            mempool.remove(&tx.compute_txid()).expect("remove failed");
+        }
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    #[test]
+    fn late_middle_chain3_propose_txs() {
+        // The getblocktemplate path: `propose_txs` removes each selected
+        // tx (parents first) from a clone of the mempool.
+        let (g, p, c) = chain3();
+        let mempool = build_unchecked(&[(&c, 100), (&g, 10_000), (&p, 100)]);
+        let proposed = mempool.propose_txs(None).expect("propose_txs");
+        let proposed: Vec<Txid> = proposed.iter().map(|tx| tx.txid).collect();
+        assert_eq!(
+            proposed,
+            vec![g.compute_txid(), p.compute_txid(), c.compute_txid()]
+        );
+    }
+
+    /// With understated ancestor weights, `propose_txs` charges a package
+    /// less weight than the txs it actually adds, and can exceed the limit.
+    #[test]
+    fn late_middle_chain3_propose_txs_respects_weight_limit() {
+        let (g, p, c) = chain3();
+        let mempool = build_unchecked(&[(&g, 10_000), (&c, 100), (&p, 100)]);
+        let limit = g.weight() + p.weight();
+        let proposed = mempool.propose_txs(Some(limit)).expect("propose_txs");
+        let total: u64 = proposed.iter().map(|tx| tx.weight).sum();
+        assert!(
+            total <= limit.to_wu(),
+            "proposed {total} WU over a {} WU limit",
+            limit.to_wu()
+        );
+    }
+
+    #[test]
+    fn diamond_one_parent_late() {
+        // P1, P2 -> C, inserted P1, C, P2
+        let p1 = spend(&[], 3);
+        let p2 = spend(&[], 4);
+        let c = spend(&[&p1, &p2], 0);
+        for order in [[&p1, &p2, &c], [&c, &p2, &p1], [&p2, &c, &p1]] {
+            let mempool = build(&[(&p1, 100), (&c, 9_000), (&p2, 4_000)]);
+            remove_all(mempool, &order);
+        }
+    }
 }
