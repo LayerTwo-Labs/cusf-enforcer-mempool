@@ -330,6 +330,17 @@ pub enum MempoolRemoveError {
     MissingDescendantsKey(#[from] MissingDescendantsKeyError),
 }
 
+impl From<MempoolRemoveError> for MempoolInsertError {
+    fn from(err: MempoolRemoveError) -> Self {
+        match err {
+            MempoolRemoveError::MissingAncestor(err) => err.into(),
+            MempoolRemoveError::MissingByAncestorFeeRateKey(err) => err.into(),
+            MempoolRemoveError::MissingDescendant(err) => err.into(),
+            MempoolRemoveError::MissingDescendantsKey(err) => err.into(),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MempoolUpdateError {
     #[error(transparent)]
@@ -484,10 +495,25 @@ fn saturating_add_weight(lhs: Weight, rhs: Weight) -> Weight {
     Weight::from_wu(res_wu)
 }
 
+/// `*lhs -= rhs`, clamping to `zero` on underflow.
+/// Returns `false` on underflow.
 #[inline(always)]
-fn saturating_sub_weight(lhs: Weight, rhs: Weight) -> Weight {
-    let res_wu = lhs.to_wu().saturating_sub(rhs.to_wu());
-    Weight::from_wu(res_wu)
+fn clamped_sub<T: Copy>(
+    lhs: &mut T,
+    rhs: T,
+    zero: T,
+    checked_sub: fn(T, T) -> Option<T>,
+) -> bool {
+    match checked_sub(*lhs, rhs) {
+        Some(res) => {
+            *lhs = res;
+            true
+        }
+        None => {
+            *lhs = zero;
+            false
+        }
+    }
 }
 
 // MUST be cheap to clone so that constructing block templates is cheap
@@ -768,8 +794,24 @@ impl Mempool {
         while let Some((anc_txid, _, _)) = iter.next()? {
             ancestors.push(anc_txid);
         }
+        self.recount_totals(txid, descendants, ancestors)?;
+        Ok(())
+    }
 
+    /// Recounts from the graph the ancestor totals of `descendants` (re-keying
+    /// them in `by_ancestor_fee_rate`, where each MUST be keyed at its stored
+    /// total) and the descendant totals of `ancestors`. Txids not in the
+    /// mempool are skipped. `txid` is only used in errors.
+    fn recount_totals(
+        &mut self,
+        txid: Txid,
+        descendants: impl IntoIterator<Item = Txid>,
+        ancestors: impl IntoIterator<Item = Txid>,
+    ) -> Result<(), MempoolRemoveError> {
         for desc_txid in descendants {
+            if !self.txs.0.contains_key(&desc_txid) {
+                continue;
+            }
             let (fee, vsize, weight) = self.ancestor_totals(desc_txid)?;
             let (_, info) = self.txs.0.get_mut(&desc_txid).ok_or(
                 MissingDescendantError {
@@ -797,6 +839,9 @@ impl Mempool {
         }
 
         for anc_txid in ancestors {
+            if !self.txs.0.contains_key(&anc_txid) {
+                continue;
+            }
             let (fee, vsize, weight) = self.descendant_totals(anc_txid)?;
             let (_, info) =
                 self.txs.0.get_mut(&anc_txid).ok_or(MissingAncestorError {
@@ -822,10 +867,21 @@ impl Mempool {
         let modified_weight = info.modified_weight;
         let vsize = tx.vsize() as u64;
         let fees = info.fees;
+        // Removing a tx with both in-mempool ancestors and descendants
+        // splits the graph: its ancestors lose all of its descendants and
+        // its descendants lose all of its ancestors, not just this tx's own
+        // stats, which is all the walks below subtract.
+        let splits_graph =
+            !info.depends.is_empty() && !info.spent_by.is_empty();
         for spent_tx in tx.input.iter().map(|input| input.previous_output.txid)
         {
             self.tx_childs.remove(spent_tx, *txid);
         }
+        // Set if a stored total was smaller than the stats being subtracted
+        // from it, i.e. the incremental accounting is already wrong. Clamped
+        // to zero, then recounted below instead of panicking.
+        let mut underflow = false;
+        let mut former_descendants = Vec::new();
         let mut descendants = self.txs.descendants_mut(*txid);
         // Skip first element
         let _: Option<_> = descendants.next()?;
@@ -845,12 +901,32 @@ impl Mempool {
                         MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
                     return Err(err.into());
                 };
-                desc_info.ancestor_modified_weight = saturating_sub_weight(
-                    desc_info.ancestor_modified_weight,
+                let ok = clamped_sub(
+                    &mut desc_info.ancestor_modified_weight,
                     modified_weight,
+                    Weight::ZERO,
+                    Weight::checked_sub,
+                ) & clamped_sub(
+                    &mut desc_info.ancestor_vsize,
+                    vsize,
+                    0,
+                    u64::checked_sub,
+                ) & clamped_sub(
+                    &mut desc_info.fees.ancestor,
+                    fees.modified,
+                    Amount::ZERO,
+                    Amount::checked_sub,
                 );
-                desc_info.ancestor_vsize -= vsize;
-                desc_info.fees.ancestor -= fees.modified;
+                if !ok {
+                    tracing::warn!(
+                        %txid,
+                        %desc_txid,
+                        "Ancestor totals of a descendant underflowed while \
+                         removing tx; clamping and recounting"
+                    );
+                    underflow = true;
+                }
+                former_descendants.push(desc_txid);
                 let ancestor_fee_rate = FeeRate {
                     fee: desc_info.fees.ancestor,
                     vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
@@ -866,13 +942,32 @@ impl Mempool {
         let () =
             self.txs
                 .ancestors_mut(*txid)
-                .for_each(|(_anc_tx, anc_info)| {
-                    anc_info.descendant_modified_weight = saturating_sub_weight(
-                        anc_info.descendant_modified_weight,
+                .for_each(|(anc_tx, anc_info)| {
+                    let ok = clamped_sub(
+                        &mut anc_info.descendant_modified_weight,
                         modified_weight,
+                        Weight::ZERO,
+                        Weight::checked_sub,
+                    ) & clamped_sub(
+                        &mut anc_info.descendant_vsize,
+                        vsize,
+                        0,
+                        u64::checked_sub,
+                    ) & clamped_sub(
+                        &mut anc_info.fees.descendant,
+                        fees.modified,
+                        Amount::ZERO,
+                        Amount::checked_sub,
                     );
-                    anc_info.descendant_vsize -= vsize;
-                    anc_info.fees.descendant -= fees.modified;
+                    if !ok {
+                        tracing::warn!(
+                            %txid,
+                            anc_txid = %anc_tx.compute_txid(),
+                            "Descendant totals of an ancestor underflowed \
+                             while removing tx; clamping and recounting"
+                        );
+                        underflow = true;
+                    }
                     anc_info.spent_by.remove(txid);
                     Ok(())
                 })?;
@@ -885,7 +980,25 @@ impl Mempool {
             let err = MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
             return Err(err.into());
         };
+        // The removed tx's own `depends` are intact, so its former
+        // ancestors can still be found from it.
+        let mut former_ancestors = Vec::new();
+        if underflow || splits_graph {
+            let mut ancestors = self.txs.ancestors(*txid);
+            while let Some((anc_txid, _, _)) = ancestors.next()? {
+                former_ancestors.push(anc_txid);
+            }
+        }
         let res = self.txs.0.remove(txid);
+        if underflow || splits_graph {
+            // Both totals of every former relative: after an underflow, the
+            // side this removal did not touch may be wrong too.
+            let affected: Vec<Txid> = former_descendants
+                .into_iter()
+                .chain(former_ancestors)
+                .collect();
+            self.recount_totals(*txid, affected.clone(), affected)?;
+        }
         Ok(res)
     }
 
@@ -1475,5 +1588,80 @@ mod tests {
             let mempool = build(&[(&p1, 100), (&c, 9_000), (&p2, 4_000)]);
             remove_all(mempool, &order);
         }
+    }
+
+    #[test]
+    fn chain4_two_late_middles() {
+        // A -> B -> C -> D, inserted D, A, C, B
+        let a = spend(&[], 2);
+        let b = spend(&[&a], 0);
+        let c = spend(&[&b], 0);
+        let d = spend(&[&c], 0);
+        for order in [[&a, &b, &c, &d], [&d, &c, &b, &a], [&b, &d, &a, &c]] {
+            let mempool =
+                build(&[(&d, 5_000), (&a, 7_000), (&c, 100), (&b, 50)]);
+            remove_all(mempool, &order);
+        }
+    }
+
+    /// Pre-existing, independent of insert order: removing a mid-chain tx
+    /// (a ZMQ removal event can arrive for a parent before its child)
+    /// must drop the whole ancestor set from the descendants and vice
+    /// versa.
+    #[test]
+    fn in_order_chain3_remove_middle_first() {
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&g, 100), (&p, 200), (&c, 300)]);
+        remove_all(mempool, &[&p, &g, &c]);
+    }
+
+    #[test]
+    fn late_middle_chain3_remove_middle_first() {
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&c, 300), (&g, 200), (&p, 100)]);
+        remove_all(mempool, &[&p, &g, &c]);
+    }
+
+    /// Defensive path: if stored aggregates are already corrupt (by some
+    /// future accounting bug), `remove` must clamp and recompute rather
+    /// than panic. Removes only roots and leaves, so the recompute is
+    /// triggered by the underflow, not by a graph split.
+    #[test]
+    fn remove_with_corrupt_aggregates_does_not_panic() {
+        let (g, p, c) = chain3();
+        let mut mempool = build(&[(&g, 100), (&p, 100), (&c, 100)]);
+        // Root removal: subtracting G from C's ancestor aggregates
+        // underflows.
+        corrupt_aggregates(&mut mempool, c.compute_txid());
+        mempool.remove(&g.compute_txid()).expect("remove failed");
+        assert_consistent(&mempool);
+        // Leaf removal: subtracting C from P's descendant aggregates
+        // underflows.
+        corrupt_aggregates(&mut mempool, p.compute_txid());
+        mempool.remove(&c.compute_txid()).expect("remove failed");
+        assert_consistent(&mempool);
+        remove_all(mempool, &[&p]);
+    }
+
+    /// Overwrite `txid`'s stored aggregates with `1`, keeping it keyed at
+    /// its (now corrupt) stored ancestor fee rate.
+    fn corrupt_aggregates(mempool: &mut Mempool, txid: Txid) {
+        let (_, info) = mempool.txs.0.get_mut(&txid).unwrap();
+        let stale = FeeRate {
+            fee: info.fees.ancestor,
+            vsize: info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        info.fees.ancestor = Amount::from_sat(1);
+        info.fees.descendant = Amount::from_sat(1);
+        info.ancestor_vsize = 1;
+        info.descendant_vsize = 1;
+        info.ancestor_modified_weight = Weight::from_wu(1);
+        info.descendant_modified_weight = Weight::from_wu(1);
+        let corrupt = FeeRate {
+            fee: info.fees.ancestor,
+            vsize: info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        assert!(mempool.by_ancestor_fee_rate.remove(stale, txid));
+        mempool.by_ancestor_fee_rate.insert(corrupt, txid);
     }
 }
