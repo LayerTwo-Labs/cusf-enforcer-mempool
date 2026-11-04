@@ -330,6 +330,17 @@ pub enum MempoolRemoveError {
     MissingDescendantsKey(#[from] MissingDescendantsKeyError),
 }
 
+impl From<MempoolRemoveError> for MempoolInsertError {
+    fn from(err: MempoolRemoveError) -> Self {
+        match err {
+            MempoolRemoveError::MissingAncestor(err) => err.into(),
+            MempoolRemoveError::MissingByAncestorFeeRateKey(err) => err.into(),
+            MempoolRemoveError::MissingDescendant(err) => err.into(),
+            MempoolRemoveError::MissingDescendantsKey(err) => err.into(),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MempoolUpdateError {
     #[error(transparent)]
@@ -484,10 +495,25 @@ fn saturating_add_weight(lhs: Weight, rhs: Weight) -> Weight {
     Weight::from_wu(res_wu)
 }
 
+/// `*lhs -= rhs`, clamping to `zero` on underflow.
+/// Returns `false` on underflow.
 #[inline(always)]
-fn saturating_sub_weight(lhs: Weight, rhs: Weight) -> Weight {
-    let res_wu = lhs.to_wu().saturating_sub(rhs.to_wu());
-    Weight::from_wu(res_wu)
+fn clamped_sub<T: Copy>(
+    lhs: &mut T,
+    rhs: T,
+    zero: T,
+    checked_sub: fn(T, T) -> Option<T>,
+) -> bool {
+    match checked_sub(*lhs, rhs) {
+        Some(res) => {
+            *lhs = res;
+            true
+        }
+        None => {
+            *lhs = zero;
+            false
+        }
+    }
 }
 
 // MUST be cheap to clone so that constructing block templates is cheap
@@ -705,7 +731,128 @@ impl Mempool {
             vsize: ancestor_modified_weight.to_vbytes_ceil(),
         };
         self.by_ancestor_fee_rate.insert(ancestor_fee_rate, txid);
+        if !direct_children.is_empty() {
+            self.relink_package_totals(txid)?;
+        }
         Ok(res)
+    }
+
+    /// Fee, vsize and modified weight of `txid` and all its ancestors.
+    fn ancestor_totals(
+        &self,
+        txid: Txid,
+    ) -> Result<(Amount, u64, Weight), MissingAncestorError> {
+        let (tx, info) = self.txs.0.get(&txid).ok_or(MissingAncestorError {
+            tx: txid,
+            missing: txid,
+        })?;
+        let mut fee = info.fees.modified;
+        let mut vsize = tx.vsize() as u64;
+        let mut weight = info.modified_weight;
+        let mut ancestors = self.txs.ancestors(txid);
+        while let Some((_, anc_tx, anc_info)) = ancestors.next()? {
+            fee += anc_info.fees.modified;
+            vsize += anc_tx.vsize() as u64;
+            weight = saturating_add_weight(weight, anc_info.modified_weight);
+        }
+        Ok((fee, vsize, weight))
+    }
+
+    /// Fee, vsize and modified weight of `txid` and all its descendants.
+    fn descendant_totals(
+        &mut self,
+        txid: Txid,
+    ) -> Result<(Amount, u64, Weight), MissingDescendantError> {
+        let mut fee = Amount::ZERO;
+        let mut vsize = 0;
+        let mut weight = Weight::ZERO;
+        self.txs.descendants_mut(txid).for_each(|(tx, info)| {
+            fee += info.fees.modified;
+            vsize += tx.vsize() as u64;
+            weight = saturating_add_weight(weight, info.modified_weight);
+            Ok(())
+        })?;
+        Ok((fee, vsize, weight))
+    }
+
+    /// Recounts the totals around `txid` after it was inserted after its own
+    /// children. Its ancestors and its descendants were then in two separate
+    /// packages, and `insert` added only `txid` itself to each side; a shared
+    /// ancestor can already be in a descendant's total, so the totals are
+    /// counted again from the graph.
+    fn relink_package_totals(
+        &mut self,
+        txid: Txid,
+    ) -> Result<(), MempoolInsertError> {
+        let mut descendants = Vec::new();
+        self.txs.descendants_mut(txid).skip(1).for_each(|(tx, _)| {
+            descendants.push(tx.compute_txid());
+            Ok(())
+        })?;
+        let mut ancestors = vec![txid];
+        let mut iter = self.txs.ancestors(txid);
+        while let Some((anc_txid, _, _)) = iter.next()? {
+            ancestors.push(anc_txid);
+        }
+        self.recount_totals(txid, descendants, ancestors)?;
+        Ok(())
+    }
+
+    /// Recounts from the graph the ancestor totals of `descendants` (re-keying
+    /// them in `by_ancestor_fee_rate`, where each MUST be keyed at its stored
+    /// total) and the descendant totals of `ancestors`. Txids not in the
+    /// mempool are skipped. `txid` is only used in errors.
+    fn recount_totals(
+        &mut self,
+        txid: Txid,
+        descendants: impl IntoIterator<Item = Txid>,
+        ancestors: impl IntoIterator<Item = Txid>,
+    ) -> Result<(), MempoolRemoveError> {
+        for desc_txid in descendants {
+            if !self.txs.0.contains_key(&desc_txid) {
+                continue;
+            }
+            let (fee, vsize, weight) = self.ancestor_totals(desc_txid)?;
+            let (_, info) = self.txs.0.get_mut(&desc_txid).ok_or(
+                MissingDescendantError {
+                    tx: txid,
+                    missing: desc_txid,
+                },
+            )?;
+            let stale = FeeRate {
+                fee: info.fees.ancestor,
+                vsize: info.ancestor_modified_weight.to_vbytes_ceil(),
+            };
+            info.fees.ancestor = fee;
+            info.ancestor_vsize = vsize;
+            info.ancestor_modified_weight = weight;
+            if !self.by_ancestor_fee_rate.remove(stale, desc_txid) {
+                return Err(MissingByAncestorFeeRateKeyError(stale).into());
+            }
+            self.by_ancestor_fee_rate.insert(
+                FeeRate {
+                    fee,
+                    vsize: weight.to_vbytes_ceil(),
+                },
+                desc_txid,
+            );
+        }
+
+        for anc_txid in ancestors {
+            if !self.txs.0.contains_key(&anc_txid) {
+                continue;
+            }
+            let (fee, vsize, weight) = self.descendant_totals(anc_txid)?;
+            let (_, info) =
+                self.txs.0.get_mut(&anc_txid).ok_or(MissingAncestorError {
+                    tx: txid,
+                    missing: anc_txid,
+                })?;
+            info.fees.descendant = fee;
+            info.descendant_vsize = vsize;
+            info.descendant_modified_weight = weight;
+        }
+        Ok(())
     }
 
     /// Remove a tx from the mempool. Descendants are updated but not removed.
@@ -720,10 +867,21 @@ impl Mempool {
         let modified_weight = info.modified_weight;
         let vsize = tx.vsize() as u64;
         let fees = info.fees;
+        // Removing a tx with both in-mempool ancestors and descendants
+        // splits the graph: its ancestors lose all of its descendants and
+        // its descendants lose all of its ancestors, not just this tx's own
+        // stats, which is all the walks below subtract.
+        let splits_graph =
+            !info.depends.is_empty() && !info.spent_by.is_empty();
         for spent_tx in tx.input.iter().map(|input| input.previous_output.txid)
         {
             self.tx_childs.remove(spent_tx, *txid);
         }
+        // Set if a stored total was smaller than the stats being subtracted
+        // from it, i.e. the incremental accounting is already wrong. Clamped
+        // to zero, then recounted below instead of panicking.
+        let mut underflow = false;
+        let mut former_descendants = Vec::new();
         let mut descendants = self.txs.descendants_mut(*txid);
         // Skip first element
         let _: Option<_> = descendants.next()?;
@@ -743,12 +901,32 @@ impl Mempool {
                         MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
                     return Err(err.into());
                 };
-                desc_info.ancestor_modified_weight = saturating_sub_weight(
-                    desc_info.ancestor_modified_weight,
+                let ok = clamped_sub(
+                    &mut desc_info.ancestor_modified_weight,
                     modified_weight,
+                    Weight::ZERO,
+                    Weight::checked_sub,
+                ) & clamped_sub(
+                    &mut desc_info.ancestor_vsize,
+                    vsize,
+                    0,
+                    u64::checked_sub,
+                ) & clamped_sub(
+                    &mut desc_info.fees.ancestor,
+                    fees.modified,
+                    Amount::ZERO,
+                    Amount::checked_sub,
                 );
-                desc_info.ancestor_vsize -= vsize;
-                desc_info.fees.ancestor -= fees.modified;
+                if !ok {
+                    tracing::warn!(
+                        %txid,
+                        %desc_txid,
+                        "Ancestor totals of a descendant underflowed while \
+                         removing tx; clamping and recounting"
+                    );
+                    underflow = true;
+                }
+                former_descendants.push(desc_txid);
                 let ancestor_fee_rate = FeeRate {
                     fee: desc_info.fees.ancestor,
                     vsize: desc_info.ancestor_modified_weight.to_vbytes_ceil(),
@@ -764,13 +942,32 @@ impl Mempool {
         let () =
             self.txs
                 .ancestors_mut(*txid)
-                .for_each(|(_anc_tx, anc_info)| {
-                    anc_info.descendant_modified_weight = saturating_sub_weight(
-                        anc_info.descendant_modified_weight,
+                .for_each(|(anc_tx, anc_info)| {
+                    let ok = clamped_sub(
+                        &mut anc_info.descendant_modified_weight,
                         modified_weight,
+                        Weight::ZERO,
+                        Weight::checked_sub,
+                    ) & clamped_sub(
+                        &mut anc_info.descendant_vsize,
+                        vsize,
+                        0,
+                        u64::checked_sub,
+                    ) & clamped_sub(
+                        &mut anc_info.fees.descendant,
+                        fees.modified,
+                        Amount::ZERO,
+                        Amount::checked_sub,
                     );
-                    anc_info.descendant_vsize -= vsize;
-                    anc_info.fees.descendant -= fees.modified;
+                    if !ok {
+                        tracing::warn!(
+                            %txid,
+                            anc_txid = %anc_tx.compute_txid(),
+                            "Descendant totals of an ancestor underflowed \
+                             while removing tx; clamping and recounting"
+                        );
+                        underflow = true;
+                    }
                     anc_info.spent_by.remove(txid);
                     Ok(())
                 })?;
@@ -783,7 +980,25 @@ impl Mempool {
             let err = MissingByAncestorFeeRateKeyError(ancestor_fee_rate);
             return Err(err.into());
         };
+        // The removed tx's own `depends` are intact, so its former
+        // ancestors can still be found from it.
+        let mut former_ancestors = Vec::new();
+        if underflow || splits_graph {
+            let mut ancestors = self.txs.ancestors(*txid);
+            while let Some((anc_txid, _, _)) = ancestors.next()? {
+                former_ancestors.push(anc_txid);
+            }
+        }
         let res = self.txs.0.remove(txid);
+        if underflow || splits_graph {
+            // Both totals of every former relative: after an underflow, the
+            // side this removal did not touch may be wrong too.
+            let affected: Vec<Txid> = former_descendants
+                .into_iter()
+                .chain(former_ancestors)
+                .collect();
+            self.recount_totals(*txid, affected.clone(), affected)?;
+        }
         Ok(res)
     }
 
@@ -1054,5 +1269,399 @@ mod tests {
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    fn insert_tx(mempool: &mut Mempool, tx: &Transaction, fee_sat: u64) {
+        let weight = tx.weight();
+        mempool
+            .insert(
+                tx.clone(),
+                Amount::from_sat(fee_sat),
+                OrdSet::new(),
+                weight,
+            )
+            .unwrap();
+    }
+
+    fn info(mempool: &Mempool, tx: &Transaction) -> TxInfo {
+        mempool.txs.0[&tx.compute_txid()].1.clone()
+    }
+
+    fn vsize(txs: &[&Transaction]) -> u64 {
+        txs.iter().map(|tx| tx.vsize() as u64).sum()
+    }
+
+    /// Chain X -> M -> D, inserted as X, D, M. M joins D's package to X's, so
+    /// D counts X as an ancestor and X counts D as a descendant.
+    #[test]
+    fn parent_after_child_links_the_whole_package() {
+        let mut mempool = test_mempool();
+        let x = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 1);
+        let m = make_tx(&[OutPoint::new(x.compute_txid(), 0)], 1);
+        let d = make_tx(&[OutPoint::new(m.compute_txid(), 0)], 1);
+        insert_tx(&mut mempool, &x, 10_000);
+        insert_tx(&mut mempool, &d, 100);
+        insert_tx(&mut mempool, &m, 200);
+
+        let d_info = info(&mempool, &d);
+        assert_eq!(d_info.fees.ancestor, Amount::from_sat(10_300));
+        assert_eq!(d_info.ancestor_vsize, vsize(&[&x, &m, &d]));
+        assert_eq!(
+            d_info.ancestor_modified_weight,
+            x.weight() + m.weight() + d.weight()
+        );
+        let x_info = info(&mempool, &x);
+        assert_eq!(x_info.fees.descendant, Amount::from_sat(10_300));
+        assert_eq!(x_info.descendant_vsize, vsize(&[&x, &m, &d]));
+        assert_eq!(
+            x_info.descendant_modified_weight,
+            x.weight() + m.weight() + d.weight()
+        );
+
+        // X confirms in a block. Before the fix this panicked with
+        // "Amount subtraction error".
+        mempool.remove(&x.compute_txid()).unwrap();
+        let d_info = info(&mempool, &d);
+        assert_eq!(d_info.fees.ancestor, Amount::from_sat(300));
+        assert_eq!(d_info.ancestor_vsize, vsize(&[&m, &d]));
+        mempool.remove(&m.compute_txid()).unwrap();
+        mempool.remove(&d.compute_txid()).unwrap();
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    /// D spends X directly and through M, and is inserted before M. X already
+    /// counts in D's ancestor total, so linking M must not count it again.
+    #[test]
+    fn parent_after_child_counts_a_shared_ancestor_once() {
+        let mut mempool = test_mempool();
+        let x = make_tx(&[OutPoint::new(Txid::all_zeros(), 0)], 2);
+        let m = make_tx(&[OutPoint::new(x.compute_txid(), 0)], 1);
+        let d = make_tx(
+            &[
+                OutPoint::new(x.compute_txid(), 1),
+                OutPoint::new(m.compute_txid(), 0),
+            ],
+            1,
+        );
+        insert_tx(&mut mempool, &x, 10_000);
+        insert_tx(&mut mempool, &d, 100);
+        insert_tx(&mut mempool, &m, 200);
+
+        let d_info = info(&mempool, &d);
+        assert_eq!(d_info.fees.ancestor, Amount::from_sat(10_300));
+        assert_eq!(d_info.ancestor_vsize, vsize(&[&x, &m, &d]));
+        let x_info = info(&mempool, &x);
+        assert_eq!(x_info.fees.descendant, Amount::from_sat(10_300));
+        assert_eq!(x_info.descendant_vsize, vsize(&[&x, &m, &d]));
+
+        mempool.remove(&x.compute_txid()).unwrap();
+        assert_eq!(info(&mempool, &d).fees.ancestor, Amount::from_sat(300));
+    }
+
+    /// A tx spending each of `parents`' output 0 (or a unique
+    /// out-of-mempool outpoint, for a root), with one output.
+    fn spend(parents: &[&Transaction], root_tag: u8) -> Transaction {
+        let inputs: Vec<OutPoint> = if parents.is_empty() {
+            vec![OutPoint::new(Txid::from_byte_array([root_tag; 32]), 0)]
+        } else {
+            parents
+                .iter()
+                .map(|parent| OutPoint::new(parent.compute_txid(), 0))
+                .collect()
+        };
+        make_tx(&inputs, 1)
+    }
+
+    /// Recompute every tx's ancestor/descendant aggregates from the tx
+    /// graph (inputs), independently of `depends`/`spent_by`, and assert
+    /// that the incrementally maintained values, the graph links and the
+    /// `by_ancestor_fee_rate` index all match.
+    fn assert_consistent(mempool: &Mempool) {
+        let txs = &mempool.txs.0;
+        let parents = |txid: &Txid| -> std::collections::BTreeSet<Txid> {
+            txs[txid]
+                .0
+                .input
+                .iter()
+                .map(|input| input.previous_output.txid)
+                .filter(|parent| txs.contains_key(parent))
+                .collect()
+        };
+        let closure = |start: Txid,
+                       step: &dyn Fn(&Txid) -> Vec<Txid>|
+         -> std::collections::BTreeSet<Txid> {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut stack = step(&start);
+            while let Some(next) = stack.pop() {
+                if seen.insert(next) {
+                    stack.extend(step(&next));
+                }
+            }
+            seen
+        };
+        let children = |txid: &Txid| -> Vec<Txid> {
+            txs.keys()
+                .filter(|other| parents(other).contains(txid))
+                .copied()
+                .collect()
+        };
+        let mut index_len = 0;
+        for (_, txids) in mempool.by_ancestor_fee_rate.0.iter() {
+            index_len += txids.len();
+        }
+        assert_eq!(index_len, txs.len(), "by_ancestor_fee_rate size");
+        for (txid, (tx, info)) in txs.iter() {
+            let ancestors =
+                closure(*txid, &|t: &Txid| parents(t).into_iter().collect());
+            let descendants = closure(*txid, &children);
+            let sum = |set: &std::collections::BTreeSet<Txid>| {
+                let mut fee = info.fees.modified;
+                let mut vsize = tx.vsize() as u64;
+                let mut weight = info.modified_weight;
+                for other in set {
+                    let (other_tx, other_info) = &txs[other];
+                    fee += other_info.fees.modified;
+                    vsize += other_tx.vsize() as u64;
+                    weight += other_info.modified_weight;
+                }
+                (fee, vsize, weight)
+            };
+            let (anc_fee, anc_vsize, anc_weight) = sum(&ancestors);
+            let (desc_fee, desc_vsize, desc_weight) = sum(&descendants);
+            assert_eq!(info.fees.ancestor, anc_fee, "{txid} ancestor fee");
+            assert_eq!(info.ancestor_vsize, anc_vsize, "{txid} ancestor vsize");
+            assert_eq!(
+                info.ancestor_modified_weight, anc_weight,
+                "{txid} ancestor weight"
+            );
+            assert_eq!(info.fees.descendant, desc_fee, "{txid} desc fee");
+            assert_eq!(info.descendant_vsize, desc_vsize, "{txid} desc vsize");
+            assert_eq!(
+                info.descendant_modified_weight, desc_weight,
+                "{txid} desc weight"
+            );
+            let depends: std::collections::BTreeSet<Txid> =
+                info.depends.iter().copied().collect();
+            assert_eq!(depends, parents(txid), "{txid} depends");
+            let spent_by: std::collections::BTreeSet<Txid> =
+                info.spent_by.iter().copied().collect();
+            let expected_spent_by: std::collections::BTreeSet<Txid> =
+                children(txid).into_iter().collect();
+            assert_eq!(spent_by, expected_spent_by, "{txid} spent_by");
+            let key = refinement_cmp::RefinementCmp(FeeRate {
+                fee: anc_fee,
+                vsize: anc_weight.to_vbytes_ceil(),
+            });
+            assert!(
+                mempool
+                    .by_ancestor_fee_rate
+                    .0
+                    .get(&key)
+                    .is_some_and(|keyed| keyed.contains(txid)),
+                "{txid} not keyed at its ancestor fee rate"
+            );
+        }
+    }
+
+    /// Insert `txs` (with fees) in the given order, checking consistency
+    /// after every insert.
+    fn build(txs: &[(&Transaction, u64)]) -> Mempool {
+        let mut mempool = test_mempool();
+        for (tx, fee) in txs {
+            insert_tx(&mut mempool, tx, *fee);
+            assert_consistent(&mempool);
+        }
+        mempool
+    }
+
+    /// Insert `txs` (with fees) in the given order, without checking
+    /// consistency, so a later operation hits whatever was stored.
+    fn build_unchecked(txs: &[(&Transaction, u64)]) -> Mempool {
+        let mut mempool = test_mempool();
+        for (tx, fee) in txs {
+            insert_tx(&mut mempool, tx, *fee);
+        }
+        mempool
+    }
+
+    /// Remove `order` one at a time via `remove` (the block-connect path,
+    /// which removes a block's txs in block order), checking consistency
+    /// after every removal.
+    fn remove_all(mut mempool: Mempool, order: &[&Transaction]) {
+        for tx in order {
+            let txid = tx.compute_txid();
+            let removed = mempool.remove(&txid).expect("remove failed");
+            assert!(removed.is_some(), "{txid} missing");
+            assert_consistent(&mempool);
+        }
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    /// G -> P -> C, inserted C, G, P (as a reorg can return them).
+    fn chain3() -> (Transaction, Transaction, Transaction) {
+        let g = spend(&[], 1);
+        let p = spend(&[&g], 0);
+        let c = spend(&[&p], 0);
+        (g, p, c)
+    }
+
+    #[test]
+    fn late_middle_chain3_remove_grandparent_first() {
+        // High-fee grandparent: removing G subtracts more from C's stored
+        // ancestor fee (which never included G) than C holds.
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&c, 100), (&g, 10_000), (&p, 100)]);
+        remove_all(mempool, &[&g, &p, &c]);
+    }
+
+    #[test]
+    fn late_middle_chain3_remove_child_first() {
+        // High-fee child over low-fee parents: removing C subtracts more
+        // from G's stored descendant fee (which never included C) than G
+        // holds.
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&c, 10_000), (&g, 100), (&p, 100)]);
+        remove_all(mempool, &[&c, &p, &g]);
+    }
+
+    /// The prod panic: block connect removes a block's txs in block order
+    /// (parents first) via `remove`.
+    #[test]
+    fn late_middle_chain3_block_connect_grandparent_first_no_panic() {
+        let (g, p, c) = chain3();
+        let mut mempool =
+            build_unchecked(&[(&c, 100), (&g, 10_000), (&p, 100)]);
+        for tx in [&g, &p, &c] {
+            mempool.remove(&tx.compute_txid()).expect("remove failed");
+        }
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    #[test]
+    fn late_middle_chain3_child_first_no_panic() {
+        let (g, p, c) = chain3();
+        let mut mempool =
+            build_unchecked(&[(&c, 10_000), (&g, 100), (&p, 100)]);
+        for tx in [&c, &p, &g] {
+            mempool.remove(&tx.compute_txid()).expect("remove failed");
+        }
+        assert!(mempool.txs.0.is_empty());
+    }
+
+    #[test]
+    fn late_middle_chain3_propose_txs() {
+        // The getblocktemplate path: `propose_txs` removes each selected
+        // tx (parents first) from a clone of the mempool.
+        let (g, p, c) = chain3();
+        let mempool = build_unchecked(&[(&c, 100), (&g, 10_000), (&p, 100)]);
+        let proposed = mempool.propose_txs(None).expect("propose_txs");
+        let proposed: Vec<Txid> = proposed.iter().map(|tx| tx.txid).collect();
+        assert_eq!(
+            proposed,
+            vec![g.compute_txid(), p.compute_txid(), c.compute_txid()]
+        );
+    }
+
+    /// With understated ancestor weights, `propose_txs` charges a package
+    /// less weight than the txs it actually adds, and can exceed the limit.
+    #[test]
+    fn late_middle_chain3_propose_txs_respects_weight_limit() {
+        let (g, p, c) = chain3();
+        let mempool = build_unchecked(&[(&g, 10_000), (&c, 100), (&p, 100)]);
+        let limit = g.weight() + p.weight();
+        let proposed = mempool.propose_txs(Some(limit)).expect("propose_txs");
+        let total: u64 = proposed.iter().map(|tx| tx.weight).sum();
+        assert!(
+            total <= limit.to_wu(),
+            "proposed {total} WU over a {} WU limit",
+            limit.to_wu()
+        );
+    }
+
+    #[test]
+    fn diamond_one_parent_late() {
+        // P1, P2 -> C, inserted P1, C, P2
+        let p1 = spend(&[], 3);
+        let p2 = spend(&[], 4);
+        let c = spend(&[&p1, &p2], 0);
+        for order in [[&p1, &p2, &c], [&c, &p2, &p1], [&p2, &c, &p1]] {
+            let mempool = build(&[(&p1, 100), (&c, 9_000), (&p2, 4_000)]);
+            remove_all(mempool, &order);
+        }
+    }
+
+    #[test]
+    fn chain4_two_late_middles() {
+        // A -> B -> C -> D, inserted D, A, C, B
+        let a = spend(&[], 2);
+        let b = spend(&[&a], 0);
+        let c = spend(&[&b], 0);
+        let d = spend(&[&c], 0);
+        for order in [[&a, &b, &c, &d], [&d, &c, &b, &a], [&b, &d, &a, &c]] {
+            let mempool =
+                build(&[(&d, 5_000), (&a, 7_000), (&c, 100), (&b, 50)]);
+            remove_all(mempool, &order);
+        }
+    }
+
+    /// Pre-existing, independent of insert order: removing a mid-chain tx
+    /// (a ZMQ removal event can arrive for a parent before its child)
+    /// must drop the whole ancestor set from the descendants and vice
+    /// versa.
+    #[test]
+    fn in_order_chain3_remove_middle_first() {
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&g, 100), (&p, 200), (&c, 300)]);
+        remove_all(mempool, &[&p, &g, &c]);
+    }
+
+    #[test]
+    fn late_middle_chain3_remove_middle_first() {
+        let (g, p, c) = chain3();
+        let mempool = build(&[(&c, 300), (&g, 200), (&p, 100)]);
+        remove_all(mempool, &[&p, &g, &c]);
+    }
+
+    /// Defensive path: if stored aggregates are already corrupt (by some
+    /// future accounting bug), `remove` must clamp and recompute rather
+    /// than panic. Removes only roots and leaves, so the recompute is
+    /// triggered by the underflow, not by a graph split.
+    #[test]
+    fn remove_with_corrupt_aggregates_does_not_panic() {
+        let (g, p, c) = chain3();
+        let mut mempool = build(&[(&g, 100), (&p, 100), (&c, 100)]);
+        // Root removal: subtracting G from C's ancestor aggregates
+        // underflows.
+        corrupt_aggregates(&mut mempool, c.compute_txid());
+        mempool.remove(&g.compute_txid()).expect("remove failed");
+        assert_consistent(&mempool);
+        // Leaf removal: subtracting C from P's descendant aggregates
+        // underflows.
+        corrupt_aggregates(&mut mempool, p.compute_txid());
+        mempool.remove(&c.compute_txid()).expect("remove failed");
+        assert_consistent(&mempool);
+        remove_all(mempool, &[&p]);
+    }
+
+    /// Overwrite `txid`'s stored aggregates with `1`, keeping it keyed at
+    /// its (now corrupt) stored ancestor fee rate.
+    fn corrupt_aggregates(mempool: &mut Mempool, txid: Txid) {
+        let (_, info) = mempool.txs.0.get_mut(&txid).unwrap();
+        let stale = FeeRate {
+            fee: info.fees.ancestor,
+            vsize: info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        info.fees.ancestor = Amount::from_sat(1);
+        info.fees.descendant = Amount::from_sat(1);
+        info.ancestor_vsize = 1;
+        info.descendant_vsize = 1;
+        info.ancestor_modified_weight = Weight::from_wu(1);
+        info.descendant_modified_weight = Weight::from_wu(1);
+        let corrupt = FeeRate {
+            fee: info.fees.ancestor,
+            vsize: info.ancestor_modified_weight.to_vbytes_ceil(),
+        };
+        assert!(mempool.by_ancestor_fee_rate.remove(stale, txid));
+        mempool.by_ancestor_fee_rate.insert(corrupt, txid);
     }
 }
