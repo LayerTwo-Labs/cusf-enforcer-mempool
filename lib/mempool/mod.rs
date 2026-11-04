@@ -917,6 +917,15 @@ impl Mempool {
             else {
                 break;
             };
+            if !self.txs.0.contains_key(&txid) {
+                // Index entry without a tx. Drop it from this working copy so
+                // that it is neither picked again nor charged block weight.
+                tracing::warn!(%txid, "Stale fee rate index entry when proposing txs, skipping");
+                #[cfg(test)]
+                tests::PROPOSE_MISSING.with(|c| c.set(c.get() + 1));
+                self.by_ancestor_fee_rate.remove(ancestor_fee_rate, txid);
+                continue;
+            }
             tracing::trace!(%txid, "Proposing tx with ancestors");
             // stack of txs to add
             let mut to_add = vec![(txid, false)];
@@ -938,8 +947,16 @@ impl Mempool {
                         }
                     }
                 } else {
+                    // A tx that spends both a parent and one of that parent's
+                    // ancestors lists both in `depends`, so the ancestor can
+                    // be pushed twice. The first visit already proposed it.
+                    if res.contains(&txid) {
+                        continue;
+                    }
                     let Some((_, info)) = self.txs.0.get(&txid) else {
                         tracing::warn!(%txid, "Missing tx in mempool when proposing txs, omitting from block template proposal");
+                        #[cfg(test)]
+                        tests::PROPOSE_MISSING.with(|c| c.set(c.get() + 1));
                         continue;
                     };
 
@@ -1054,5 +1071,116 @@ mod tests {
         );
 
         assert!(result.is_ok(), "insert failed: {result:?}");
+    }
+
+    thread_local! {
+        /// Times `propose_txs_mut` took its "missing tx" warn path.
+        pub(super) static PROPOSE_MISSING: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    fn propose_missing() -> usize {
+        PROPOSE_MISSING.with(|c| c.get())
+    }
+
+    /// Inserts `tx` with the given base fee. `depends` etc. are derived by
+    /// `insert` from the txs already present, so parents go in first.
+    fn insert_tx(mempool: &mut Mempool, tx: &Transaction, fee_sat: u64) {
+        mempool
+            .insert(
+                tx.clone(),
+                Amount::from_sat(fee_sat),
+                OrdSet::new(),
+                tx.weight(),
+            )
+            .unwrap();
+    }
+
+    /// B is a root, A spends B, X spends both A and B: X's `depends` holds A
+    /// and its own ancestor B. Every tx belongs in the template, and none is
+    /// missing from the mempool.
+    #[test]
+    fn propose_tx_spending_parent_and_grandparent() {
+        // Both stacking orders of X's two parents: which one is popped first
+        // depends on txid order.
+        let mut seen_a_above_b = false;
+        let mut seen_b_above_a = false;
+        for tag in 1..=64u8 {
+            // B has two outputs: one spent by A, one by X.
+            let b = make_tx(
+                &[OutPoint::new(Txid::from_byte_array([tag; 32]), 0)],
+                2,
+            );
+            let a = make_tx(&[OutPoint::new(b.compute_txid(), 0)], 1);
+            let x = make_tx(
+                &[
+                    OutPoint::new(a.compute_txid(), 0),
+                    OutPoint::new(b.compute_txid(), 1),
+                ],
+                1,
+            );
+            if a.compute_txid() > b.compute_txid() {
+                seen_a_above_b = true;
+            } else {
+                seen_b_above_a = true;
+            }
+            let mut mempool = test_mempool();
+            insert_tx(&mut mempool, &b, 100);
+            insert_tx(&mut mempool, &a, 100);
+            insert_tx(&mut mempool, &x, 50_000);
+            PROPOSE_MISSING.with(|c| c.set(0));
+            let proposed = mempool.propose_txs(None).unwrap();
+            let txids: Vec<Txid> = proposed.iter().map(|t| t.txid).collect();
+            assert_eq!(
+                txids,
+                vec![b.compute_txid(), a.compute_txid(), x.compute_txid()],
+                "tag {tag}: template order"
+            );
+            assert_eq!(
+                propose_missing(),
+                0,
+                "tag {tag}: a tx proposed earlier in the same package was \
+                 reported missing from the mempool"
+            );
+            if seen_a_above_b && seen_b_above_a {
+                return;
+            }
+        }
+        panic!("did not cover both stacking orders");
+    }
+
+    /// The index holds an entry for a tx that is not in `txs` (stale). The
+    /// proposal must still contain every real tx, and must not spend block
+    /// weight on the stale entry.
+    #[test]
+    fn propose_skips_stale_index_entry() {
+        let txs: Vec<Transaction> = (1..=20u8)
+            .map(|t| {
+                make_tx(&[OutPoint::new(Txid::from_byte_array([t; 32]), 0)], 1)
+            })
+            .collect();
+        let mut mempool = test_mempool();
+        for tx in &txs {
+            insert_tx(&mut mempool, tx, 1_000);
+        }
+        // A stale entry at a high fee rate with a large package size: the
+        // first pick of every iteration.
+        let stale_txid = Txid::from_byte_array([0xee; 32]);
+        mempool.by_ancestor_fee_rate.insert(
+            FeeRate {
+                fee: Amount::from_sat(10_000_000),
+                vsize: 400_000,
+            },
+            stale_txid,
+        );
+        PROPOSE_MISSING.with(|c| c.set(0));
+        let proposed = mempool.propose_txs(None).unwrap();
+        assert_eq!(proposed.len(), txs.len(), "every real tx proposed");
+        assert!(proposed.iter().all(|t| t.txid != stale_txid));
+        assert!(
+            propose_missing() <= 1,
+            "stale entry hit {} times",
+            propose_missing()
+        );
     }
 }
