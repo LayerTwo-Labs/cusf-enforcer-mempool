@@ -44,6 +44,13 @@ impl AbandonedPool {
         self.abandoned_txs.contains_key(txid)
     }
 
+    /// Returns `true` if the tx is an absent parent of a tx in the pool, and
+    /// so must still be known to be unavailable in order to restore its
+    /// children once it becomes available again.
+    pub fn is_absent_parent(&self, txid: &Txid) -> bool {
+        self.absent_parent_to_child_txids.contains_key(txid)
+    }
+
     /// Returns the existing value if the tx was already present in the
     /// pool.
     /// Provided absent parents are ignored if they are not present in the tx's
