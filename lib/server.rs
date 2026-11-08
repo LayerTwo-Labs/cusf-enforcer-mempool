@@ -411,6 +411,27 @@ enum FinalizeCoinbaseTxError {
     },
 }
 
+/// Sum the fees of the txs selected for a block
+fn block_txs_fees(
+    transactions: &[BlockTemplateTransaction],
+) -> Result<Amount, FinalizeCoinbaseTxError> {
+    transactions.iter().enumerate().try_fold(
+        Amount::ZERO,
+        |fees_acc, (tx_index, tx)| {
+            let fee = tx.fee.to_unsigned().map_err(|_| {
+                FinalizeCoinbaseTxError::NegativeTxFee {
+                    txid: tx.txid,
+                    tx_index,
+                    fee: tx.fee,
+                }
+            })?;
+            fees_acc
+                .checked_add(fee)
+                .ok_or(FinalizeCoinbaseTxError::FeeOverflow)
+        },
+    )
+}
+
 /// Generate a BIP34 height script
 fn bip34_height_script(height: u32) -> ScriptBuf {
     let mut builder =
@@ -432,21 +453,7 @@ fn finalize_coinbase_tx(
     mut coinbase_txouts: Vec<TxOut>,
     transactions: &[BlockTemplateTransaction],
 ) -> Result<(Transaction, Option<ScriptBuf>), FinalizeCoinbaseTxError> {
-    let fees = transactions.iter().enumerate().try_fold(
-        Amount::ZERO,
-        |fees_acc, (tx_index, tx)| {
-            let fee = tx.fee.to_unsigned().map_err(|_| {
-                FinalizeCoinbaseTxError::NegativeTxFee {
-                    txid: tx.txid,
-                    tx_index,
-                    fee: tx.fee,
-                }
-            })?;
-            fees_acc
-                .checked_add(fee)
-                .ok_or(FinalizeCoinbaseTxError::FeeOverflow)
-        },
-    )?;
+    let fees = block_txs_fees(transactions)?;
     let block_reward = get_block_reward(block_height, fees, network);
     // Remaining block reward value to add to coinbase txouts
     let coinbase_reward = coinbase_txouts.iter().try_fold(
@@ -927,7 +934,6 @@ where
             ref version_bits_available,
             version_bits_required,
             ref coinbase_aux,
-            ref coinbase_txn_or_value,
             ref mutable,
             sigop_limit,
             size_limit,
@@ -1046,7 +1052,14 @@ where
             };
             CoinbaseTxnOrValue::Txn(txn)
         } else {
-            coinbase_txn_or_value.clone()
+            let fees = block_txs_fees(&block_txs).map_err(|err| {
+                let err = log_error(err);
+                internal_error(err)
+            })?;
+            CoinbaseTxnOrValue::ValueSats(
+                get_block_reward(tip_block_height + 1, fees, self.network)
+                    .to_sat(),
+            )
         };
         let mintime =
             // TODO: calculate this correctly
@@ -1194,5 +1207,33 @@ mod tests {
                 "weight `{block_weight}` exceeds limit for {spk_len}-byte spk"
             );
         }
+    }
+
+    /// The `coinbasevalue` served for default-capability requests is computed
+    /// from the height of the block being built and the fees of the txs
+    /// selected for it, so it must track both rather than any fixed value.
+    #[test]
+    fn block_reward_tracks_height_and_fees() {
+        let block_tx = |fee_sats| BlockTemplateTransaction {
+            txid: Txid::all_zeros(),
+            hash: Wtxid::all_zeros(),
+            depends: Vec::new(),
+            fee: bitcoin::SignedAmount::from_sat(fee_sats),
+            sigops: None,
+            weight: 0,
+            data: Vec::new(),
+        };
+        assert_eq!(block_txs_fees(&[]).unwrap(), Amount::ZERO);
+        let fees = block_txs_fees(&[block_tx(1_000), block_tx(2_500)]).unwrap();
+        assert_eq!(fees, Amount::from_sat(3_500));
+        // Regtest halves every 150 blocks
+        assert_eq!(
+            get_block_reward(299, fees, Network::Regtest),
+            Amount::from_sat(2_500_000_000) + fees
+        );
+        assert_eq!(
+            get_block_reward(300, fees, Network::Regtest),
+            Amount::from_sat(1_250_000_000) + fees
+        );
     }
 }
