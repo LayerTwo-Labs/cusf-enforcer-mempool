@@ -15,9 +15,9 @@ use bitcoin_jsonrpsee::client::{
     BlockTemplate, BlockTemplateRequest, BlockTemplateTransaction,
     CoinbaseTxnOrValue, MODE_PROPOSAL, MODE_TEMPLATE, NetworkInfo,
 };
-use chrono::{DateTime, Utc};
 use educe::Educe;
 use futures::FutureExt;
+use jiff::{SignedDuration, Timestamp};
 use jsonrpsee::{core::RpcResult, proc_macros::rpc, types::ErrorCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -147,8 +147,8 @@ pub trait Rpc {
 // cached block templates, with their generation timestamp
 #[derive(Clone, Debug)]
 struct CachedBlockTemplates {
-    coinbasetxn: Option<(Box<BlockTemplate>, DateTime<Utc>)>,
-    coinbasevalue: Option<(Box<BlockTemplate>, DateTime<Utc>)>,
+    coinbasetxn: Option<(Box<BlockTemplate>, Timestamp)>,
+    coinbasevalue: Option<(Box<BlockTemplate>, Timestamp)>,
     cache_lifetime: Duration,
 }
 
@@ -165,7 +165,7 @@ impl CachedBlockTemplates {
     fn try_take(
         self,
         coinbasetxn: bool,
-        now: DateTime<Utc>,
+        now: Timestamp,
         tip_block_hash: BlockHash,
     ) -> Option<Box<BlockTemplate>> {
         let (block_template, generated_ts) = if coinbasetxn {
@@ -173,7 +173,7 @@ impl CachedBlockTemplates {
         } else {
             self.coinbasevalue
         }?;
-        let age = now.signed_duration_since(generated_ts).to_std().ok()?;
+        let age = Duration::try_from(now.duration_since(generated_ts)).ok()?;
         if age > self.cache_lifetime {
             return None;
         }
@@ -184,7 +184,7 @@ impl CachedBlockTemplates {
         }
     }
 
-    fn put(&mut self, block_template: Box<BlockTemplate>, now: DateTime<Utc>) {
+    fn put(&mut self, block_template: Box<BlockTemplate>, now: Timestamp) {
         match &block_template.coinbase_txn_or_value {
             CoinbaseTxnOrValue::Txn(_) => {
                 self.coinbasetxn = Some((block_template, now))
@@ -920,7 +920,7 @@ where
             .await;
         }
 
-        let now = Utc::now();
+        let now = Timestamp::now();
         let BlockTemplate {
             version,
             ref rules,
@@ -936,7 +936,7 @@ where
             ..
         } = self.sample_block_template;
         let current_time_adjusted =
-            (now.timestamp() + self.network_info.time_offset_s) as u64;
+            now + SignedDuration::from_secs(self.network_info.time_offset_s);
         let cached_mempool_query_output = self
             .mempool
             .with(|mempool, enforcer| {
@@ -1082,7 +1082,7 @@ where
             sigop_limit,
             size_limit,
             weight_limit,
-            current_time: current_time_adjusted,
+            current_time: current_time_adjusted.as_second() as u64,
             compact_target: target.to_compact_lossy(),
             height,
             default_witness_commitment,
